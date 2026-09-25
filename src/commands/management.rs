@@ -476,6 +476,7 @@ pub fn cmd_rebuild(
         db::open_staged_db(root, staged.db_path())?
     };
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!(
             "[verbose] staged DB opened + schema created in {:?}",
@@ -951,6 +952,7 @@ fn cmd_rebuild_sub_projects(
     let staged = IndexStaging::create(&live_db, "rebuild")?;
     let mut conn = db::open_staged_db(root, staged.db_path())?;
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!("[verbose] staged DB opened in {:?}", t.elapsed());
     }
