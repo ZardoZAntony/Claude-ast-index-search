@@ -8113,6 +8113,59 @@ pub fn find_symbols_under(conn: &Connection, dir: &str, file_suffix: &str) -> Re
     Ok(rows)
 }
 
+const BUILD_FILES_FINGERPRINT_KEY: &str = "build_files_fingerprint";
+
+/// Fingerprint of the build files the module graph was last derived from.
+pub fn get_build_files_fingerprint(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            params![BUILD_FILES_FINGERPRINT_KEY],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub fn set_build_files_fingerprint(conn: &Connection, fingerprint: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+        params![BUILD_FILES_FINGERPRINT_KEY, fingerprint],
+    )?;
+    Ok(())
+}
+
+const UNREAD_MODULE_MANIFESTS_KEY: &str = "unread_module_manifests";
+
+/// Record manifests that declare a project but whose targets could not be
+/// read, so module-graph commands can warn that the graph is incomplete.
+pub fn set_unread_module_manifests(conn: &Connection, manifests: &[String]) -> Result<()> {
+    if manifests.is_empty() {
+        conn.execute(
+            "DELETE FROM metadata WHERE key = ?1",
+            params![UNREAD_MODULE_MANIFESTS_KEY],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            params![UNREAD_MODULE_MANIFESTS_KEY, manifests.join("\n")],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn get_unread_module_manifests(conn: &Connection) -> Result<Vec<String>> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            params![UNREAD_MODULE_MANIFESTS_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value
+        .map(|v| v.lines().map(str::to_string).collect())
+        .unwrap_or_default())
+}
+
 /// Distinct module names imported by the Swift files under `dir`.
 pub fn find_swift_imports_under(
     conn: &Connection,

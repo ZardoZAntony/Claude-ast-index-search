@@ -55,6 +55,22 @@ fn init_rebuild_schema(conn: &rusqlite::Connection) -> Result<()> {
     db::init_db_for_rebuild(conn)
 }
 
+/// Manifests whose targets could not be read leave their modules out of the
+/// graph; surface them under `--verbose` only, like other rebuild diagnostics.
+fn report_unread_manifests(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
+    if verbose {
+        let unread = db::get_unread_module_manifests(conn)?;
+        if !unread.is_empty() {
+            eprintln!(
+                "[verbose] could not read targets from {} manifest(s), their modules are missing: {}",
+                unread.len(),
+                unread.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn finalize_rebuild_schema(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
     let t = Instant::now();
     db::finalize_db_after_rebuild(conn)?;
@@ -558,6 +574,11 @@ pub fn cmd_rebuild(
 
             let t = Instant::now();
             let module_count = indexer::index_modules_from_files(&conn, root, &all_module_files)?;
+            db::set_build_files_fingerprint(
+                &conn,
+                &indexer::build_files_fingerprint(&all_module_files),
+            )?;
+            report_unread_manifests(&conn, verbose)?;
             if verbose {
                 eprintln!(
                     "[verbose] index_modules: {} modules in {:?}",
@@ -763,8 +784,14 @@ pub fn cmd_rebuild(
         "modules" => {
             println!("{}", "Rebuilding modules index...".cyan());
             conn.execute("DELETE FROM module_deps", [])?;
-            conn.execute("DELETE FROM modules", [])?;
-            let module_count = indexer::index_modules(&conn, root)?;
+            // Sync instead of delete-and-reinsert: resources, XML/storyboard
+            // usages and assets reference modules by id with ON DELETE CASCADE.
+            let module_files = indexer::collect_module_files(root);
+            let module_count = indexer::sync_modules_from_files(&conn, root, &module_files)?;
+            db::set_build_files_fingerprint(
+                &conn,
+                &indexer::build_files_fingerprint(&module_files),
+            )?;
 
             if index_deps {
                 println!("{}", "Indexing module dependencies...".cyan());
@@ -1065,6 +1092,8 @@ fn cmd_rebuild_sub_projects(
     // Index modules and dependencies from collected build files
     let t = Instant::now();
     let module_count = indexer::index_modules_from_files(&conn, root, &all_module_files)?;
+    db::set_build_files_fingerprint(&conn, &indexer::build_files_fingerprint(&all_module_files))?;
+    report_unread_manifests(&conn, verbose)?;
     if verbose {
         eprintln!(
             "[verbose] index_modules: {} modules in {:?}",

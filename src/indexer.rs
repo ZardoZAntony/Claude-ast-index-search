@@ -1393,6 +1393,31 @@ pub fn is_excluded_dir(entry: &ignore::DirEntry) -> bool {
     }
 }
 
+/// Fingerprint of the build files that define the module graph: their paths,
+/// modification times and sizes. Perl `.pm` files are module files too, but
+/// they are ordinary sources edited all the time; their packages are refreshed
+/// by `rebuild`.
+pub fn build_files_fingerprint(module_files: &[PathBuf]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(String, i64, u64)> = module_files
+        .iter()
+        .filter(|path| path.extension().is_none_or(|ext| ext != "pm"))
+        .map(|path| {
+            let metadata = fs::metadata(path).ok();
+            let mtime = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs() as i64);
+            (path.to_string_lossy().to_string(), mtime, metadata.map_or(0, |m| m.len()))
+        })
+        .collect();
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    format!("{}:{:016x}", entries.len(), hasher.finish())
+}
+
 /// Module-related file names to collect during directory walk
 fn is_module_file(name: &str) -> bool {
     name == "build.gradle"
@@ -2266,6 +2291,9 @@ pub fn update_directory_incremental(
     let mut files_to_parse: Vec<PendingUpdateFile> = Vec::new();
     let mut current_paths: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // Build files are collected regardless of extension: `build.gradle.kts`,
+    // `pom.xml`, `ya.make` are not parsed as sources but define the module graph.
+    let mut module_files: Vec<PathBuf> = Vec::new();
 
     for (walk_dir, anchor) in &walk_specs {
         let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
@@ -2298,6 +2326,11 @@ pub fn update_directory_incremental(
         let walker = builder.build();
 
         for entry in walker.filter_map(|e| e.ok()) {
+            if entry.file_type().is_some_and(|t| t.is_file())
+                && entry.file_name().to_str().is_some_and(is_module_file)
+            {
+                module_files.push(entry.path().to_path_buf());
+            }
             let is_supported = entry
                 .path()
                 .extension()
@@ -2469,6 +2502,19 @@ pub fn update_directory_incremental(
         db::complete_index_update(conn)?;
     }
 
+    // The module graph is derived from build files, not from parsed symbols,
+    // so an added, removed or edited build file needs a separate refresh.
+    let fingerprint = build_files_fingerprint(&module_files);
+    match db::get_build_files_fingerprint(conn)? {
+        Some(stored) if stored != fingerprint => {
+            refresh_module_graph(conn, root, &module_files, false)?;
+            db::set_build_files_fingerprint(conn, &fingerprint)?;
+        }
+        // First update after a rebuild: the graph was just derived from these files.
+        None => db::set_build_files_fingerprint(conn, &fingerprint)?,
+        Some(_) => {}
+    }
+
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
 }
 
@@ -2494,6 +2540,7 @@ fn swift_target_name(module_name: &str) -> &str {
 /// gets a manifest-qualified `dir.path.Target` name so none silently wins.
 fn index_swift_manifest_modules(conn: &Connection, root: &Path, manifests: &[&Path]) -> Result<usize> {
     let mut declared = Vec::new();
+    let mut unread = Vec::new();
     for manifest in manifests {
         let (Some(kind), Some(dir)) = (
             manifest.file_name().and_then(|n| n.to_str()).and_then(swift_manifest_kind),
@@ -2504,10 +2551,15 @@ fn index_swift_manifest_modules(conn: &Connection, root: &Path, manifests: &[&Pa
         let Ok(content) = fs::read_to_string(manifest) else {
             continue;
         };
-        for target in swift_manifest::parse_manifest(&content) {
+        let parsed = swift_manifest::parse_manifest(&content);
+        if parsed.declares_project && parsed.targets.is_empty() {
+            unread.push(manifest.strip_prefix(root).unwrap_or(manifest).to_string_lossy().to_string());
+        }
+        for target in parsed.targets {
             declared.push((kind, dir, target));
         }
     }
+    db::set_unread_module_manifests(conn, &unread)?;
 
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
     for (_, _, target) in &declared {
@@ -2548,6 +2600,13 @@ fn index_swift_manifest_modules(conn: &Connection, root: &Path, manifests: &[&Pa
 
 /// Index modules from build.gradle files (Android) and Package.swift / Tuist Project.swift (iOS)
 pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
+    let files = collect_module_files(root);
+    index_modules_from_files(conn, root, &files)
+}
+
+/// Build files (Gradle, SwiftPM/Tuist manifests, Maven, ya.make, Python, Perl)
+/// under `root`, honouring the same ignore rules as indexing.
+pub fn collect_module_files(root: &Path) -> Vec<PathBuf> {
     use ignore::WalkBuilder;
 
     let is_git = has_git_repo(root);
@@ -2578,8 +2637,61 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
         })
         .map(|e| e.path().to_path_buf())
         .collect();
+    files
+}
 
-    index_modules_from_files(conn, root, &files)
+/// Re-derive the module list from build files, keeping the id of every module
+/// that still exists. Resources, XML/storyboard usages and assets reference
+/// modules by id with `ON DELETE CASCADE`, so deleting and re-inserting all
+/// modules would silently drop them.
+pub fn sync_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf]) -> Result<usize> {
+    let scratch = Connection::open_in_memory()?;
+    db::init_db(&scratch)?;
+    let count = index_modules_from_files(&scratch, root, files)?;
+    let fresh: Vec<(String, String, Option<String>)> = scratch
+        .prepare("SELECT name, path, kind FROM modules")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let unread = db::get_unread_module_manifests(&scratch)?;
+
+    let fresh_names: std::collections::HashSet<&str> =
+        fresh.iter().map(|(name, _, _)| name.as_str()).collect();
+    let existing: Vec<String> = conn
+        .prepare("SELECT name FROM modules")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut upsert = tx.prepare_cached(
+            "INSERT INTO modules (name, path, kind) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET path = excluded.path, kind = excluded.kind",
+        )?;
+        for (name, path, kind) in &fresh {
+            upsert.execute(rusqlite::params![name, path, kind])?;
+        }
+        let mut delete = tx.prepare_cached("DELETE FROM modules WHERE name = ?1")?;
+        for name in existing.iter().filter(|name| !fresh_names.contains(name.as_str())) {
+            delete.execute(rusqlite::params![name])?;
+        }
+    }
+    db::set_unread_module_manifests(&tx, &unread)?;
+    tx.commit()?;
+    Ok(count)
+}
+
+/// Rebuild modules, their dependencies and transitive closure from the given
+/// build files, keeping the ids of modules that still exist.
+pub fn refresh_module_graph(
+    conn: &mut Connection,
+    root: &Path,
+    files: &[PathBuf],
+    progress: bool,
+) -> Result<(usize, usize)> {
+    let module_count = sync_modules_from_files(conn, root, files)?;
+    let dep_count = index_module_dependencies(conn, root, files, progress)?;
+    build_transitive_deps(conn, progress)?;
+    Ok((module_count, dep_count))
 }
 
 /// Index modules from a pre-collected list of module files (avoids re-walking the filesystem)
@@ -3450,7 +3562,7 @@ fn swift_manifest_edges(
     let Ok(content) = fs::read_to_string(manifest) else {
         return Vec::new();
     };
-    let targets = swift_manifest::parse_manifest(&content);
+    let targets = swift_manifest::parse_manifest(&content).targets;
     let local_id = |target: &swift_manifest::ManifestTarget| {
         let dir = swift_manifest::target_dir(manifest_dir, target);
         let rel = dir.strip_prefix(root).unwrap_or(&dir).to_string_lossy();

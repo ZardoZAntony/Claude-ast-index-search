@@ -1,12 +1,18 @@
 //! Target and dependency extraction from Swift manifests: SwiftPM
 //! `Package.swift` and Tuist `Project.swift`, parsed with tree-sitter-swift.
 //!
-//! Both declare targets as call expressions inside a `targets` array literal —
-//! `.target(name: "Foo", dependencies: ["Bar"])` in SwiftPM, or a Tuist
-//! helper such as `.spmSwiftFolderTarget(name: .Foo, dependencies: [.target(.Bar)])`.
-//! The array may be the `targets:` argument of `Package(...)`/`Project(...)`
-//! or a `let targets = [...]` declaration passed in later. Manifests are not
-//! evaluated: targets produced by helper functions are not discovered.
+//! Targets are call expressions inside a `targets` or `modules` array literal —
+//! `.target(name: "Foo", dependencies: ["Bar"])` in SwiftPM, or project helpers
+//! such as `.spmSwiftFolderTarget(name: .Foo, ...)` / `.module(name: .Foo, ...)`
+//! in Tuist. The array may be an argument of `Package(...)`/`Project(...)` or a
+//! `let targets = [...]` declaration passed in later.
+//!
+//! Manifests are not evaluated, so project helpers are read by convention:
+//! the source directory is probed among common layouts, and nested
+//! `implementation:` / `tests:` configurations declare `<Name>Impl` /
+//! `<Name>Tests` companion targets. Targets produced by helper functions
+//! outside such arrays are not discovered; [`Manifest::declares_project`]
+//! lets callers flag a manifest that yielded nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -15,13 +21,20 @@ use tree_sitter::{Language, Node, Parser};
 
 static SWIFT: LazyLock<Language> = LazyLock::new(|| tree_sitter_swift::LANGUAGE.into());
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Manifest {
+    pub targets: Vec<ManifestTarget>,
+    /// The manifest calls `Project(...)` / `Package(...)` directly, so an empty
+    /// `targets` means the declarations were not understood rather than absent.
+    pub declares_project: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestTarget {
     pub name: String,
-    /// Explicit `path:` argument, relative to the manifest directory.
-    pub path: Option<String>,
-    /// Static directory prefix of the first `sources:` glob, if any.
-    pub sources_dir: Option<String>,
+    /// Candidate source directories relative to the manifest, most specific
+    /// first; [`target_dir`] picks the first one that exists.
+    pub dirs: Vec<String>,
     pub dependencies: Vec<ManifestDependency>,
 }
 
@@ -35,57 +48,61 @@ pub struct ManifestDependency {
 /// Dependency forms that never refer to a source module of the workspace.
 const NON_MODULE_DEPENDENCIES: &[&str] = &["sdk", "system", "xcframework", "framework", "library"];
 
-pub fn parse_manifest(content: &str) -> Vec<ManifestTarget> {
+/// Argument labels whose array holds target declarations.
+const TARGET_ARRAY_LABELS: &[&str] = &["targets", "modules"];
+
+pub fn parse_manifest(content: &str) -> Manifest {
     let mut parser = Parser::new();
     if parser.set_language(&SWIFT).is_err() {
-        return Vec::new();
+        return Manifest::default();
     }
     let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
+        return Manifest::default();
     };
+    let root = tree.root_node();
     let mut arrays = Vec::new();
-    collect_target_arrays(tree.root_node(), content, &mut arrays);
-    arrays
-        .into_iter()
-        .flat_map(|array| named_children(array))
-        .filter_map(|element| parse_target(element, content))
-        .collect()
+    collect_target_arrays(root, content, &mut arrays);
+
+    let mut targets: Vec<ManifestTarget> = Vec::new();
+    for element in arrays.into_iter().flat_map(named_children) {
+        for target in parse_declaration(element, content) {
+            if !targets.iter().any(|t| t.name == target.name) {
+                targets.push(target);
+            }
+        }
+    }
+    Manifest {
+        targets,
+        declares_project: calls_project_constructor(root, content),
+    }
 }
 
-/// Source directory of a manifest target: explicit `path:`, then the static
-/// prefix of `sources:`, then the SwiftPM conventions `Sources/<name>` and
-/// `Tests/<name>`. Falls back to `Sources/<name>` when nothing exists on disk.
+/// Source directory of a manifest target: the first candidate that exists on
+/// disk, else the most specific candidate.
 pub fn target_dir(manifest_dir: &Path, target: &ManifestTarget) -> PathBuf {
-    if let Some(path) = target.path.as_deref().filter(|p| !p.is_empty()) {
-        return manifest_dir.join(path);
-    }
-    if let Some(dir) = target.sources_dir.as_deref().filter(|p| !p.is_empty()) {
-        return manifest_dir.join(dir);
-    }
-    let conventional = [
-        manifest_dir.join("Sources").join(&target.name),
-        manifest_dir.join("Tests").join(&target.name),
-    ];
-    conventional
+    target
+        .dirs
         .iter()
+        .map(|dir| manifest_dir.join(dir))
         .find(|dir| dir.is_dir())
-        .cloned()
-        .unwrap_or_else(|| conventional[0].clone())
+        .unwrap_or_else(|| {
+            manifest_dir.join(target.dirs.first().map_or(target.name.as_str(), String::as_str))
+        })
 }
 
-/// Array literals holding target declarations: the `targets:` argument of a
-/// call, or the value of a `let/var ...targets` declaration.
+/// Array literals holding target declarations: a `targets:` / `modules:`
+/// argument, or the value of a `let/var ...targets` / `...modules` declaration.
 fn collect_target_arrays<'t>(node: Node<'t>, content: &str, out: &mut Vec<Node<'t>>) {
     let array = match node.kind() {
         "value_argument" => node
             .child_by_field_name("name")
-            .filter(|label| text(*label, content) == "targets")
+            .filter(|label| TARGET_ARRAY_LABELS.contains(&text(*label, content)))
             .and_then(|_| node.child_by_field_name("value")),
         "property_declaration" => node
             .child_by_field_name("name")
             .filter(|name| {
-                let name = text(*name, content);
-                name.ends_with("targets") || name.ends_with("Targets")
+                let name = text(*name, content).to_ascii_lowercase();
+                TARGET_ARRAY_LABELS.iter().any(|label| name.ends_with(label))
             })
             .and_then(|_| node.child_by_field_name("value")),
         _ => None,
@@ -99,14 +116,98 @@ fn collect_target_arrays<'t>(node: Node<'t>, content: &str, out: &mut Vec<Node<'
     }
 }
 
-fn parse_target(element: Node, content: &str) -> Option<ManifestTarget> {
-    let (_, args) = parse_call(element, content)?;
-    let name = labeled(&args, "name").and_then(|v| simple_name(v, content))?;
-    let path = labeled(&args, "path").and_then(|v| string_literal(v, content));
-    let sources_dir = labeled(&args, "sources")
-        .and_then(|v| first_string_literal(v, content))
-        .map(|glob| static_glob_prefix(&glob));
-    let dependencies = labeled(&args, "dependencies")
+/// A direct `Project(...)` call, or a `Package(...)` call with a `targets:`
+/// argument — as opposed to a manifest built by a helper such as
+/// `App.main.project(...)`, or a dependencies-only `Package(...)`.
+fn calls_project_constructor(node: Node, content: &str) -> bool {
+    if node.kind() == "call_expression" {
+        if let Some(callee) = node.named_child(0).filter(|c| c.kind() == "simple_identifier") {
+            match text(callee, content) {
+                "Project" => return true,
+                "Package" => {
+                    let has_targets = parse_call(node, content)
+                        .is_some_and(|(_, args)| labeled(&args, "targets").is_some());
+                    if has_targets {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    named_children(node)
+        .into_iter()
+        .any(|child| calls_project_constructor(child, content))
+}
+
+/// The target a declaration names, plus companions from nested
+/// `implementation:` / `tests:` configurations.
+fn parse_declaration(element: Node, content: &str) -> Vec<ManifestTarget> {
+    let Some((_, args)) = parse_call(element, content) else {
+        return Vec::new();
+    };
+    let Some(name) = labeled(&args, "name").and_then(|v| simple_name(v, content)) else {
+        return Vec::new();
+    };
+
+    let explicit_dir = labeled(&args, "path")
+        .and_then(|v| string_literal(v, content))
+        .or_else(|| {
+            labeled(&args, "sources")
+                .and_then(|v| first_string_literal(v, content))
+                .map(|glob| static_glob_prefix(&glob))
+        })
+        .filter(|dir| !dir.is_empty());
+    let dirs = match explicit_dir {
+        Some(dir) => vec![dir],
+        None => conventional_dirs(&name),
+    };
+
+    let mut targets = vec![ManifestTarget {
+        dependencies: dependencies_of(&args, content),
+        name: name.clone(),
+        dirs,
+    }];
+    let companions = [
+        ("implementation", "Impl", vec![format!("{name}/Impl"), format!("Sources/{name}Impl")]),
+        ("tests", "Tests", vec![format!("{name}/Tests"), format!("Tests/{name}Tests")]),
+    ];
+    for (label, suffix, dirs) in companions {
+        let Some(config) = labeled(&args, label) else {
+            continue;
+        };
+        let dependencies = match parse_call(config, content) {
+            Some((_, config_args)) => dependencies_of(&config_args, content),
+            None if text(config, content) == "true" => Vec::new(),
+            None => continue,
+        };
+        targets.push(ManifestTarget {
+            name: format!("{name}{suffix}"),
+            dirs,
+            dependencies,
+        });
+    }
+    targets
+}
+
+/// SwiftPM (`Sources/X`, `Tests/X`) and per-module folder (`X/Sources`,
+/// `X/Api`, `X/Tests` for `XTests`) layouts.
+fn conventional_dirs(name: &str) -> Vec<String> {
+    let mut dirs = vec![
+        format!("Sources/{name}"),
+        format!("{name}/Sources"),
+        format!("{name}/Api"),
+        format!("Tests/{name}"),
+    ];
+    if let Some(stem) = name.strip_suffix("Tests").filter(|s| !s.is_empty()) {
+        dirs.push(format!("{stem}/Tests"));
+    }
+    dirs.push(name.to_string());
+    dirs
+}
+
+fn dependencies_of(args: &Args, content: &str) -> Vec<ManifestDependency> {
+    labeled(args, "dependencies")
         .filter(|v| v.kind() == "array_literal")
         .map(|deps| {
             named_children(deps)
@@ -114,13 +215,7 @@ fn parse_target(element: Node, content: &str) -> Option<ManifestTarget> {
                 .filter_map(|dep| parse_dependency(dep, content))
                 .collect()
         })
-        .unwrap_or_default();
-    Some(ManifestTarget {
-        name,
-        path,
-        sources_dir,
-        dependencies,
-    })
+        .unwrap_or_default()
 }
 
 fn parse_dependency(element: Node, content: &str) -> Option<ManifestDependency> {
@@ -252,9 +347,14 @@ mod tests {
         }
     }
 
+    fn names(manifest: &Manifest) -> Vec<&str> {
+        manifest.targets.iter().map(|t| t.name.as_str()).collect()
+    }
+
     #[test]
     fn parses_swiftpm_targets_and_dependencies() {
-        let manifest = r#"
+        let manifest = parse_manifest(
+            r#"
 // swift-tools-version:5.9
 let package = Package(
     name: "Core",
@@ -267,21 +367,23 @@ let package = Package(
         .testTarget(name: "CoreTests", dependencies: [.target(name: "Core")]),
     ]
 )
-"#;
-        let targets = parse_manifest(manifest);
-        let names: Vec<_> = targets.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["Core", "Utils", "CoreTests"]);
+"#,
+        );
+        assert!(manifest.declares_project);
+        assert_eq!(names(&manifest), ["Core", "Utils", "CoreTests"]);
+        let targets = &manifest.targets;
         assert_eq!(
             targets[0].dependencies,
             [dep("Utils", "target"), dep("Other", "product")]
         );
-        assert_eq!(targets[1].path.as_deref(), Some("Lib/Utils"));
+        assert_eq!(targets[1].dirs, ["Lib/Utils"]);
         assert_eq!(targets[2].dependencies, [dep("Core", "target")]);
     }
 
     #[test]
     fn parses_tuist_helper_targets_with_enum_names() {
-        let manifest = r#"
+        let manifest = parse_manifest(
+            r#"
 let project = Project(
     name: Core.self,
     targets: [
@@ -298,60 +400,109 @@ let project = Project(
         .target(name: "App", destinations: .iOS, sources: ["App/Sources/**/*.swift"]),
     ]
 )
-"#;
-        let targets = parse_manifest(manifest);
-        assert_eq!(targets.len(), 3);
-        assert_eq!(targets[0].name, "YandexGoBaseRouting");
+"#,
+        );
+        assert_eq!(names(&manifest), ["YandexGoBaseRouting", "YandexGoBaseRoutingTests", "App"]);
         assert_eq!(
-            targets[0].dependencies,
+            manifest.targets[0].dependencies,
             [
                 dep("YandexGoFoundation", "external"),
                 dep("YandexGoMapViewController", "target"),
                 dep("FLEXWrapper", "project"),
             ]
         );
-        assert_eq!(targets[1].name, "YandexGoBaseRoutingTests");
-        assert_eq!(targets[2].sources_dir.as_deref(), Some("App/Sources"));
+        assert_eq!(manifest.targets[2].dirs, ["App/Sources"]);
+    }
+
+    #[test]
+    fn module_helpers_declare_companion_targets() {
+        let manifest = parse_manifest(
+            r#"
+let project = Project(
+    name: Foundation.self,
+    modules: [
+        .module(
+            name: .Cache,
+            dependencies: [.external(name: "Base")],
+            tests: .init(dependencies: [.target(.Cache), .target(.TestHelpers)])
+        ),
+        .apiImplModule(
+            name: .Socket,
+            dependencies: [.external(name: "Base")],
+            implementation: .init(dependencies: [.target(.Socket)]),
+            tests: .init(dependencies: [.target(.SocketImpl)])
+        ),
+        .module(name: .TestHelpers),
+        .externalModuleTests(name: .BaseTests, dependencies: [.external(name: "Base")]),
+    ]
+)
+"#,
+        );
+        assert_eq!(
+            names(&manifest),
+            ["Cache", "CacheTests", "Socket", "SocketImpl", "SocketTests", "TestHelpers", "BaseTests"]
+        );
+        let target = |name: &str| manifest.targets.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(target("Cache").dependencies, [dep("Base", "external")]);
+        assert_eq!(
+            target("CacheTests").dependencies,
+            [dep("Cache", "target"), dep("TestHelpers", "target")]
+        );
+        assert_eq!(target("SocketImpl").dependencies, [dep("Socket", "target")]);
+        assert_eq!(target("SocketImpl").dirs[0], "Socket/Impl");
+        assert!(target("BaseTests").dirs.contains(&"Base/Tests".to_string()));
     }
 
     #[test]
     fn target_dir_prefers_existing_conventional_directory() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("Tests/FooTests")).unwrap();
+        for existing in ["Tests/FooTests", "Bar/Sources", "Baz/Api", "Qux/Tests"] {
+            std::fs::create_dir_all(dir.path().join(existing)).unwrap();
+        }
         let target = |name: &str| ManifestTarget {
             name: name.to_string(),
-            path: None,
-            sources_dir: None,
+            dirs: conventional_dirs(name),
             dependencies: vec![],
         };
-        assert_eq!(
-            target_dir(dir.path(), &target("FooTests")),
-            dir.path().join("Tests/FooTests")
-        );
-        assert_eq!(
-            target_dir(dir.path(), &target("Foo")),
-            dir.path().join("Sources/Foo")
-        );
+        let resolved = |name: &str| target_dir(dir.path(), &target(name));
+        assert_eq!(resolved("FooTests"), dir.path().join("Tests/FooTests"));
+        assert_eq!(resolved("Bar"), dir.path().join("Bar/Sources"));
+        assert_eq!(resolved("Baz"), dir.path().join("Baz/Api"));
+        assert_eq!(resolved("QuxTests"), dir.path().join("Qux/Tests"));
+        assert_eq!(resolved("Missing"), dir.path().join("Sources/Missing"));
     }
 
     #[test]
     fn parses_targets_declared_in_a_variable() {
-        let manifest = r#"
+        let manifest = parse_manifest(
+            r#"
 let targets: [PackageDescription.Target] = [
     .target(name: "Maps", dependencies: [.product(name: "Geo", package: "geo")]),
 ]
 let documentableTargets: [String] = ["Maps"]
 let package = Package(name: "Maps", targets: targets)
-"#;
-        let targets = parse_manifest(manifest);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].name, "Maps");
-        assert_eq!(targets[0].dependencies, [dep("Geo", "product")]);
+"#,
+        );
+        assert_eq!(names(&manifest), ["Maps"]);
+        assert_eq!(manifest.targets[0].dependencies, [dep("Geo", "product")]);
+    }
+
+    #[test]
+    fn reports_project_manifests_without_understood_targets() {
+        let helper_built = parse_manifest("let project = App.main.fullProject(dependencies: [])");
+        assert!(!helper_built.declares_project);
+        let dependencies_only =
+            parse_manifest("let package = Package(name: \"Deps\", dependencies: [.package(path: \"X\")])");
+        assert!(!dependencies_only.declares_project);
+        let unknown_layout =
+            parse_manifest("let project = Project(name: \"X\", features: [.feature(name: .A)])");
+        assert!(unknown_layout.declares_project);
+        assert!(unknown_layout.targets.is_empty());
     }
 
     #[test]
     fn ignores_non_call_elements_and_unbalanced_input() {
-        assert!(parse_manifest("let t = Target(targets: [\"A\", \"B\"])").is_empty());
-        assert!(parse_manifest("targets: [ .target(name: \"A\"").is_empty());
+        assert!(parse_manifest("let t = Target(targets: [\"A\", \"B\"])").targets.is_empty());
+        assert!(parse_manifest("targets: [ .target(name: \"A\"").targets.is_empty());
     }
 }

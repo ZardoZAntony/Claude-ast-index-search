@@ -188,3 +188,122 @@ fn tuist_manifest_marks_ios_project() {
     fs::write(dir.path().join("Tuist.swift"), "").unwrap();
     assert!(indexer::has_ios_markers(dir.path()));
 }
+
+#[test]
+fn tuist_module_helpers_resolve_folder_layout_and_companions() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Modules/Foundation/Project.swift",
+        r#"
+let project = Project(
+    name: Foundation.self,
+    modules: [
+        .module(
+            name: .Cache,
+            dependencies: [.target(.Socket)],
+            tests: .init(dependencies: [.target(.Cache)])
+        ),
+        .apiImplModule(
+            name: .Socket,
+            implementation: .init(dependencies: [.target(.Socket)]),
+            tests: .init(dependencies: [.target(.SocketImpl)])
+        ),
+    ]
+)
+"#,
+    );
+    for rel in [
+        "Cache/Sources/Cache.swift",
+        "Cache/Tests/CacheTests.swift",
+        "Socket/Api/Socket.swift",
+        "Socket/Impl/SocketImpl.swift",
+        "Socket/Tests/SocketTests.swift",
+    ] {
+        write(root, &format!("Modules/Foundation/{rel}"), "");
+    }
+
+    let conn = index(root, &["Modules/Foundation/Project.swift"]);
+
+    assert_eq!(module_path(&conn, "Cache"), "Modules/Foundation/Cache/Sources");
+    assert_eq!(module_path(&conn, "CacheTests"), "Modules/Foundation/Cache/Tests");
+    assert_eq!(module_path(&conn, "Socket"), "Modules/Foundation/Socket/Api");
+    assert_eq!(module_path(&conn, "SocketImpl"), "Modules/Foundation/Socket/Impl");
+    assert_eq!(module_path(&conn, "SocketTests"), "Modules/Foundation/Socket/Tests");
+    assert_eq!(deps(&conn, "Cache"), [pair("Socket", "target")]);
+    assert_eq!(deps(&conn, "SocketImpl"), [pair("Socket", "target")]);
+    assert_eq!(deps(&conn, "SocketTests"), [pair("SocketImpl", "target")]);
+    assert!(db::get_unread_module_manifests(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn project_manifest_without_readable_targets_is_recorded() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Modules/Odd/Project.swift",
+        r#"let project = Project(name: Odd.self, features: [.feature(name: .A)])"#,
+    );
+    write(
+        root,
+        "Projects/App/Project.swift",
+        r#"let project = App.main.fullProject(dependencies: [])"#,
+    );
+
+    let conn = index(root, &["Modules/Odd/Project.swift", "Projects/App/Project.swift"]);
+
+    assert_eq!(
+        db::get_unread_module_manifests(&conn).unwrap(),
+        ["Modules/Odd/Project.swift"]
+    );
+}
+
+#[test]
+fn sync_keeps_ids_of_surviving_modules() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let manifest = "App/Project.swift";
+    write(
+        root,
+        manifest,
+        r#"let project = Project(name: "App", targets: [.spmSwiftFolderTarget(name: .Keep), .spmSwiftFolderTarget(name: .Drop)])"#,
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    db::init_db(&conn).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    let files = [root.join(manifest)];
+    indexer::sync_modules_from_files(&conn, root, &files).unwrap();
+    let id_of = |name: &str| -> Option<i64> {
+        conn.query_row("SELECT id FROM modules WHERE name = ?1", [name], |r| r.get(0))
+            .ok()
+    };
+    let keep_id = id_of("Keep").unwrap();
+    for (module_id, name) in [(keep_id, "kept"), (id_of("Drop").unwrap(), "dropped")] {
+        conn.execute(
+            "INSERT INTO ios_assets (module_id, type, name, file_path) VALUES (?1, 'imageset', ?2, 'x')",
+            rusqlite::params![module_id, name],
+        )
+        .unwrap();
+    }
+
+    write(
+        root,
+        manifest,
+        r#"let project = Project(name: "App", targets: [.spmSwiftFolderTarget(name: .Keep), .spmSwiftFolderTarget(name: .Added)])"#,
+    );
+    indexer::sync_modules_from_files(&conn, root, &files).unwrap();
+
+    assert_eq!(id_of("Keep"), Some(keep_id));
+    assert!(id_of("Added").is_some());
+    assert!(id_of("Drop").is_none());
+    let assets: Vec<String> = conn
+        .prepare("SELECT name FROM ios_assets")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(assets, ["kept"]);
+}

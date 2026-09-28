@@ -611,6 +611,26 @@ exclude:
 
 ## Changelog
 
+### 3.55.0
+
+- **Tuist module helpers are understood** — besides `targets: [...]`, target
+  declarations inside `modules: [...]` are read, source directories are found
+  among common layouts (`Sources/X`, `X/Sources`, `X/Api`, `Tests/X`,
+  `X/Tests`), and nested `implementation:` / `tests:` configurations declare
+  `XImpl` / `XTests` targets with their own dependencies. Workspaces that moved
+  to per-module folders no longer lose those modules from the graph.
+- **`update` refreshes the module graph when build files change** — adding,
+  removing or editing `build.gradle(.kts)`, `Package.swift`, `Project.swift`,
+  `pom.xml`, `ya.make` and other build files now updates `deps`, `dependents`,
+  `module-route` and `unused-deps` without a `rebuild`. Unchanged build files
+  cost nothing extra.
+- **`rebuild --type modules` keeps resources and usages** — it used to delete
+  and re-insert every module, which cascaded into Android resources, XML
+  usages, iOS assets and storyboard usages. Modules are now synced in place and
+  keep their ids.
+- **`rebuild --verbose` lists manifests whose targets could not be read**, so
+  an incomplete module graph is visible instead of silent.
+
 ### 3.54.0
 
 - **Tuist projects get a module graph** — targets declared in `Project.swift`
