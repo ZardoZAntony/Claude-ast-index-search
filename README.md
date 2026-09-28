@@ -134,7 +134,8 @@ cargo build --release
 
 ### Troubleshooting: Syntax errors on install
 
-If `brew install ast-index` fails with merge conflict errors (`
+If `brew install ast-index` fails with merge conflict errors (`<<<<<<< HEAD`), reset your local tap:
+
 ```bash
 cd /opt/homebrew/Library/Taps/defendend/homebrew-ast-index
 git fetch origin
