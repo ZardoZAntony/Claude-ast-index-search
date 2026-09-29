@@ -126,6 +126,24 @@ ast-index rebuild
 Use `include` when you only want selected directories from a larger tree. Use
 `exclude` for generated or vendored folders that should never enter the index.
 
+Hidden files and directories (names starting with a dot) are skipped. List the
+ones that hold real code in `include_hidden` (gitignore-style patterns):
+
+```yaml
+include_hidden:
+  - .default        # e.g. Bitrix component templates
+  - .settings.php
+```
+
+To keep the config out of the working tree, put it in the repository's git
+directory as `.git/ast-index.yaml`. It is used when the root has no
+`.ast-index.yaml`, is never committed, and applies to every linked worktree of
+the clone.
+
+Minified or generated JS/CSS (nearly all text in lines longer than 500
+characters, such as bundles and `*.min.js`) is recorded but not parsed, so its
+mangled names do not show up in search results.
+
 ## Keeping The Index Fresh
 
 Use three commands for the index lifecycle:

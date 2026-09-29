@@ -219,12 +219,34 @@ pub struct ProjectConfig {
     pub include_hidden: Option<Vec<String>>,
 }
 
-/// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root.
+/// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root, else
+/// `ast-index.yaml` in the repository's git directory — a per-clone config that is never
+/// committed and is shared by every worktree of the clone.
 fn config_path(root: &Path) -> Option<PathBuf> {
     [".ast-index.yaml", ".ast-index.yml"]
         .iter()
         .map(|name| root.join(name))
         .find(|path| path.exists())
+        .or_else(|| {
+            git_common_dir(root)
+                .map(|dir| dir.join("ast-index.yaml"))
+                .filter(|path| path.exists())
+        })
+}
+
+/// The git directory shared by all worktrees: `.git/` of a clone, or — for a linked worktree,
+/// whose `.git` is a file — the main clone's directory found via `gitdir:` and `commondir`.
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let content = fs::read_to_string(&dot_git).ok()?;
+    let gitdir = root.join(content.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
+    match fs::read_to_string(gitdir.join("commondir")) {
+        Ok(common) => Some(gitdir.join(common.trim())),
+        Err(_) => Some(gitdir),
+    }
 }
 
 fn parse_config(config_path: &Path) -> std::result::Result<ProjectConfig, String> {
@@ -1228,6 +1250,31 @@ fn read_source(path: &Path) -> Result<String> {
     }
 }
 
+/// Minified or generated JS/CSS: nearly all of the text sits in very long lines (bundles,
+/// Bitrix `script.map.js`, vendored `*.min.js`). Their "symbols" are mangled names that only
+/// add noise to search, so such files are recorded without parsing, like oversized ones.
+/// Handwritten sources with a few long lines (inline SVG, data tables) stay well below the
+/// threshold; Vue/Svelte components are never treated as minified.
+fn is_minified_web_asset(file_type: parsers::FileType, content: &str) -> bool {
+    use parsers::FileType;
+    const LONG_LINE: usize = 500;
+    const MINIFIED_SHARE: f64 = 0.9;
+
+    if !matches!(
+        file_type,
+        FileType::TypeScript | FileType::Css | FileType::Scss | FileType::Less
+    ) || content.is_empty()
+    {
+        return false;
+    }
+    let long_bytes: usize = content
+        .lines()
+        .map(str::len)
+        .filter(|len| *len > LONG_LINE)
+        .sum();
+    long_bytes as f64 >= content.len() as f64 * MINIFIED_SHARE
+}
+
 /// Parse a single file without DB access (thread-safe)
 fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
@@ -1271,8 +1318,8 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     } else {
         parsers::FileType::from_extension(ext)
     } {
-        Some(ft) => ft,
-        None => {
+        Some(ft) if !is_minified_web_asset(ft, &content) => ft,
+        _ => {
             return Ok(ParsedFile {
                 rel_path,
                 root_path,
