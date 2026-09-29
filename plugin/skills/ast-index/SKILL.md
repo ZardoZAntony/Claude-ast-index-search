@@ -617,6 +617,14 @@ Consult: `references/python-commands.md`
 - Index: `class`, `def`, `async def`, decorators
 - `outline` and `imports` work with Python files
 
+### PHP
+
+Consult: `references/php-commands.md`
+
+- Class references carry fully qualified names (namespace, `use`, PHPDoc, FQN strings)
+- One-call refactoring: `impact <FQN>`, `move-plan <FQN> <namespace>`, `usages <FQN>`,
+  `callers 'Type::method'`, `unused-symbols`, `duplicates`
+
 ### Go
 
 Consult: `references/go-commands.md`
@@ -696,6 +704,7 @@ For detailed platform-specific commands, consult:
 - **`references/dart-commands.md`** - Dart/Flutter classes, mixins, extensions
 - **`references/perl-commands.md`** - Perl exports, subs, POD
 - **`references/python-commands.md`** - Python classes, functions
+- **`references/php-commands.md`** - PHP FQN resolution, impact, move-plan, typed callers, duplicates
 - **`references/go-commands.md`** - Go structs, interfaces
 - **`references/cpp-commands.md`** - C/C++ classes, JNI functions
 - **`references/proto-commands.md`** - Protocol Buffers messages, services

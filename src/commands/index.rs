@@ -789,6 +789,11 @@ pub fn cmd_usages(
     format: &str,
     scope: &SearchScope,
 ) -> Result<()> {
+    // A fully qualified PHP name: exact references of that class, not of its namesakes.
+    if symbol.contains('\\') {
+        return super::php::cmd_usages_fqn(root, symbol, limit, format);
+    }
+
     // Try to use index first
     let _cache_lease = db::acquire_project_lease(root)?;
     let db_path = db::get_db_path(root)?;

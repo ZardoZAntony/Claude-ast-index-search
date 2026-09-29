@@ -180,6 +180,10 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 
 /// Find function callers
 pub fn cmd_callers(root: &Path, function_name: &str, limit: usize, format: &str) -> Result<()> {
+    // `Type::method`: calls whose receiver resolves to the type or a subtype (PHP index).
+    if function_name.contains("::") {
+        return super::php::cmd_typed_callers(root, function_name, limit, format);
+    }
     let pattern = build_caller_pattern(function_name);
     let def_pattern = build_def_skip_pattern(function_name);
     let conn = db::open_db_leased(root)?;

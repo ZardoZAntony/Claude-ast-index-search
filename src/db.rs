@@ -4124,6 +4124,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
             name TEXT NOT NULL,
             line INTEGER NOT NULL,
             context TEXT,
+            fqn TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         );
 
@@ -4244,6 +4245,7 @@ fn create_secondary_indexes(conn: &Connection) -> Result<()> {
         -- full table scan when filtering by name AND joining with files
         -- on large ref tables (millions of rows). See issue #19.
         CREATE INDEX IF NOT EXISTS idx_refs_name_file_line ON refs(name, file_id, line);
+        CREATE INDEX IF NOT EXISTS idx_refs_fqn ON refs(fqn COLLATE NOCASE) WHERE fqn IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_xml_usages_class ON xml_usages(class_name);
         CREATE INDEX IF NOT EXISTS idx_xml_usages_module ON xml_usages(module_id);
         CREATE INDEX IF NOT EXISTS idx_resources_name ON resources(name);
@@ -4340,6 +4342,9 @@ const CREATE_QUALIFIED_NAME_INDEX_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
         ON symbols(qualified_name) WHERE qualified_name IS NOT NULL
 "#;
+/// Class references by fully qualified name (PHP); PHP class names are case-insensitive.
+const CREATE_REFS_FQN_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_refs_fqn ON refs(fqn COLLATE NOCASE) WHERE fqn IS NOT NULL";
 const CREATE_REFS_NAME_FILE_LINE_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_refs_name_file_line ON refs(name, file_id, line)";
 const DEFAULT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -4508,6 +4513,7 @@ fn inspect_open_migrations(
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
     let files_uniqueness_current = !files_exists || !files_has_legacy_path_unique(conn)?;
     let symbols_current = !symbols_exists || column_exists(conn, "symbols", "qualified_name")?;
+    let refs_current = !table_exists(conn, "refs")? || column_exists(conn, "refs", "fqn")?;
 
     let (stored_root, has_legacy_extra_roots) = if metadata_exists {
         let stored_root = conn
@@ -4551,6 +4557,7 @@ fn inspect_open_migrations(
             || !files_current
             || !files_uniqueness_current
             || !symbols_current
+            || !refs_current
             || stored_root.as_deref() != Some(normalized_root)
             || has_legacy_extra_roots,
         optional_indexes,
@@ -4641,6 +4648,15 @@ fn apply_open_migrations_transaction(
             .context("failed to replace idx_symbols_qualified_name")?;
         tx.execute(CREATE_QUALIFIED_NAME_INDEX_SQL, [])
             .context("failed to create idx_symbols_qualified_name")?;
+    }
+
+    if table_exists(&tx, "refs")? {
+        if !column_exists(&tx, "refs", "fqn")? {
+            tx.execute("ALTER TABLE refs ADD COLUMN fqn TEXT", [])
+                .context("failed to add refs.fqn")?;
+        }
+        tx.execute(CREATE_REFS_FQN_INDEX_SQL, [])
+            .context("failed to create idx_refs_fqn")?;
     }
 
     tx.execute("DROP INDEX IF EXISTS idx_files_root_path_path", [])

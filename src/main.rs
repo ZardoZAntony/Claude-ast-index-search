@@ -546,6 +546,33 @@ enum Commands {
         #[arg(long)]
         module: Option<String>,
     },
+    /// Everything a change to a PHP class touches, by fully qualified name
+    Impact {
+        /// Fully qualified class name, e.g. 'App\\Order\\OrderService'
+        fqn: String,
+    },
+    /// Edits needed to move a PHP class to another namespace
+    MovePlan {
+        /// Fully qualified class name to move
+        fqn: String,
+        /// Target namespace
+        namespace: String,
+    },
+    /// Same-named PHP classes whose bodies are near copies
+    Duplicates {
+        /// Only classes under this path prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Minimum token similarity, 0..1
+        #[arg(long, default_value = "0.75")]
+        min_similarity: f64,
+        /// Minimum class size in non-blank lines
+        #[arg(long, default_value = "1")]
+        min_lines: usize,
+        /// Max pairs
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
     /// Show symbols in a file
     Outline {
         /// File path
@@ -1308,6 +1335,23 @@ fn main() -> Result<()> {
             limit,
         } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
         Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
+        Commands::Impact { fqn } => commands::php::cmd_impact(&root, &fqn, format),
+        Commands::MovePlan { fqn, namespace } => {
+            commands::php::cmd_move_plan(&root, &fqn, &namespace, format)
+        }
+        Commands::Duplicates {
+            path,
+            min_similarity,
+            min_lines,
+            limit,
+        } => commands::php::cmd_duplicates(
+            &root,
+            path.as_deref(),
+            min_similarity,
+            min_lines,
+            limit,
+            format,
+        ),
         Commands::UnusedSymbols {
             module,
             export_only,

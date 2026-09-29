@@ -32,8 +32,15 @@ impl LanguageParser for PhpParser {
         defined: &[ParsedSymbol],
         file_type: FileType,
     ) -> Result<Vec<ParsedRef>> {
-        let mut refs = extract_references_for_lang(content, defined, Some(file_type))?;
-        refs.extend(phpdoc::extract_phpdoc_refs(content, defined, file_type));
+        // Only real definitions hide a name: `use Trait;` inside a class is recorded as an
+        // import symbol with the short name, which would drop every reference to the trait.
+        let definitions: Vec<ParsedSymbol> = defined
+            .iter()
+            .filter(|s| s.kind != SymbolKind::Import)
+            .cloned()
+            .collect();
+        let mut refs = extract_references_for_lang(content, &definitions, Some(file_type))?;
+        refs.extend(phpdoc::extract_phpdoc_refs(content, &definitions, file_type));
         Ok(refs)
     }
 

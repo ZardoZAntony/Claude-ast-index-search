@@ -270,6 +270,11 @@ pub fn load_config(root: &Path) -> Option<ProjectConfig> {
     }
 }
 
+/// Project config without the "Loaded config" notice, for commands that re-read it.
+pub fn load_config_quiet(root: &Path) -> Option<ProjectConfig> {
+    config_path(root).and_then(|path| parse_config(&path).ok())
+}
+
 /// Which hidden entries (dot-files and dot-directories) a walk may enter.
 ///
 /// Walks skip hidden entries. `include_hidden` in the project config lists gitignore-style
@@ -284,8 +289,7 @@ pub struct HiddenPolicy {
 impl HiddenPolicy {
     /// Policy from the config in `root`; read quietly, since walks run after the config notice.
     pub fn for_root(root: &Path) -> Self {
-        let allow = config_path(root)
-            .and_then(|path| parse_config(&path).ok())
+        let allow = load_config_quiet(root)
             .and_then(|config| config.include_hidden)
             .filter(|patterns| !patterns.is_empty())
             .and_then(|patterns| {
@@ -1221,6 +1225,8 @@ struct ParsedFile {
     symbols: Vec<ParsedSymbol>,
     qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
+    /// Fully qualified class name per reference (PHP); empty when the language has none.
+    ref_fqns: Vec<Option<String>>,
 }
 
 /// File scheduled by incremental update.
@@ -1306,6 +1312,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
+            ref_fqns: vec![],
         });
     }
 
@@ -1328,6 +1335,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 symbols: vec![],
                 qualified_names: HashMap::new(),
                 refs: vec![],
+                ref_fqns: vec![],
             });
         }
     };
@@ -1337,6 +1345,13 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
 
     if file_type == parsers::FileType::Cpp {
         qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+    }
+
+    let mut ref_fqns = Vec::new();
+    if file_type == parsers::FileType::Php {
+        let names = parsers::php_names::resolve(&content, &symbols, &refs);
+        qualified_names = names.qualified;
+        ref_fqns = names.refs;
     }
 
     // BSL (1C:Enterprise) — module names are encoded in directory structure,
@@ -1383,6 +1398,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         symbols,
         qualified_names,
         refs,
+        ref_fqns,
     })
 }
 
@@ -2268,7 +2284,7 @@ fn write_batch_to_db(
             "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
         )?;
         let mut ref_stmt = tx.prepare_cached(
-            "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO refs (file_id, name, line, context, fqn) VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
 
         for pf in batch {
@@ -2280,6 +2296,7 @@ fn write_batch_to_db(
                 symbols,
                 qualified_names,
                 refs,
+                ref_fqns,
             } = pf;
 
             file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
@@ -2309,8 +2326,15 @@ fn write_batch_to_db(
                 }
             }
 
-            for r in refs {
-                ref_stmt.execute(rusqlite::params![file_id, r.name, r.line as i64, r.context])?;
+            for (i, r) in refs.into_iter().enumerate() {
+                let fqn = ref_fqns.get(i).cloned().flatten();
+                ref_stmt.execute(rusqlite::params![
+                    file_id,
+                    r.name,
+                    r.line as i64,
+                    r.context,
+                    fqn
+                ])?;
             }
 
             *total_count += 1;
@@ -4954,6 +4978,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
+            ref_fqns: vec![],
         });
     }
 
@@ -4968,6 +4993,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         symbols,
         qualified_names: HashMap::new(),
         refs,
+        ref_fqns: vec![],
     })
 }
 

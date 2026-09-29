@@ -463,6 +463,22 @@ for bare arrays must unwrap `items`, and every client should check `truncated`
 before treating results as complete. Increase `--limit` to request more rows.
 The `changed` command remains on its independent schema v1.
 
+## PHP Refactoring
+
+PHP class references keep their fully qualified name (resolved from `namespace`, `use`,
+PHPDoc and FQN strings), so these answer refactoring questions in one call:
+
+```bash
+ast-index impact 'App\Order\OrderDto'                  # everything a change touches, by kind
+ast-index move-plan 'App\Order\OrderDto' 'App\Order\Dto'  # edits for a namespace move
+ast-index usages 'App\Order\OrderDto'                  # this class only, not its namesakes
+ast-index callers 'CacheInvalidatorInterface::invalidate' # calls through the type and subtypes
+ast-index unused-symbols --module src/Order/             # dead classes, checked by FQN
+ast-index duplicates --path src/                         # near-copy classes and their usage
+```
+
+See `plugin/skills/ast-index/references/php-commands.md` for details.
+
 ## Advanced
 
 Run SQL against the SQLite index:

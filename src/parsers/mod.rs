@@ -18,6 +18,7 @@
 //! - Dart/Flutter
 
 pub mod perl;
+pub mod php_names;
 pub mod phpdoc;
 pub mod typescript;
 pub mod wsdl;

@@ -109,6 +109,30 @@ pub fn cmd_unused_symbols(
     let mut unused: Vec<&db::SearchResult> = Vec::new();
 
     for sym in &symbols {
+        // PHP classes: references resolved to this exact FQN from other files, so a dead class
+        // with a live namesake elsewhere is still reported.
+        let php_class = sym.qualified_name.is_some()
+            && (sym.path.ends_with(".php") || sym.path.ends_with(".phtml"))
+            && matches!(sym.kind.as_str(), "class" | "interface" | "enum" | "object");
+        if php_class {
+            let fqn_refs: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM refs r JOIN files f ON f.id = r.file_id
+                     WHERE r.fqn = ?1 COLLATE NOCASE AND f.path <> ?2",
+                    params![sym.qualified_name, sym.path],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if fqn_refs > 0 {
+                continue;
+            }
+            unused.push(sym);
+            if unused.len() >= limit {
+                break;
+            }
+            continue;
+        }
+
         // Check refs table
         let ref_count: i64 = conn
             .query_row(

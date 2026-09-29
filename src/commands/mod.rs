@@ -21,6 +21,7 @@ pub mod ios;
 pub mod management;
 pub mod modules;
 pub mod perl;
+pub mod php;
 pub mod project_info;
 pub mod watch;
 
