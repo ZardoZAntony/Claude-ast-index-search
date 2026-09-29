@@ -467,10 +467,15 @@ PHPDoc and FQN strings), so these answer refactoring questions in one call:
 ast-index impact 'App\Order\OrderDto'                  # everything a change touches, by kind
 ast-index move-plan 'App\Order\OrderDto' 'App\Order\Dto'  # edits for a namespace move
 ast-index usages 'App\Order\OrderDto'                  # this class only, not its namesakes
+ast-index implementations 'App\Base\Version'           # subtypes, import aliases included
 ast-index callers 'CacheInvalidatorInterface::invalidate' # calls through the type and subtypes
 ast-index unused-symbols --module src/Order/             # dead classes, checked by FQN
 ast-index duplicates --path src/                         # near-copy classes and their usage
 ```
+
+`impact` summarizes more than 60 references per file; add `--full` for every line.
+`unused-symbols` skips files and method names listed in `unused_ignore` and
+`unused_ignore_names` in `.ast-index.yaml` (framework entry points).
 
 See `plugin/skills/ast-index/references/php-commands.md` for details.
 

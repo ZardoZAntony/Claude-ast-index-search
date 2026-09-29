@@ -313,3 +313,309 @@ fn implementations_accept_fqn() {
         .collect();
     assert_eq!(fqns, vec!["App\\Cache\\OrderInvalidator"]);
 }
+
+fn run_text(cwd: &Path, cache: &Path, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(cwd)
+        .args(args)
+        .env("AST_INDEX_CACHE_DIR", cache)
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("AST_INDEX_DB_PATH")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Aliased imports, traits, supertypes, long classes and DI wiring.
+fn project2() -> (TempDir, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    write(
+        root,
+        ".ast-index.yaml",
+        "unused_ignore:\n  - \"**/install/index.php\"\nunused_ignore_names:\n  - \"*Action\"\n",
+    );
+    write(root, "src/Base/Version.php", "<?php\nnamespace App\\Base;\n\nabstract class OrtekaVersion\n{\n    abstract public function up(): void;\n}\n");
+    write(root, "migrations/V1.php", "<?php\nnamespace Migrations;\n\nuse App\\Base\\OrtekaVersion as Version;\n\nfinal class V1 extends Version\n{\n    public function up(): void {}\n}\n");
+    write(root, "migrations/V2.php", "<?php\nnamespace Migrations;\n\nuse App\\Base\\OrtekaVersion as Version;\n\nfinal class V2 extends Version\n{\n    public function up(): void {}\n}\n");
+
+    write(root, "src/Model/BaseTrait.php", "<?php\nnamespace App\\Model;\n\ntrait BaseTrait\n{\n    public function id(): int { return 1; }\n}\n");
+    write(
+        root,
+        "src/Model/Entity.php",
+        "<?php\nnamespace App\\Model;\n\nfinal class Entity\n{\n    use BaseTrait;\n}\n",
+    );
+    write(
+        root,
+        "src/Model/Sub/Entity.php",
+        "<?php\nnamespace App\\Model\\Sub;\n\nfinal class Entity {}\n",
+    );
+
+    // A long class: the method is far below the class line.
+    let filler: String = (0..450).map(|i| format!("    // filler {i}\n")).collect();
+    write(root, "src/Cache/CacheManagerInterface.php", "<?php\nnamespace App\\Cache;\n\ninterface CacheManagerInterface\n{\n    public function remember(string $key): mixed;\n}\n");
+    write(root, "src/Cache/CacheManager.php", &format!("<?php\nnamespace App\\Cache;\n\nclass CacheManager implements CacheManagerInterface\n{{\n{filler}    public function remember(string $key): mixed {{ return null; }}\n}}\n"));
+    write(root, "src/Cache/TaggedCacheManager.php", "<?php\nnamespace App\\Cache;\n\nfinal class TaggedCacheManager extends CacheManager\n{\n    public function remember(string $key): mixed\n    {\n        return parent::remember($key);\n    }\n}\n");
+    write(root, "src/Cache/Consumer.php", "<?php\nnamespace App\\Cache;\n\nfinal class Consumer\n{\n    public function __construct(\n        private CacheManagerInterface $cache,\n        private CacheManager $manager,\n    ) {}\n\n    public function a(): void\n    {\n        $this->cache->remember('a');\n        // $this->manager->remember('in a comment');\n        $this->manager->remember('b'); $this->manager->remember('c');\n        usort($list, function ($x) { return $this->manager->remember('d'); });\n    }\n\n    public function b(CacheManager $m): void\n    {\n        $m = $this->other();\n        $m->remember('e');\n    }\n}\n");
+
+    write(root, "src/Di/Registered.php", "<?php\nnamespace App\\Di;\n\nfinal class Registered\n{\n    public function __construct() {}\n}\n");
+    write(
+        root,
+        "src/Di/Requested.php",
+        "<?php\nnamespace App\\Di;\n\nfinal class Requested\n{\n    public function listAction(): array { return []; }\n}\n",
+    );
+    write(root, "src/di/services.php", "<?php\nuse App\\Di\\Registered;\nuse App\\Di\\Requested;\n\nreturn [\n    Registered::class => ['className' => Registered::class],\n    Requested::class => [\n        'constructor' => static fn() => new Requested(),\n    ],\n];\n");
+    write(
+        root,
+        "src/install/index.php",
+        "<?php\nfinal class ModuleInstaller\n{\n    public function DoInstall(): void {}\n}\n",
+    );
+
+    write(root, "src/Dup/A/Same.php", "<?php\nnamespace App\\Dup;\n\nfinal class Same\n{\n    public function one(): int { return 1; }\n    public function two(): int { return 2; }\n}\n");
+    write(root, "src/Dup/B/Same.php", "<?php\nnamespace App\\Dup;\n\nfinal class Same\n{\n    public function one(): int { return 1; }\n    public function two(): int { return 2; }\n}\n");
+
+    let many: String = (0..70)
+        .map(|i| format!("        $a{i} = new Target();\n"))
+        .collect();
+    write(
+        root,
+        "src/Many/Target.php",
+        "<?php\nnamespace App\\Many;\n\nfinal class Target {}\n",
+    );
+    write(root, "src/Many/User.php", &format!("<?php\nnamespace App\\Many;\n\nfinal class User\n{{\n    public function run(): void\n    {{\n{many}    }}\n}}\n"));
+
+    write(
+        root,
+        "src/Orm/ThingCollection.php",
+        "<?php\nnamespace App\\Orm;\n\nuse App\\Orm\\Table\\EO_Thing_Collection;\n\nfinal class ThingCollection extends EO_Thing_Collection {}\n",
+    );
+
+    run(root, cache.path(), &["rebuild"]);
+    (tmp, cache)
+}
+
+#[test]
+fn implementations_of_a_type_outside_the_index() {
+    let (tmp, cache) = project2();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "implementations",
+            "App\\Orm\\Table\\EO_Thing_Collection",
+        ],
+    );
+    let fqns: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["fqn"].as_str().unwrap())
+        .collect();
+    assert_eq!(fqns, vec!["App\\Orm\\ThingCollection"]);
+}
+
+#[test]
+fn implementations_follow_import_aliases() {
+    let (tmp, cache) = project2();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "implementations",
+            "App\\Base\\OrtekaVersion",
+        ],
+    );
+    let mut fqns: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["fqn"].as_str().unwrap())
+        .collect();
+    fqns.sort();
+    assert_eq!(fqns, vec!["Migrations\\V1", "Migrations\\V2"]);
+}
+
+#[test]
+fn alias_import_line_resolves_to_the_class() {
+    let (tmp, cache) = project2();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &["--format", "json", "impact", "App\\Base\\OrtekaVersion"],
+    );
+    let lines: Vec<String> = v["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{}:{}:{}",
+                r["path"].as_str().unwrap(),
+                r["line"],
+                r["kind"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(
+        lines.contains(&"migrations/V1.php:4:import".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"migrations/V1.php:6:inheritance".to_string()),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn move_plan_imports_a_same_namespace_trait_and_warns_on_collision() {
+    let (tmp, cache) = project2();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "move-plan",
+            "App\\Model\\Entity",
+            "App\\Model\\Sub",
+        ],
+    );
+    let plan = serde_json::to_string(&v["files"]).unwrap();
+    assert!(
+        plan.contains("add `use App\\\\Model\\\\BaseTrait;`"),
+        "{plan}"
+    );
+    let warnings = serde_json::to_string(&v["warnings"]).unwrap();
+    assert!(
+        warnings.contains("already exists at src/Model/Sub/Entity.php"),
+        "{warnings}"
+    );
+}
+
+#[test]
+fn callers_find_far_declarations_supertype_calls_and_rebinding() {
+    let (tmp, cache) = project2();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "callers",
+            "App\\Cache\\CacheManager::remember",
+        ],
+    );
+    let decls: Vec<String> = v["declarations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| format!("{}:{}", d["path"].as_str().unwrap(), d["line"]))
+        .collect();
+    assert!(
+        decls.contains(&"src/Cache/CacheManager.php:456".to_string()),
+        "{decls:?}"
+    );
+    assert!(
+        decls.contains(&"src/Cache/TaggedCacheManager.php:6".to_string()),
+        "{decls:?}"
+    );
+    assert_eq!(
+        paths(&v, "calls"),
+        vec![
+            "src/Cache/Consumer.php:15".to_string(),
+            "src/Cache/Consumer.php:15".to_string(),
+            "src/Cache/Consumer.php:16".to_string(),
+            "src/Cache/TaggedCacheManager.php:8".to_string(),
+        ]
+    );
+    assert_eq!(
+        paths(&v, "via_supertype"),
+        vec!["src/Cache/Consumer.php:13".to_string()]
+    );
+    assert_eq!(
+        paths(&v, "unresolved"),
+        vec!["src/Cache/Consumer.php:22".to_string()]
+    );
+}
+
+#[test]
+fn impact_summarizes_many_references_per_file() {
+    let (tmp, cache) = project2();
+    let text = run_text(tmp.path(), cache.path(), &["impact", "App\\Many\\Target"]);
+    assert!(text.contains("per file"), "{text}");
+    assert!(text.contains("src/Many/User.php  new×70"), "{text}");
+    assert!(!text.contains("$a42 = new Target"), "{text}");
+    let full = run_text(
+        tmp.path(),
+        cache.path(),
+        &["impact", "App\\Many\\Target", "--full"],
+    );
+    assert!(full.contains("$a42 = new Target"), "{full}");
+}
+
+#[test]
+fn duplicates_flag_copies_with_the_same_fqn() {
+    let (tmp, cache) = project2();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &["--format", "json", "duplicates"],
+    );
+    let pair = v["pairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "Same")
+        .expect("Same pair");
+    assert_eq!(pair["same_fqn"], true);
+}
+
+#[test]
+fn unused_symbols_skip_magic_ignored_files_and_report_di_only() {
+    let (tmp, cache) = project2();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "unused-symbols",
+            "--module",
+            "src/",
+            "--limit",
+            "500",
+        ],
+    );
+    let rows = v.as_array().unwrap();
+    let names: Vec<&str> = rows.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert!(!names.contains(&"__construct"), "{names:?}");
+    assert!(!names.contains(&"DoInstall"), "{names:?}");
+    assert!(!names.contains(&"ModuleInstaller"), "{names:?}");
+    assert!(!names.contains(&"Requested"), "{names:?}");
+    assert!(!names.contains(&"listAction"), "{names:?}");
+    let registered = rows
+        .iter()
+        .find(|s| s["name"] == "Registered")
+        .expect("Registered reported");
+    assert_eq!(registered["reason"], "registered in DI only");
+}
+
+#[test]
+fn short_name_usages_warn_about_namesakes() {
+    let (tmp, cache) = project();
+    let text = run_text(tmp.path(), cache.path(), &["usages", "OrderDto"]);
+    assert!(text.contains("2 classes are named OrderDto"), "{text}");
+}

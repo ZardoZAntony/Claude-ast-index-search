@@ -623,7 +623,9 @@ Consult: `references/php-commands.md`
 
 - Class references carry fully qualified names (namespace, `use`, PHPDoc, FQN strings)
 - One-call refactoring: `impact <FQN>`, `move-plan <FQN> <namespace>`, `usages <FQN>`,
-  `callers 'Type::method'`, `unused-symbols`, `duplicates`
+  `implementations <FQN>`, `callers 'Type::method'`, `unused-symbols`, `duplicates`
+- `callers` output has sections: calls on the type, calls via a supertype (may dispatch here),
+  receiver not inferred (check by hand), excluded
 
 ### Go
 
@@ -640,7 +642,7 @@ Consult: `references/go-commands.md`
 
 ### PHP
 
-- Index: `namespace`, `class`, `interface`, `trait`, `enum`, `function`, `method`, `const`, `property`, `use`
+- Index: `namespace`, `class`, `interface`, `trait` (kind `trait`), `enum`, `function`, `method`, `const`, `property`, `use`
 - Supports: Laravel (models, traits, facades), `extends`/`implements`, namespace imports
 - `outline` and `imports` work with PHP files
 

@@ -844,6 +844,7 @@ pub fn cmd_usages(
                 println!("  No usages found in index.");
             }
             print_truncation_notice(page.pagination);
+            super::php::print_namesakes_notice(&conn, symbol);
 
             return Ok(());
         }

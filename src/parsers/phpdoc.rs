@@ -439,15 +439,18 @@ fn read_reference(doc: &Doc, i: usize, out: &mut Vec<(String, usize)>) -> usize 
     j
 }
 
-/// Emit each CamelCase segment of a (possibly qualified) name, as the generic extractor does
-/// for code lines: `\Orteka\Foo\BarDto` → `Orteka`, `Foo`, `BarDto`.
+/// Emit each capitalized segment of a (possibly qualified) name, as the code extractors do:
+/// `\Orteka\Foo\BarDto` → `Orteka`, `Foo`, `BarDto`. Underscores are allowed (Bitrix ORM
+/// `EO_Product_Collection`), except in ALL-CAPS constant names.
 fn push_names(word: &str, line: usize, out: &mut Vec<(String, usize)>) {
     for segment in word.split('\\') {
         let mut chars = segment.chars();
         let Some(first) = chars.next() else {
             continue;
         };
-        if first.is_ascii_uppercase() && chars.all(|c| c.is_ascii_alphanumeric()) {
+        let word_chars = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let constant = segment.contains('_') && !segment.chars().any(|c| c.is_ascii_lowercase());
+        if first.is_ascii_uppercase() && word_chars && !constant {
             out.push((segment.to_string(), line));
         }
     }
@@ -594,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn defined_and_noise_names_are_filtered() {
+    fn defined_names_are_filtered_and_exceptions_kept() {
         let symbols = vec![ParsedSymbol {
             name: "SelfDto".to_string(),
             kind: crate::db::SymbolKind::Class,
@@ -607,7 +610,8 @@ mod tests {
             .into_iter()
             .map(|r| r.name)
             .collect();
-        assert_eq!(refs, vec!["OtherDto"]);
+        // `Exception` is a PHP class, not stdlib noise as in Kotlin.
+        assert_eq!(refs, vec!["Exception", "OtherDto"]);
     }
 
     #[test]

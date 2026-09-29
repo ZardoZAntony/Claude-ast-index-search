@@ -4125,6 +4125,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
             line INTEGER NOT NULL,
             context TEXT,
             fqn TEXT,
+            ref_kind TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         );
 
@@ -4513,7 +4514,8 @@ fn inspect_open_migrations(
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
     let files_uniqueness_current = !files_exists || !files_has_legacy_path_unique(conn)?;
     let symbols_current = !symbols_exists || column_exists(conn, "symbols", "qualified_name")?;
-    let refs_current = !table_exists(conn, "refs")? || column_exists(conn, "refs", "fqn")?;
+    let refs_current = !table_exists(conn, "refs")?
+        || (column_exists(conn, "refs", "fqn")? && column_exists(conn, "refs", "ref_kind")?);
 
     let (stored_root, has_legacy_extra_roots) = if metadata_exists {
         let stored_root = conn
@@ -4654,6 +4656,10 @@ fn apply_open_migrations_transaction(
         if !column_exists(&tx, "refs", "fqn")? {
             tx.execute("ALTER TABLE refs ADD COLUMN fqn TEXT", [])
                 .context("failed to add refs.fqn")?;
+        }
+        if !column_exists(&tx, "refs", "ref_kind")? {
+            tx.execute("ALTER TABLE refs ADD COLUMN ref_kind TEXT", [])
+                .context("failed to add refs.ref_kind")?;
         }
         tx.execute(CREATE_REFS_FQN_INDEX_SQL, [])
             .context("failed to create idx_refs_fqn")?;
@@ -5375,6 +5381,7 @@ pub fn db_exists(project_root: &Path) -> bool {
 pub enum SymbolKind {
     Class,
     Interface,
+    Trait,
     Object,
     Enum,
     Function,
@@ -5395,6 +5402,7 @@ impl SymbolKind {
         match self {
             SymbolKind::Class => "class",
             SymbolKind::Interface => "interface",
+            SymbolKind::Trait => "trait",
             SymbolKind::Object => "object",
             SymbolKind::Enum => "enum",
             SymbolKind::Function => "function",
@@ -5936,7 +5944,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
-              AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
+              AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
             ORDER BY length(s.qualified_name), s.qualified_name
             LIMIT ?2
             "#,
@@ -5954,7 +5962,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name = ?1
-              AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
+              AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
             LIMIT ?2
             "#,
         )?;
@@ -5972,7 +5980,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
-              AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
+              AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
             ORDER BY length(s.qualified_name), s.qualified_name
             LIMIT ?2
             "#,
@@ -5991,7 +5999,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
-              AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
+              AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
             ORDER BY length(s.qualified_name), s.qualified_name
             LIMIT ?2
             "#,
@@ -6007,7 +6015,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.name = ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
+        WHERE s.name = ?1 AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
         LIMIT ?2
         "#,
     )?;
@@ -6069,7 +6077,7 @@ pub fn find_class_like_pattern(
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE ({} LIKE ?1 ESCAPE '\'{} ) AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
+        WHERE ({} LIKE ?1 ESCAPE '\'{} ) AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
         ORDER BY length({}), {}
         LIMIT ?{}
         "#,
@@ -6984,7 +6992,7 @@ fn count_symbol_matches(
         "SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicate}){scope_clause}"
     );
     if class_only {
-        sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+        sql.push_str(" AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
     }
     if exclude_imports {
         sql.push_str(" AND s.kind != 'import'");
@@ -7341,7 +7349,7 @@ pub fn search_symbols_for_command(
             sql.push_str(" AND s.kind = ?");
         }
         if class_only {
-            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+            sql.push_str(" AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
         sql.push_str(&format!(
             " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, length({column}) LIMIT ?"
@@ -7375,7 +7383,7 @@ pub fn search_symbols_for_command(
             sql.push_str(" AND s.kind = ?");
         }
         if class_only {
-            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+            sql.push_str(" AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
         sql.push_str(" ORDER BY length(s.qualified_name), s.qualified_name LIMIT ?");
         if let Some(kind) = kind {
@@ -7398,7 +7406,7 @@ pub fn search_symbols_for_command(
             sql.push_str(" AND s.kind = ?");
         }
         if class_only {
-            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+            sql.push_str(" AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
         sql.push_str(" LIMIT ?");
         if let Some(kind) = kind {
@@ -7684,7 +7692,7 @@ pub fn find_class_like_scoped(
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE {} AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
+        WHERE {} AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
         LIMIT ?{}
         "#,
         predicate,
@@ -7712,7 +7720,7 @@ pub fn find_class_like_scoped(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
+            WHERE s.qualified_name LIKE ?1 AND s.kind IN ('class', 'interface', 'trait', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
             LIMIT ?{}
             "#,
             scope_clause,

@@ -26,7 +26,7 @@ use crate::indexer;
 
 const CONFIG_EXTENSIONS: &[&str] = &["neon", "yaml", "yml", "json", "xml"];
 const MAX_CONFIG_FILE_BYTES: u64 = 1_000_000;
-const CLASS_KINDS: &str = "('class', 'interface', 'enum', 'object')";
+const CLASS_KINDS: &str = "('class', 'interface', 'trait', 'enum', 'object')";
 const COVERAGE: &str = "PHP code, use imports, PHPDoc types, FQN strings in PHP, \
 config files (.neon .yaml .yml .json .xml); not covered: dynamically built class names, \
 files excluded from the index";
@@ -126,7 +126,25 @@ fn truncate(text: &str, max: usize) -> String {
 
 static NEW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bnew\s+\\?[\w\\]+").unwrap());
 
-/// Kind of use on a reference line, from its text.
+/// Kind of use recorded by the indexer; `None` for rows written before kinds were stored.
+fn stored_kind(kind: Option<&str>) -> Option<&'static str> {
+    Some(match kind? {
+        "import" => "import",
+        "trait-use" => "trait-use",
+        "phpdoc" => "phpdoc",
+        "attribute" => "attribute",
+        "::class" => "::class",
+        "new" => "new",
+        "static" => "static",
+        "inheritance" => "inheritance",
+        "check" => "check",
+        "string" => "string",
+        "type" => "type",
+        _ => return None,
+    })
+}
+
+/// Kind of use on a reference line, from its text (fallback for indexes without kinds).
 fn classify(context: &str, short: &str) -> &'static str {
     let t = context.trim_start();
     if t.starts_with("use ") {
@@ -168,7 +186,7 @@ fn classify(context: &str, short: &str) -> &'static str {
 fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>> {
     let short = short_name(fqn).to_string();
     let mut stmt = conn.prepare(
-        "SELECT f.path, f.root_path, r.line, r.context, r.file_id
+        "SELECT f.path, f.root_path, r.line, r.context, r.file_id, r.ref_kind
          FROM refs r JOIN files f ON f.id = r.file_id
          WHERE r.fqn = ?1 COLLATE NOCASE
          ORDER BY f.path, r.line",
@@ -182,10 +200,11 @@ fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>>
             row.get::<_, i64>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, i64>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     for item in mapped {
-        let (path, root_path, line, context, file_id) = item?;
+        let (path, root_path, line, context, file_id, kind) = item?;
         if !seen.insert((file_id, line)) {
             continue;
         }
@@ -193,7 +212,7 @@ fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>>
         let context = context.unwrap_or_default();
         rows.push(RefRow {
             test: is_test_path(&shown),
-            kind: classify(&context, &short),
+            kind: stored_kind(kind.as_deref()).unwrap_or_else(|| classify(&context, &short)),
             context,
             path: shown,
             line,
@@ -381,11 +400,38 @@ pub fn cmd_usages_fqn(root: &Path, fqn: &str, limit: usize, format: &str) -> Res
     Ok(())
 }
 
+/// A short name shared by several PHP classes: `usages Name` mixes them, the FQN form does not.
+pub fn print_namesakes_notice(conn: &Connection, name: &str) {
+    let sql = format!(
+        "SELECT DISTINCT qualified_name FROM symbols
+         WHERE name = ?1 COLLATE NOCASE AND qualified_name IS NOT NULL AND kind IN {CLASS_KINDS}
+         ORDER BY qualified_name"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return;
+    };
+    let fqns: Vec<String> = stmt
+        .query_map(params![name], |row| row.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    if fqns.len() > 1 {
+        println!(
+            "{} {} classes are named {name}; these usages mix them. For one class: usages '<FQN>' ({})",
+            "note:".yellow(),
+            fqns.len(),
+            fqns.join(", ")
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // impact <FQN>
 // ---------------------------------------------------------------------------
 
-pub fn cmd_impact(root: &Path, fqn: &str, format: &str) -> Result<()> {
+/// Above this many references the text output lists files with counts instead of every line.
+const IMPACT_FULL_LIMIT: usize = 60;
+
+pub fn cmd_impact(root: &Path, fqn: &str, full: bool, format: &str) -> Result<()> {
     let _lease = db::acquire_project_lease(root)?;
     let conn = open(root)?;
     let fqn = normalize_fqn(fqn);
@@ -429,18 +475,25 @@ pub fn cmd_impact(root: &Path, fqn: &str, format: &str) -> Result<()> {
         files.len(),
         kinds.join(", ")
     );
-    let mut current = "";
-    for r in &refs {
-        if r.path != current {
-            current = &r.path;
-            println!("{}", r.path.cyan());
+    if full || refs.len() <= IMPACT_FULL_LIMIT {
+        let mut current = "";
+        for r in &refs {
+            if r.path != current {
+                current = &r.path;
+                println!("{}", r.path.cyan());
+            }
+            println!(
+                "  {:>5} {:<11} {}",
+                r.line,
+                r.kind,
+                truncate(&r.context, 100)
+            );
         }
+    } else {
         println!(
-            "  {:>5} {:<11} {}",
-            r.line,
-            r.kind,
-            truncate(&r.context, 100)
+            "  per file (more than {IMPACT_FULL_LIMIT} references; --full or --format json lists every line):"
         );
+        print_file_summary(&refs);
     }
     println!("config mentions: {}", config.len());
     for c in &config {
@@ -448,6 +501,32 @@ pub fn cmd_impact(root: &Path, fqn: &str, format: &str) -> Result<()> {
     }
     println!("coverage: {COVERAGE}");
     Ok(())
+}
+
+/// One line per file: counts by kind and the first line numbers.
+fn print_file_summary(refs: &[RefRow]) {
+    let mut files: Vec<(&str, BTreeMap<&str, usize>, Vec<i64>)> = Vec::new();
+    for r in refs {
+        if files.last().is_none_or(|(p, _, _)| *p != r.path) {
+            files.push((&r.path, BTreeMap::new(), Vec::new()));
+        }
+        let (_, kinds, lines) = files.last_mut().expect("pushed above");
+        *kinds.entry(r.kind).or_default() += 1;
+        lines.push(r.line);
+    }
+    for (path, kinds, lines) in files {
+        let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{k}×{n}")).collect();
+        let mut shown: Vec<String> = lines.iter().take(8).map(|l| l.to_string()).collect();
+        if lines.len() > 8 {
+            shown.push("…".into());
+        }
+        println!(
+            "  {}  {}  (lines {})",
+            path.cyan(),
+            kinds.join(" "),
+            shown.join(", ")
+        );
+    }
 }
 
 /// Last two path components (`Elastic/Foo.php`): how config files usually point at a class file.
@@ -491,6 +570,25 @@ pub fn cmd_move_plan(root: &Path, fqn: &str, new_namespace: &str, format: &str) 
     let Some(def) = defs.first() else {
         bail!("{fqn} is not defined in the index");
     };
+    let mut warnings = Vec::new();
+    if defs.len() > 1 {
+        let places: Vec<String> = defs
+            .iter()
+            .map(|d| format!("{}:{}", d.path, d.line))
+            .collect();
+        warnings.push(format!(
+            "{fqn} is defined {} times ({}); the plan moves the first one, references cannot be \
+             told apart",
+            defs.len(),
+            places.join(", ")
+        ));
+    }
+    if let Some(taken) = definitions(&conn, root, &new_fqn)?.first() {
+        warnings.push(format!(
+            "{new_fqn} already exists at {}:{} — the move would collide",
+            taken.path, taken.line
+        ));
+    }
     let refs = refs_by_fqn(&conn, root, &fqn)?;
     let mut plan: Vec<FileEdits> = Vec::new();
 
@@ -544,9 +642,11 @@ pub fn cmd_move_plan(root: &Path, fqn: &str, new_namespace: &str, format: &str) 
             });
         }
         let mut inline = 0;
+        let fqn_lower = fqn.to_ascii_lowercase();
+        let escaped_lower = fqn_lower.replace('\\', "\\\\");
         for r in rows.iter().filter(|r| r.kind != "import") {
-            let has_fqn =
-                r.context.contains(&fqn) || r.context.contains(&fqn.replace('\\', "\\\\"));
+            let context = r.context.to_ascii_lowercase();
+            let has_fqn = context.contains(&fqn_lower) || context.contains(&escaped_lower);
             if has_fqn {
                 inline += 1;
                 edits.push(Edit {
@@ -595,10 +695,14 @@ pub fn cmd_move_plan(root: &Path, fqn: &str, new_namespace: &str, format: &str) 
             "new_fqn": new_fqn,
             "files": plan,
             "summary": {"edits": edit_count, "files": plan.len(), "references_resolved_through_import": untouched},
+            "warnings": warnings,
             "coverage": COVERAGE,
         }));
     }
     println!("{}", format!("Move {fqn} → {new_fqn}").bold());
+    for w in &warnings {
+        println!("  {} {w}", "warning:".yellow());
+    }
     for f in &plan {
         println!("{}", f.path.cyan());
         for e in &f.edits {
@@ -621,24 +725,37 @@ fn psr4_path(path: &str, old_ns: &str, new_ns: &str) -> Option<String> {
     let (dir, file) = path.rsplit_once('/')?;
     let dir_parts: Vec<&str> = dir.split('/').collect();
     let ns_parts: Vec<&str> = old_ns.split('\\').filter(|s| !s.is_empty()).collect();
+    // Case-insensitive: Bitrix module autoload maps `Orteka\Main\Metro` to `lib/metro/`.
     let mut matched = 0;
-    while matched < dir_parts.len()
-        && matched < ns_parts.len()
-        && dir_parts[dir_parts.len() - 1 - matched] == ns_parts[ns_parts.len() - 1 - matched]
-    {
+    let mut lowercase_dirs = false;
+    while matched < dir_parts.len() && matched < ns_parts.len() {
+        let dir_part = dir_parts[dir_parts.len() - 1 - matched];
+        let ns_part = ns_parts[ns_parts.len() - 1 - matched];
+        if !dir_part.eq_ignore_ascii_case(ns_part) {
+            break;
+        }
+        lowercase_dirs |= dir_part != ns_part && dir_part == ns_part.to_ascii_lowercase();
         matched += 1;
     }
     let base = dir_parts[..dir_parts.len() - matched].join("/");
     let prefix = ns_parts[..ns_parts.len() - matched].join("\\");
     let rest = if prefix.is_empty() {
         new_ns
+    } else if new_ns.len() >= prefix.len() && new_ns[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+        let rest = &new_ns[prefix.len()..];
+        if !rest.is_empty() && !rest.starts_with('\\') {
+            return None;
+        }
+        rest.trim_start_matches('\\')
     } else {
-        new_ns
-            .strip_prefix(&prefix)?
-            .strip_prefix('\\')
-            .unwrap_or("")
+        return None;
     };
     let rel = rest.replace('\\', "/");
+    let rel = if lowercase_dirs {
+        rel.to_ascii_lowercase()
+    } else {
+        rel
+    };
     Some(
         [base.as_str(), rel.as_str(), file]
             .iter()
@@ -667,7 +784,8 @@ fn implicit_same_namespace_deps(
     own_fqn: &str,
 ) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT fqn, line, context FROM refs WHERE file_id = ?1 AND fqn IS NOT NULL ORDER BY line",
+        "SELECT fqn, line, context, ref_kind FROM refs
+         WHERE file_id = ?1 AND fqn IS NOT NULL ORDER BY line",
     )?;
     let rows = stmt
         .query_map(params![file_id], |row| {
@@ -675,13 +793,18 @@ fn implicit_same_namespace_deps(
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    // `use Trait;` inside a class is not an import: the trait resolves by namespace too.
     let imported: HashSet<String> = rows
         .iter()
-        .filter(|(_, _, c)| c.trim_start().starts_with("use "))
-        .map(|(f, _, _)| f.to_ascii_lowercase())
+        .filter(|(fqn, _, context, kind)| {
+            stored_kind(kind.as_deref()).unwrap_or_else(|| classify(context, short_name(fqn)))
+                == "import"
+        })
+        .map(|(f, _, _, _)| f.to_ascii_lowercase())
         .collect();
     let known_class = |fqn: &str| -> bool {
         let sql = format!(
@@ -691,7 +814,7 @@ fn implicit_same_namespace_deps(
             .unwrap_or(false)
     };
     let mut deps: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    for (fqn, line, _) in &rows {
+    for (fqn, line, _, _) in &rows {
         if fqn.eq_ignore_ascii_case(own_fqn)
             || !namespace_of(fqn).eq_ignore_ascii_case(old_ns)
             || imported.contains(&fqn.to_ascii_lowercase())
@@ -732,6 +855,9 @@ struct DuplicatePair {
     similarity: f64,
     lines: usize,
     contract_mirror: bool,
+    /// Both copies declare the same FQN (one of them is usually a leftover): references
+    /// cannot be told apart, so the counts are shared.
+    same_fqn: bool,
     a: CopyInfo,
     b: CopyInfo,
 }
@@ -780,16 +906,17 @@ pub fn cmd_duplicates(
             .push((fqn, shown, line, abs));
     }
 
-    let mut usage_cache: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut usage_cache: HashMap<(String, String), (usize, usize)> = HashMap::new();
     let mut usage = |fqn: &str, own_path: &str| -> Result<(usize, usize)> {
-        if let Some(v) = usage_cache.get(fqn) {
+        let key = (fqn.to_ascii_lowercase(), own_path.to_string());
+        if let Some(v) = usage_cache.get(&key) {
             return Ok(*v);
         }
         let refs = refs_by_fqn(&conn, root, fqn)?;
         let outside: Vec<&RefRow> = refs.iter().filter(|r| r.path != own_path).collect();
         let tests = outside.iter().filter(|r| r.test).count();
         let v = (outside.len() - tests, tests);
-        usage_cache.insert(fqn.to_string(), v);
+        usage_cache.insert(key, v);
         Ok(v)
     };
 
@@ -820,6 +947,7 @@ pub fn cmd_duplicates(
                 }
                 let (fa, pa, linea, _) = &members[i];
                 let (fb, pb, lineb, _) = &members[j];
+                let same_fqn = fa.eq_ignore_ascii_case(fb);
                 let (ra, rta) = usage(fa, pa)?;
                 let (rb, rtb) = usage(fb, pb)?;
                 pairs.push(DuplicatePair {
@@ -827,6 +955,7 @@ pub fn cmd_duplicates(
                     similarity: (similarity * 100.0).round() / 100.0,
                     lines: size,
                     contract_mirror: pa.contains("/Contracts/") || pb.contains("/Contracts/"),
+                    same_fqn,
                     a: CopyInfo {
                         fqn: fa.clone(),
                         path: pa.clone(),
@@ -878,10 +1007,10 @@ pub fn cmd_duplicates(
         .bold()
     );
     for p in &pairs {
-        let tag = if p.contract_mirror {
-            " [contract mirror]"
-        } else {
-            ""
+        let tag = match (p.contract_mirror, p.same_fqn) {
+            (_, true) => " [same FQN — reference counts are shared]",
+            (true, false) => " [contract mirror]",
+            _ => "",
         };
         println!(
             "{:>4.0}%  {}  {} lines{tag}",
@@ -890,7 +1019,9 @@ pub fn cmd_duplicates(
             p.lines
         );
         for c in [&p.a, &p.b] {
-            let unused = if c.references == 0 {
+            let unused = if p.same_fqn {
+                String::new()
+            } else if c.references == 0 {
                 if c.test_references == 0 {
                     "  UNUSED".red().to_string()
                 } else {
@@ -929,7 +1060,7 @@ fn class_body(content: &str, decl_line: usize) -> Vec<String> {
             out.push(t.split_whitespace().collect::<Vec<_>>().join(" "));
         }
         if !is_comment {
-            for c in t.chars() {
+            for c in code_chars(t) {
                 match c {
                     '{' => {
                         depth += 1;
@@ -945,6 +1076,32 @@ fn class_body(content: &str, decl_line: usize) -> Vec<String> {
         }
         if out.len() > 5000 {
             break;
+        }
+    }
+    out
+}
+
+/// Characters of a line outside string literals and a trailing `//` comment, so braces in
+/// `'{'` or `"{$x}"` do not end a class early.
+fn code_chars(line: &str) -> Vec<char> {
+    let mut out = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' {
+                    chars.next();
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '/' if chars.peek() == Some(&'/') => break,
+                '#' if chars.peek() != Some(&'[') => break,
+                _ => out.push(c),
+            },
         }
     }
     out
@@ -1078,11 +1235,10 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
     let mut declarations = Vec::new();
     for fqn in &types {
         for d in definitions(&conn, root, fqn)? {
-            let content = read_lossy(&d.abs).unwrap_or_default();
-            if let Some(n) = find_method_decl(&content, d.line as usize, &method) {
+            if let Some(line) = method_in_class(&conn, d.file_id, d.line, &method) {
                 declarations.push(Declaration {
                     path: d.path.clone(),
-                    line: n as i64,
+                    line,
                     owner: fqn.clone(),
                 });
             }
@@ -1102,14 +1258,27 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
         }
     }
 
-    // Call sites: files with a recorded `method(` reference, plus files that define a method of
-    // that name (the generic extractor skips references to names defined in the same file).
+    // Calls typed as a supertype that declares the method (or lies outside the index) may
+    // dispatch to these types at run time: listed separately, not excluded.
+    let mut via_supertypes = Vec::new();
+    for sup in supertypes(&conn, &roots)? {
+        let defs = definitions(&conn, root, &sup)?;
+        let declares = defs.is_empty()
+            || defs
+                .iter()
+                .any(|d| method_in_class(&conn, d.file_id, d.line, &method).is_some());
+        if declares {
+            via_supertypes.push(sup);
+        }
+    }
+    let supers_lower: HashSet<String> = via_supertypes
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+
     let mut stmt = conn.prepare(
         "SELECT DISTINCT r.file_id, f.path, f.root_path FROM refs r JOIN files f ON f.id = r.file_id
-         WHERE r.name = ?1 AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')
-         UNION
-         SELECT DISTINCT s.file_id, f.path, f.root_path FROM symbols s JOIN files f ON f.id = s.file_id
-         WHERE s.name = ?1 AND s.kind = 'function' AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')",
+         WHERE r.name = ?1 AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')",
     )?;
     let files = stmt
         .query_map(params![method], |row| {
@@ -1122,7 +1291,9 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
         .collect::<Result<Vec<_>, _>>()?;
 
     let call_re = Regex::new(&format!(r"(->|\?->|::)\s*{}\s*\(", regex::escape(&method)))?;
+    let decl_re = Regex::new(&format!(r"\bfunction\s+&?{}\s*\(", regex::escape(&method)))?;
     let mut calls = Vec::new();
+    let mut via_supertype = Vec::new();
     let mut unresolved = Vec::new();
     let mut excluded = Vec::new();
     for (file_id, path, root_path) in files {
@@ -1132,30 +1303,38 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
         };
         let lines: Vec<&str> = content.lines().collect();
         for (idx, line) in lines.iter().enumerate() {
-            let Some(m) = call_re.find(line) else {
-                continue;
-            };
-            if line.contains("function ") {
+            let t = line.trim_start();
+            let comment = t.starts_with("//")
+                || t.starts_with('*')
+                || t.starts_with("/*")
+                || (t.starts_with('#') && !t.starts_with("#["));
+            if comment || decl_re.is_match(line) {
                 continue;
             }
             let line_no = idx as i64 + 1;
-            let receiver =
-                receiver_type(&conn, file_id, &lines, idx, &line[..m.start()], m.as_str());
-            let site = CallSite {
-                path: shown.clone(),
-                line: line_no,
-                receiver: receiver.clone(),
-                context: truncate(line, 110),
-            };
-            match receiver {
-                Some(t) if types_lower.contains(&t.to_ascii_lowercase()) => calls.push(site),
-                Some(_) => excluded.push(site),
-                None => unresolved.push(site),
+            for m in call_re.find_iter(line) {
+                let receiver =
+                    receiver_type(&conn, file_id, &lines, idx, &line[..m.start()], m.as_str());
+                let site = CallSite {
+                    path: shown.clone(),
+                    line: line_no,
+                    receiver: receiver.clone(),
+                    context: truncate(line, 110),
+                };
+                match receiver {
+                    Some(t) if types_lower.contains(&t.to_ascii_lowercase()) => calls.push(site),
+                    Some(t) if supers_lower.contains(&t.to_ascii_lowercase()) => {
+                        via_supertype.push(site)
+                    }
+                    Some(_) => excluded.push(site),
+                    None => unresolved.push(site),
+                }
             }
         }
     }
     let sort = |v: &mut Vec<CallSite>| v.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     sort(&mut calls);
+    sort(&mut via_supertype);
     sort(&mut unresolved);
     sort(&mut excluded);
     let total_calls = calls.len();
@@ -1168,6 +1347,8 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
             "method": method,
             "declarations": declarations,
             "calls": calls,
+            "supertypes": via_supertypes,
+            "via_supertype": via_supertype,
             "unresolved": unresolved,
             "excluded": excluded,
             "pagination": {"total": total_calls, "returned": calls.len(), "truncated": total_calls > calls.len(), "limit": limit},
@@ -1200,6 +1381,26 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
             c.context
         );
     }
+    if !via_supertype.is_empty() {
+        println!(
+            "calls typed as a supertype ({}) — may dispatch here: {}",
+            via_supertypes
+                .iter()
+                .map(|t| short_name(t))
+                .collect::<Vec<_>>()
+                .join(", "),
+            via_supertype.len()
+        );
+        for c in &via_supertype {
+            println!(
+                "  {}:{}  [{}]  {}",
+                c.path.cyan(),
+                c.line,
+                short_name(c.receiver.as_deref().unwrap_or("")),
+                c.context
+            );
+        }
+    }
     println!(
         "receiver not inferred — check by hand: {}",
         unresolved.len()
@@ -1225,9 +1426,24 @@ fn type_fqns(conn: &Connection, type_part: &str) -> Result<Vec<String>> {
             "SELECT DISTINCT qualified_name FROM symbols WHERE qualified_name = ?1 COLLATE NOCASE AND kind IN {CLASS_KINDS}"
         );
         let mut stmt = conn.prepare(&sql)?;
-        return Ok(stmt
+        let defined = stmt
             .query_map(params![type_part], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?);
+            .collect::<Result<Vec<_>, _>>()?;
+        if !defined.is_empty() {
+            return Ok(defined);
+        }
+        // A type outside the index (vendor, framework core, generated ORM classes) still has
+        // subtypes and callers in it when code references it by this FQN.
+        let referenced: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM refs WHERE fqn = ?1 COLLATE NOCASE)",
+            params![type_part],
+            |row| row.get(0),
+        )?;
+        return Ok(if referenced {
+            vec![type_part.to_string()]
+        } else {
+            vec![]
+        });
     }
     let sql = format!(
         "SELECT DISTINCT qualified_name FROM symbols
@@ -1240,44 +1456,140 @@ fn type_fqns(conn: &Connection, type_part: &str) -> Result<Vec<String>> {
     Ok(found)
 }
 
+/// Names a type goes by in the files that reference it: its short name and import aliases.
+fn local_names(conn: &Connection, fqn: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT name FROM refs WHERE fqn = ?1 COLLATE NOCASE")?;
+    let mut names: Vec<String> = stmt
+        .query_map(params![fqn], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let short = short_name(fqn).to_string();
+    if !names.iter().any(|n| n.eq_ignore_ascii_case(&short)) {
+        names.push(short);
+    }
+    Ok(names)
+}
+
+/// Does the `extends`/`implements` name `parent_name` on a declaration at `line` resolve to
+/// `parent`? The name may sit a few lines below the `class` line (multi-line lists, attributes).
+fn parent_resolves(
+    conn: &Connection,
+    file_id: i64,
+    line: i64,
+    parent_name: &str,
+    parent: &str,
+) -> bool {
+    if let Some(stripped) = parent_name.strip_prefix('\\') {
+        return stripped.eq_ignore_ascii_case(parent);
+    }
+    let last = short_name(parent_name);
+    (line..=line + 10)
+        .any(|l| fqn_at(conn, file_id, l, last).is_some_and(|f| f.eq_ignore_ascii_case(parent)))
+}
+
 /// The types plus every class/interface that extends or implements one of them, transitively.
-/// A child counts only if its `extends`/`implements` name resolves to the parent's FQN.
+/// A child counts only if its `extends`/`implements` name resolves to the parent's FQN, under
+/// any alias the parent is imported with.
 fn with_subtypes(conn: &Connection, roots: &[String]) -> Result<Vec<String>> {
     let mut all: Vec<String> = roots.to_vec();
     let mut seen: HashSet<String> = roots.iter().map(|r| r.to_ascii_lowercase()).collect();
     let mut queue: Vec<String> = roots.to_vec();
     let sql = format!(
-        "SELECT s.qualified_name, s.file_id, s.line FROM inheritance i
+        "SELECT s.qualified_name, s.file_id, s.line, i.parent_name FROM inheritance i
          JOIN symbols s ON s.id = i.child_id
          WHERE (i.parent_name = ?1 COLLATE NOCASE OR i.parent_name LIKE '%\\' || ?1)
            AND s.qualified_name IS NOT NULL AND s.kind IN {CLASS_KINDS}"
     );
     let mut stmt = conn.prepare(&sql)?;
     while let Some(parent) = queue.pop() {
-        let short = short_name(&parent).to_string();
-        let children = stmt
-            .query_map(params![short], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (child, file_id, line) in children {
-            let resolved = (line..=line + 5).any(|l| {
-                fqn_at(conn, file_id, l, &short).is_some_and(|f| f.eq_ignore_ascii_case(&parent))
-            });
-            if resolved && seen.insert(child.to_ascii_lowercase()) {
-                all.push(child.clone());
-                queue.push(child);
+        for name in local_names(conn, &parent)? {
+            let children = stmt
+                .query_map(params![name], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (child, file_id, line, parent_name) in children {
+                if parent_resolves(conn, file_id, line, &parent_name, &parent)
+                    && seen.insert(child.to_ascii_lowercase())
+                {
+                    all.push(child.clone());
+                    queue.push(child);
+                }
             }
         }
     }
     Ok(all)
 }
 
-/// Line of `function <method>(` at or after `from_line` (1-based) within the next 400 lines.
+/// Every class/interface the types extend or implement, transitively (not the types
+/// themselves). Parents outside the index are kept by the name they resolve to.
+fn supertypes(conn: &Connection, types: &[String]) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT s.file_id, s.line, i.parent_name FROM symbols s
+         JOIN inheritance i ON i.child_id = s.id
+         WHERE s.qualified_name = ?1 COLLATE NOCASE AND s.kind IN {CLASS_KINDS}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut seen: HashSet<String> = types.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let mut out = Vec::new();
+    let mut queue: Vec<String> = types.to_vec();
+    while let Some(child) = queue.pop() {
+        let parents = stmt
+            .query_map(params![child], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (file_id, line, parent_name) in parents {
+            let resolved = match parent_name.strip_prefix('\\') {
+                Some(stripped) => Some(stripped.to_string()),
+                None => (line..=line + 10)
+                    .find_map(|l| fqn_at(conn, file_id, l, short_name(&parent_name))),
+            };
+            if let Some(parent) = resolved {
+                if seen.insert(parent.to_ascii_lowercase()) {
+                    out.push(parent.clone());
+                    queue.push(parent);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Line of the method in the class declared at `class_line`: the first `function` symbol of
+/// that name after the class and before the next class-like declaration in the file.
+fn method_in_class(conn: &Connection, file_id: i64, class_line: i64, method: &str) -> Option<i64> {
+    let next_class: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT MIN(line) FROM symbols WHERE file_id = ?1 AND line > ?2 AND kind IN {CLASS_KINDS}"
+            ),
+            params![file_id, class_line],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(i64::MAX);
+    conn.query_row(
+        "SELECT MIN(line) FROM symbols WHERE file_id = ?1 AND name = ?2 COLLATE NOCASE
+           AND kind = 'function' AND line >= ?3 AND line < ?4",
+        params![file_id, method, class_line, next_class],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// Line of `function <method>(` at or after `from_line` (1-based) within the next 400 lines —
+/// for anonymous classes, which have no symbol of their own.
 fn find_method_decl(content: &str, from_line: usize, method: &str) -> Option<usize> {
     let re = Regex::new(&format!(r"\bfunction\s+&?{}\s*\(", regex::escape(method))).ok()?;
     content
@@ -1312,7 +1624,7 @@ fn receiver_type(
         let token = TRAILING_NAME.captures(prefix)?.get(1)?.as_str();
         return match token.to_ascii_lowercase().as_str() {
             "self" | "static" => enclosing_class(conn, file_id, line_no),
-            "parent" => None,
+            "parent" => parent_class(conn, file_id, line_no),
             _ => resolve_name(conn, file_id, line_no, token),
         };
     }
@@ -1352,6 +1664,30 @@ fn enclosing_class(conn: &Connection, file_id: i64, line: i64) -> Option<String>
         .ok()
 }
 
+/// The class the enclosing class extends.
+fn parent_class(conn: &Connection, file_id: i64, line: i64) -> Option<String> {
+    let sql = format!(
+        "SELECT s.id, s.line FROM symbols s WHERE s.file_id = ?1 AND s.line <= ?2
+           AND s.kind IN {CLASS_KINDS} ORDER BY s.line DESC LIMIT 1"
+    );
+    let (id, class_line): (i64, i64) = conn
+        .query_row(&sql, params![file_id, line], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .ok()?;
+    let parent_name: String = conn
+        .query_row(
+            "SELECT parent_name FROM inheritance WHERE child_id = ?1 AND kind = 'extends' LIMIT 1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if let Some(stripped) = parent_name.strip_prefix('\\') {
+        return Some(stripped.to_string());
+    }
+    (class_line..=class_line + 10).find_map(|l| fqn_at(conn, file_id, l, short_name(&parent_name)))
+}
+
 /// Declared type of `$prop`: typed property / promoted constructor parameter, or `@var`.
 fn property_type(conn: &Connection, file_id: i64, lines: &[&str], prop: &str) -> Option<String> {
     let decl = Regex::new(&format!(
@@ -1380,7 +1716,12 @@ fn property_type(conn: &Connection, file_id: i64, lines: &[&str], prop: &str) ->
     None
 }
 
-/// Type of `$var` from the nearest earlier typed parameter, `@var`, `new`, or `get(T::class)`.
+static NAMED_FUNCTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bfunction\s+&?\w+\s*\(").unwrap());
+
+/// Type of `$var` from the nearest earlier typed parameter, `@var`, `new`, or `get(T::class)`,
+/// within the enclosing named function. Another assignment or a `foreach … as $var` on the way
+/// makes the type unknown rather than a guess.
 fn variable_type(
     conn: &Connection,
     file_id: i64,
@@ -1389,20 +1730,40 @@ fn variable_type(
     var: &str,
 ) -> Option<String> {
     let v = regex::escape(var);
-    let patterns = [
+    let typed = [
         format!(r"\$(?:{v})\s*=\s*\(?\s*new\s+(\\?[A-Za-z_][\w\\]*)"),
         format!(r"\$(?:{v})\s*=\s*.*?\bget\(\s*(\\?[A-Za-z_][\w\\]*)::class"),
         format!(r"@var\s+(\??\\?[A-Za-z_][\w\\|]*)\s+\$(?:{v})\b"),
         format!(r"[(,]\s*(\??\\?[A-Za-z_][\w\\|]*)\s+&?(?:\.\.\.)?\$(?:{v})\b"),
+        // A parameter on its own line of a multi-line signature.
+        format!(
+            r"^\s*(?:(?:private|protected|public|readonly)\s+)*(\??\\?[A-Za-z_][\w\\|]*)\s+&?(?:\.\.\.)?\$(?:{v})\b"
+        ),
     ];
-    let regexes: Vec<Regex> = patterns.iter().filter_map(|p| Regex::new(p).ok()).collect();
-    for i in (0..=idx).rev().take(300) {
-        for re in &regexes {
-            if let Some(c) = re.captures(lines[i]) {
+    let typed: Vec<Regex> = typed.iter().filter_map(|p| Regex::new(p).ok()).collect();
+    let rebinds = Regex::new(&format!(
+        r"\$(?:{v})\s*(?:=[^=>]|=$)|\bas\s+(?:\$\w+\s*=>\s*)?&?\$(?:{v})\b"
+    ))
+    .ok()?;
+    let doc_above = Regex::new(r"@var\s+(\??\\?[A-Za-z_][\w\\|]*)").ok()?;
+    for i in (0..=idx).rev() {
+        let line = lines[i];
+        for re in &typed {
+            if let Some(c) = re.captures(line) {
                 if let Some(t) = first_type(conn, file_id, i as i64 + 1, c.get(1)?.as_str()) {
                     return Some(t);
                 }
             }
+        }
+        if i < idx && rebinds.is_match(line) {
+            // `/** @var T */` right above an assignment types it.
+            let above = i.checked_sub(1).map(|j| lines[j]).unwrap_or("");
+            return doc_above
+                .captures(above)
+                .and_then(|c| first_type(conn, file_id, i as i64, c.get(1)?.as_str()));
+        }
+        if NAMED_FUNCTION.is_match(line) {
+            return None;
         }
     }
     None
@@ -1451,6 +1812,15 @@ mod tests {
             Some("local/modules/orteka.catalog/lib/Infrastructure/Facet/Elastic/Filter/Foo.php")
         );
         assert_eq!(psr4_path("src/A/Foo.php", "App\\A", "Other\\B"), None);
+        assert_eq!(
+            psr4_path(
+                "local/modules/orteka.main/lib/metro/MetroTable.php",
+                "Orteka\\Main\\Metro",
+                "Orteka\\Main\\Geo\\Metro"
+            )
+            .as_deref(),
+            Some("local/modules/orteka.main/lib/geo/metro/MetroTable.php")
+        );
     }
 
     #[test]
@@ -1474,5 +1844,9 @@ mod tests {
         );
         let t = token_counts(&body);
         assert!((dice(&t, &t) - 1.0).abs() < f64::EPSILON);
+
+        let braces = "<?php\nclass A\n{\n    private string $open = '{';\n    public function a(): string { return \"}{$x}\"; } // }\n}\nclass B {}\n";
+        assert_eq!(class_body(braces, 2).last().map(String::as_str), Some("}"));
+        assert_eq!(class_body(braces, 2).len(), 5);
     }
 }

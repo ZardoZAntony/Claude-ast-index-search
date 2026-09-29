@@ -632,7 +632,7 @@ fn get_module_public_symbols(
     let mut stmt = conn.prepare(
         "SELECT DISTINCT s.name FROM symbols s
          JOIN files f ON s.file_id = f.id
-         WHERE f.path LIKE ?1 AND s.kind IN ('class', 'interface', 'object')
+         WHERE f.path LIKE ?1 AND s.kind IN ('class', 'interface', 'trait', 'object')
          LIMIT 100",
     )?;
 

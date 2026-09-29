@@ -550,6 +550,9 @@ enum Commands {
     Impact {
         /// Fully qualified class name, e.g. 'App\\Order\\OrderService'
         fqn: String,
+        /// List every reference line even when there are many (text output)
+        #[arg(long)]
+        full: bool,
     },
     /// Edits needed to move a PHP class to another namespace
     MovePlan {
@@ -1335,7 +1338,7 @@ fn main() -> Result<()> {
             limit,
         } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
         Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
-        Commands::Impact { fqn } => commands::php::cmd_impact(&root, &fqn, format),
+        Commands::Impact { fqn, full } => commands::php::cmd_impact(&root, &fqn, full, format),
         Commands::MovePlan { fqn, namespace } => {
             commands::php::cmd_move_plan(&root, &fqn, &namespace, format)
         }

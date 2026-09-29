@@ -6,6 +6,9 @@ tuned for a large PHP/Bitrix codebase (~10k files).
 **Why.** On PHP, upstream's index was not reliable enough for refactoring:
 - it did not see classes in PHPDoc (`@var ItemDto[]`, `@return`, `@throws`);
 - it mixed up classes that share a short name across namespaces;
+- its shared name filter, built for Kotlin/Java, dropped PHP classes and methods such as
+  `Exception`, `Result`, `Error`, `get()`, and it did not see `EO_Product_Collection`-style or
+  lower-case class names, snake_case calls, or methods called from their own class;
 - it skipped the hidden paths where Bitrix keeps code (`.default/`, `.settings.php`, `.tests/`);
 - it silently lost edits made within the same second as the last indexing.
 
@@ -19,6 +22,8 @@ them. On top of that, new commands answer typical refactoring questions in one c
 | References by short name: five different `OrderDto` classes look like one | FQN resolution via `namespace`/`use` (aliases, group use), PHPDoc, FQN strings, attributes; `usages`/`implementations` accept an FQN |
 | Rename, move, dead code, duplicates, signature change take dozens of greps | `impact <FQN>`, `move-plan <FQN> <namespace>`, `unused-symbols --module … --export-only`, `duplicates`, `callers 'Type::method'` (infers receiver types) |
 | PHPDoc is not indexed | PHPDoc tag types are references, just like code |
+| Words in SQL strings, heredocs, comments and inline HTML, enum cases, named arguments and constants pass for classes | A per-file lexer resolves names in code only; keywords are case-insensitive; each reference keeps its kind (`import`, `trait-use`, `new`, `type`, …) |
+| Kotlin/Java naming rules: `Exception`, `Result`, `get()` dropped as noise; `EO_*`/lower-case classes, snake_case and same-class calls, callables `[Foo::class, 'handle']` unseen | PHP reserved words are the only noise; these names are references |
 | Hidden paths are always skipped | `include_hidden` in `.ast-index.yaml` |
 | Same-second edits are lost; non-UTF-8 files and directories like `auth.mts/` are re-parsed on every `update` | Nanosecond mtimes; lossy decoding of non-UTF-8 sources; `update` walks files only |
 | Minified JS/CSS clutters search | Detected and not parsed |
@@ -27,7 +32,8 @@ Details: [PHP commands reference](plugin/skills/ast-index/references/php-command
 
 **Effect** (measured on a ~10k-file PHP project; Sonnet, 2 runs per variant — indicative, not exact).
 
-One command gives a complete answer:
+One command answers the question (measured before the lexer and naming fixes; `callers` lists
+calls it could not infer for a manual check):
 
 | Task | Command | Time | Answer size |
 |---|---|---|---|
@@ -65,6 +71,8 @@ Example `.ast-index.yaml` for Bitrix, in the project root:
 ```yaml
 include_hidden: [.default, .settings.php, .tests]
 exclude: ["*.css", "*.scss", "*.less", orm_annotation.php, orm_annotations.php, vendor/]
+unused_ignore: ["**/install/index.php"]
+unused_ignore_names: ["*Action", getObjectClass, getCollectionClass]
 ```
 
 Upstream documentation follows.

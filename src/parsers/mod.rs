@@ -55,7 +55,7 @@ const MAX_CONTEXT_LEN: usize = 500;
 const MAX_SIGNATURE_LEN: usize = 500;
 
 /// Truncate context to avoid storing huge minified lines
-fn truncate_context(s: &str) -> String {
+pub(crate) fn truncate_context(s: &str) -> String {
     truncate_to_len(s, MAX_CONTEXT_LEN)
 }
 
@@ -704,6 +704,13 @@ pub fn parse_file_symbols(
 
 /// Whether a reference candidate is language noise (keyword, stdlib type) rather than a project symbol.
 pub(crate) fn is_noise_ref_name(name: &str, file_type: Option<FileType>) -> bool {
+    // PHP: only reserved words, compared case-insensitively. The shared lists below name
+    // Kotlin/Swift stdlib types and accessors (`Result`, `Error`, `Exception`, `get`), which in
+    // PHP are ordinary classes and methods (`Bitrix\Main\Result`, `->get(Foo::class)`).
+    if matches!(file_type, Some(FileType::Php)) {
+        return php_names::is_reserved_word(name);
+    }
+
     // Common keywords to skip across all languages
     static BASE_KEYWORDS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
         [

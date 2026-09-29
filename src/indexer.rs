@@ -217,6 +217,12 @@ pub struct ProjectConfig {
     /// Hidden paths to index anyway (gitignore-style patterns such as `.default`, `.settings.php`).
     /// Every walk skips dot-files and dot-directories unless they match one of these.
     pub include_hidden: Option<Vec<String>>,
+    /// Files whose symbols `unused-symbols` never reports (gitignore-style patterns): entry
+    /// points a framework calls by convention, such as Bitrix installers `**/install/index.php`.
+    pub unused_ignore: Option<Vec<String>>,
+    /// Symbol names `unused-symbols` never reports (`*` wildcards): methods a framework calls
+    /// by name, such as Bitrix controller actions `*Action` or ORM `getObjectClass`.
+    pub unused_ignore_names: Option<Vec<String>>,
 }
 
 /// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root.
@@ -1203,8 +1209,9 @@ struct ParsedFile {
     symbols: Vec<ParsedSymbol>,
     qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
-    /// Fully qualified class name per reference (PHP); empty when the language has none.
-    ref_fqns: Vec<Option<String>>,
+    /// Fully qualified class name and kind of use per reference (PHP); empty when the language
+    /// has none.
+    ref_fqns: Vec<Option<(String, &'static str)>>,
 }
 
 /// File scheduled by incremental update.
@@ -2262,7 +2269,7 @@ fn write_batch_to_db(
             "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
         )?;
         let mut ref_stmt = tx.prepare_cached(
-            "INSERT INTO refs (file_id, name, line, context, fqn) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO refs (file_id, name, line, context, fqn, ref_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
 
         for pf in batch {
@@ -2305,13 +2312,17 @@ fn write_batch_to_db(
             }
 
             for (i, r) in refs.into_iter().enumerate() {
-                let fqn = ref_fqns.get(i).cloned().flatten();
+                let (fqn, kind) = match ref_fqns.get(i).cloned().flatten() {
+                    Some((fqn, kind)) => (Some(fqn), Some(kind)),
+                    None => (None, None),
+                };
                 ref_stmt.execute(rusqlite::params![
                     file_id,
                     r.name,
                     r.line as i64,
                     r.context,
-                    fqn
+                    fqn,
+                    kind
                 ])?;
             }
 
