@@ -219,34 +219,12 @@ pub struct ProjectConfig {
     pub include_hidden: Option<Vec<String>>,
 }
 
-/// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root, else
-/// `ast-index.yaml` in the repository's git directory — a per-clone config that is never
-/// committed and is shared by every worktree of the clone.
+/// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root.
 fn config_path(root: &Path) -> Option<PathBuf> {
     [".ast-index.yaml", ".ast-index.yml"]
         .iter()
         .map(|name| root.join(name))
         .find(|path| path.exists())
-        .or_else(|| {
-            git_common_dir(root)
-                .map(|dir| dir.join("ast-index.yaml"))
-                .filter(|path| path.exists())
-        })
-}
-
-/// The git directory shared by all worktrees: `.git/` of a clone, or — for a linked worktree,
-/// whose `.git` is a file — the main clone's directory found via `gitdir:` and `commondir`.
-fn git_common_dir(root: &Path) -> Option<PathBuf> {
-    let dot_git = root.join(".git");
-    if dot_git.is_dir() {
-        return Some(dot_git);
-    }
-    let content = fs::read_to_string(&dot_git).ok()?;
-    let gitdir = root.join(content.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
-    match fs::read_to_string(gitdir.join("commondir")) {
-        Ok(common) => Some(gitdir.join(common.trim())),
-        Err(_) => Some(gitdir),
-    }
 }
 
 fn parse_config(config_path: &Path) -> std::result::Result<ProjectConfig, String> {

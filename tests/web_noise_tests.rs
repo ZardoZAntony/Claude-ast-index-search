@@ -1,5 +1,4 @@
-//! Front-end noise: minified bundles are recorded but not parsed, and the project config may
-//! live in the git directory (outside the working tree, shared by worktrees).
+//! Front-end noise: minified bundles are recorded but not parsed.
 
 use std::fs;
 use std::path::Path;
@@ -74,36 +73,4 @@ fn minified_bundle_is_recorded_but_not_parsed() {
         "minified bundle was parsed"
     );
     assert!(symbol_exists(&conn, "HandwrittenIcon"));
-}
-
-#[test]
-fn config_in_git_dir_applies_to_clone_and_linked_worktree() {
-    let tmp = TempDir::new().unwrap();
-    let main = tmp.path().join("main");
-    fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
-    fs::write(
-        main.join(".git/ast-index.yaml"),
-        "include_hidden:\n  - .default\n",
-    )
-    .unwrap();
-    fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
-
-    let wt = tmp.path().join("wt");
-    fs::create_dir_all(&wt).unwrap();
-    fs::write(
-        wt.join(".git"),
-        format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
-    )
-    .unwrap();
-
-    for root in [&main, &wt] {
-        let config = indexer::load_config(root).expect("config from the git directory");
-        assert_eq!(config.include_hidden, Some(vec![".default".to_string()]));
-    }
-
-    // A config in the working tree wins over the git-directory one.
-    fs::write(main.join(".ast-index.yaml"), "exclude:\n  - vendor\n").unwrap();
-    let config = indexer::load_config(&main).unwrap();
-    assert_eq!(config.include_hidden, None);
-    assert_eq!(config.exclude, Some(vec!["vendor".to_string()]));
 }

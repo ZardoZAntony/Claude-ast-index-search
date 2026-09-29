@@ -46,8 +46,8 @@ case-insensitively, as in PHP.
 ## Project config
 
 Hidden directories hold real code in some PHP frameworks (Bitrix component templates in
-`.default/`, module wiring in `.settings.php`); list them in `include_hidden`. To keep the
-config out of the repository, put it in `.git/ast-index.yaml`.
+`.default/`, module wiring in `.settings.php`); list them in `include_hidden` in the
+project's `.ast-index.yaml`.
 
 ```yaml
 include_hidden:

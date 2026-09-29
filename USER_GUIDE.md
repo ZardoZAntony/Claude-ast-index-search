@@ -135,11 +135,6 @@ include_hidden:
   - .settings.php
 ```
 
-To keep the config out of the working tree, put it in the repository's git
-directory as `.git/ast-index.yaml`. It is used when the root has no
-`.ast-index.yaml`, is never committed, and applies to every linked worktree of
-the clone.
-
 Minified or generated JS/CSS (nearly all text in lines longer than 500
 characters, such as bundles and `*.min.js`) is recorded but not parsed, so its
 mangled names do not show up in search results.

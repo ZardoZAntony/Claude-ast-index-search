@@ -19,7 +19,7 @@ them. On top of that, new commands answer typical refactoring questions in one c
 | References by short name: five different `OrderDto` classes look like one | FQN resolution via `namespace`/`use` (aliases, group use), PHPDoc, FQN strings, attributes; `usages`/`implementations` accept an FQN |
 | Rename, move, dead code, duplicates, signature change take dozens of greps | `impact <FQN>`, `move-plan <FQN> <namespace>`, `unused-symbols --module … --export-only`, `duplicates`, `callers 'Type::method'` (infers receiver types) |
 | PHPDoc is not indexed | PHPDoc tag types are references, just like code |
-| Hidden paths are always skipped | `include_hidden` config; the config can live outside the repo in `.git/ast-index.yaml` (shared by all worktrees) |
+| Hidden paths are always skipped | `include_hidden` in `.ast-index.yaml` |
 | Same-second edits are lost; non-UTF-8 files and directories like `auth.mts/` are re-parsed on every `update` | Nanosecond mtimes; lossy decoding of non-UTF-8 sources; `update` walks files only |
 | Minified JS/CSS clutters search | Detected and not parsed |
 
@@ -38,7 +38,7 @@ Details: [PHP commands reference](plugin/skills/ast-index/references/php-command
 cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
-Example config for Bitrix (`.git/ast-index.yaml`, never committed):
+Example `.ast-index.yaml` for Bitrix, in the project root:
 
 ```yaml
 include_hidden: [.default, .settings.php, .tests]
