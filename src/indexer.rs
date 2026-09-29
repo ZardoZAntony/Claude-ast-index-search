@@ -1214,6 +1214,20 @@ enum PendingUpdateFile {
     },
 }
 
+/// Read a source file as text. Invalid UTF-8 (a legacy encoding such as Windows-1251 in old
+/// templates) is replaced instead of rejected: identifiers are ASCII, so symbols and references
+/// survive, and the file no longer fails — and gets retried — on every update. Content with NUL
+/// bytes is binary and still fails.
+fn read_source(path: &Path) -> Result<String> {
+    match String::from_utf8(fs::read(path)?) {
+        Ok(text) => Ok(text),
+        Err(e) if e.as_bytes().contains(&0) => {
+            anyhow::bail!("{}: binary content, not UTF-8 text", path.display())
+        }
+        Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    }
+}
+
 /// Parse a single file without DB access (thread-safe)
 fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
@@ -1248,7 +1262,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         });
     }
 
-    let content = fs::read_to_string(file_path)?;
+    let content = read_source(file_path)?;
 
     // Detect file type by extension, with content-based sniffing for .m files
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
