@@ -428,14 +428,15 @@ where
     };
 
     let first = roots.first().map(PathBuf::as_path).unwrap_or(root);
+    let hidden = crate::indexer::HiddenPolicy::for_root(root);
     let mut wb = WalkBuilder::new(first);
     for extra in roots.iter().skip(1) {
         wb.add(extra);
     }
-    wb.hidden(true)
+    wb.hidden(hidden.skips_all_hidden())
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| hidden.allows(entry) && !crate::indexer::is_excluded_dir(entry))
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
@@ -582,11 +583,12 @@ where
         crate::indexer::find_arc_root(root)
     };
 
+    let hidden = crate::indexer::HiddenPolicy::for_root(root);
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(true)
+    wb.hidden(hidden.skips_all_hidden())
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| hidden.allows(entry) && !crate::indexer::is_excluded_dir(entry))
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");

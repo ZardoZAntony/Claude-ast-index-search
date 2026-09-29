@@ -214,36 +214,86 @@ pub struct ProjectConfig {
     /// When set, only matching top-level directories are indexed; everything else is skipped.
     pub include: Option<Vec<String>>,
     pub no_ignore: Option<bool>,
+    /// Hidden paths to index anyway (gitignore-style patterns such as `.default`, `.settings.php`).
+    /// Every walk skips dot-files and dot-directories unless they match one of these.
+    pub include_hidden: Option<Vec<String>>,
+}
+
+/// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root.
+fn config_path(root: &Path) -> Option<PathBuf> {
+    [".ast-index.yaml", ".ast-index.yml"]
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.exists())
+}
+
+fn parse_config(config_path: &Path) -> std::result::Result<ProjectConfig, String> {
+    let content = fs::read_to_string(config_path).map_err(|e| format!("failed to read: {e}"))?;
+    serde_yaml::from_str::<ProjectConfig>(&content).map_err(|e| format!("failed to parse: {e}"))
 }
 
 /// Load project config from `.ast-index.yaml` or `.ast-index.yml` in the given root.
 /// Returns `None` if no config file found or on parse error (with warning).
 pub fn load_config(root: &Path) -> Option<ProjectConfig> {
-    let yaml_path = root.join(".ast-index.yaml");
-    let yml_path = root.join(".ast-index.yml");
-    let config_path = if yaml_path.exists() {
-        yaml_path
-    } else if yml_path.exists() {
-        yml_path
-    } else {
-        return None;
-    };
-
-    match fs::read_to_string(&config_path) {
-        Ok(content) => match serde_yaml::from_str::<ProjectConfig>(&content) {
-            Ok(config) => {
-                eprintln!("Loaded config from {}", config_path.display());
-                Some(config)
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to parse {}: {}", config_path.display(), e);
-                None
-            }
-        },
+    let config_path = config_path(root)?;
+    match parse_config(&config_path) {
+        Ok(config) => {
+            eprintln!("Loaded config from {}", config_path.display());
+            Some(config)
+        }
         Err(e) => {
-            eprintln!("Warning: failed to read {}: {}", config_path.display(), e);
+            eprintln!("Warning: {} {}", config_path.display(), e);
             None
         }
+    }
+}
+
+/// Which hidden entries (dot-files and dot-directories) a walk may enter.
+///
+/// Walks skip hidden entries. `include_hidden` in the project config lists gitignore-style
+/// patterns of hidden paths to index anyway: Bitrix keeps component templates in `.default/`
+/// and module wiring in `.settings.php`. Without the option a walk keeps the plain
+/// `WalkBuilder::hidden(true)` behaviour.
+#[derive(Clone, Default)]
+pub struct HiddenPolicy {
+    allow: Option<std::sync::Arc<ignore::gitignore::Gitignore>>,
+}
+
+impl HiddenPolicy {
+    /// Policy from the config in `root`; read quietly, since walks run after the config notice.
+    pub fn for_root(root: &Path) -> Self {
+        let allow = config_path(root)
+            .and_then(|path| parse_config(&path).ok())
+            .and_then(|config| config.include_hidden)
+            .filter(|patterns| !patterns.is_empty())
+            .and_then(|patterns| {
+                let mut gb = ignore::gitignore::GitignoreBuilder::new(root);
+                for p in &patterns {
+                    gb.add_line(None, p).ok();
+                }
+                gb.build().ok()
+            })
+            .map(std::sync::Arc::new);
+        Self { allow }
+    }
+
+    /// Value for `WalkBuilder::hidden`: with an allow-list, `allows` does the filtering.
+    pub fn skips_all_hidden(&self) -> bool {
+        self.allow.is_none()
+    }
+
+    /// Entry filter to combine with the walk's `filter_entry`.
+    pub fn allows(&self, entry: &ignore::DirEntry) -> bool {
+        let Some(allow) = &self.allow else {
+            return true;
+        };
+        let hidden = entry.depth() > 0
+            && entry.file_name().to_str().is_some_and(|name| name.starts_with('.'));
+        if !hidden {
+            return true;
+        }
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        allow.matched(entry.path(), is_dir).is_ignore()
     }
 }
 
@@ -1358,14 +1408,15 @@ pub fn quick_file_count(root: &Path, no_ignore: bool, limit: usize) -> usize {
     use ignore::WalkBuilder;
 
     let use_git = has_git_repo(root) && !no_ignore;
+    let hidden = HiddenPolicy::for_root(root);
     let mut builder = WalkBuilder::new(root);
     builder
-        .hidden(true)
+        .hidden(hidden.skips_all_hidden())
         .follow_links(false)
         .max_depth(Some(50))
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(|entry| !is_excluded_dir(entry));
+        .filter_entry(move |entry| hidden.allows(entry) && !is_excluded_dir(entry));
     // No arc ignore here — quick_file_count is just a rough estimate,
     // and add_custom_ignore_filename causes stat per directory (slow on FUSE)
 
@@ -1864,15 +1915,16 @@ fn index_directory_scoped_with_max_depth(
         }
     };
 
+    let hidden = HiddenPolicy::for_root(root);
     let mut builder = WalkBuilder::new(walk_dir);
     builder
-        .hidden(true)
+        .hidden(hidden.skips_all_hidden())
         .follow_links(false) // Never follow symlinks — prevents loops in monorepos
         .max_depth(max_depth) // Prevent runaway traversal in deeply nested structures
         .git_ignore(use_git) // Respect .gitignore only if .git exists
         .git_exclude(use_git)
         .filter_entry(move |entry| {
-            if is_excluded_dir(entry) {
+            if !hidden.allows(entry) || is_excluded_dir(entry) {
                 return false;
             }
             if let Some(ref matcher) = exclude_matcher {
@@ -2297,16 +2349,18 @@ pub fn update_directory_incremental(
     // `pom.xml`, `ya.make` are not parsed as sources but define the module graph.
     let mut module_files: Vec<PathBuf> = Vec::new();
 
+    let hidden_policy = HiddenPolicy::for_root(root);
     for (walk_dir, anchor) in &walk_specs {
         let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
         let arc_root = find_arc_root(walk_dir).or_else(|| find_arc_root(anchor));
         let mut builder = WalkBuilder::new(walk_dir);
         let exclude_matcher_owned = exclude_matcher.cloned();
+        let hidden = hidden_policy.clone();
         builder
-            .hidden(true)
+            .hidden(hidden.skips_all_hidden())
             .git_ignore(is_git)
             .filter_entry(move |entry| {
-                if is_excluded_dir(entry) {
+                if !hidden.allows(entry) || is_excluded_dir(entry) {
                     return false;
                 }
                 if let Some(ref m) = exclude_matcher_owned {
