@@ -475,7 +475,8 @@ ast-index duplicates --path src/                         # near-copy classes and
 
 `impact` summarizes more than 60 references per file; add `--full` for every line.
 `unused-symbols` skips files and method names listed in `unused_ignore` and
-`unused_ignore_names` in `.ast-index.yaml` (framework entry points).
+`unused_ignore_names` in `.ast-index.yaml` (framework entry points); `duplicates` tags pairs
+under `duplicate_mirrors` paths as deliberate copies.
 
 See `plugin/skills/ast-index/references/php-commands.md` for details.
 

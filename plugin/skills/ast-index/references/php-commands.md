@@ -8,8 +8,10 @@ imports (aliases and group use included), `\Fully\Qualified` names, FQN strings 
 names are matched case-insensitively, as in PHP.
 
 The indexer lexes each file, so words inside strings, heredoc SQL, comments and inline HTML
-are not taken for classes; enum cases, named arguments, constants and keywords in any letter
-case (`Throw New …`) are skipped too.
+(`?>` closes PHP inside a `//` comment too) are not taken for classes; enum cases, named
+arguments, constants and keywords in any letter case (`Throw New …`) are skipped too. A class's
+references in its own file count (`new Foo()` in Foo's factory), its declaration does not.
+Method names are matched case-insensitively (`GetList` called as `getList`).
 
 ## Answer refactoring questions in one call
 
@@ -47,14 +49,15 @@ case (`Throw New …`) are skipped too.
   by hand), and same-named methods of unrelated types (excluded).
 - **`unused-symbols`** checks PHP classes by FQN, so a dead class with a live namesake is
   reported. A reference counts wherever it is: code, PHPDoc, tests, callables
-  (`[Foo::class, 'handle']`, `'Foo::handle'`). Classes referenced only where a DI config
+  (`[Foo::class, 'handle']`, `[$this, 'handle']`, `array('Foo', 'handle')`, `'Foo::handle'`). Classes referenced only where a DI config
   registers them (`Foo::class => [...]` in `di/` or `.settings.php`), never requested, are
   listed separately. Magic methods are skipped. Entry points a framework calls by convention
   go to `unused_ignore` (files) and `unused_ignore_names` (method names) in the config.
 - **`duplicates`** compares bodies of same-named classes (token similarity, default ≥ 0.75)
   and shows how many references each copy has — `UNUSED` copies are removal candidates.
-  Pairs where one path is under `/Contracts/` are tagged `[contract mirror]`; copies that
-  declare the same FQN are tagged `[same FQN]` — their references cannot be told apart.
+  Pairs where a path contains one of `duplicate_mirrors` from the config are deliberate copies,
+  tagged `[mirror]` and listed last; copies that declare the same FQN are tagged `[same FQN]` —
+  their references cannot be told apart.
 - **`usages <ShortName>`** notes when several classes share the name; pass the FQN instead.
 
 ## When to use grep instead
@@ -82,4 +85,6 @@ unused_ignore:            # files whose symbols the framework calls by conventio
 unused_ignore_names:      # method names the framework calls; `*` is a wildcard
   - "*Action"
   - getObjectClass
+duplicate_mirrors:        # path fragments of deliberate copies
+  - /Contracts/
 ```

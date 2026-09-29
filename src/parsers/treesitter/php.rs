@@ -1,6 +1,7 @@
 //! Tree-sitter based PHP parser
 
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
@@ -27,52 +28,43 @@ impl LanguageParser for PhpParser {
     /// Code references plus class names from PHPDoc type positions, which the generic
     /// extractor skips together with the rest of the comment.
     ///
-    /// Only class-like definitions hide a name. Methods, functions and constants of the file
-    /// stay visible, so `$this->build()` in the class that declares `build()` is a reference —
-    /// otherwise a template method called only by its own base class looked unused. The
-    /// declaration line itself (`function build(`) is not a reference.
+    /// No definition of the file hides a name: `new Foo()` in Foo's own factory and
+    /// `$this->build()` in the class that declares `build()` are references too — a rename needs
+    /// them, and a template method called only by its base class is not dead. Only the names
+    /// being declared (`class Foo`, `function build(`, at the symbol's own line) are dropped.
     fn extract_refs_for_lang(
         &self,
         content: &str,
         defined: &[ParsedSymbol],
         file_type: FileType,
     ) -> Result<Vec<ParsedRef>> {
-        let definitions: Vec<ParsedSymbol> = defined
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.kind,
-                    SymbolKind::Class
-                        | SymbolKind::Interface
-                        | SymbolKind::Trait
-                        | SymbolKind::Enum
-                        | SymbolKind::Object
-                )
-            })
-            .cloned()
-            .collect();
         let lines: Vec<&str> = content.lines().collect();
-        let mut refs = extract_references_for_lang(content, &definitions, Some(file_type))?;
+        let mut refs = extract_references_for_lang(content, &[], Some(file_type))?;
+        refs.extend(php_extra_refs(&lines));
+        // Each declaration hides one occurrence of its name on its line: in
+        // `function Logger(): Logger { return new Logger(); }` the type and `new` stay.
+        // `use Trait;` is recorded as an import symbol on its line, yet it is a reference.
+        let mut declared: HashMap<(usize, String), usize> = HashMap::new();
+        for s in defined.iter().filter(|s| s.kind != SymbolKind::Import) {
+            *declared.entry((s.line, s.name.clone())).or_default() += 1;
+        }
         refs.retain(|r| {
-            !lines
-                .get(r.line.wrapping_sub(1))
-                .is_some_and(|line| declares_function(line, &r.name))
+            let Some(line) = lines.get(r.line.wrapping_sub(1)) else {
+                return true;
+            };
+            let t = line.trim_start();
+            // `#` starts a comment in PHP (`#[` an attribute); the generic extractor knows only `//`.
+            let hash_comment = t.starts_with('#') && !t.starts_with("#[");
+            let declaration = match declared.get_mut(&(r.line, r.name.clone())) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    true
+                }
+                _ => false,
+            };
+            !hash_comment && !declaration && !calls_builtin_only(line, &r.name)
         });
-        refs.extend(snake_case_calls(&lines));
-        refs.extend(callable_methods(&lines));
-        refs.extend(php_only_names(&lines));
-        // `#` starts a comment in PHP (`#[` an attribute); the generic extractor knows only `//`.
-        refs.retain(|r| {
-            !lines.get(r.line.wrapping_sub(1)).is_some_and(|line| {
-                let t = line.trim_start();
-                t.starts_with('#') && !t.starts_with("#[")
-            })
-        });
-        refs.extend(phpdoc::extract_phpdoc_refs(
-            content,
-            &definitions,
-            file_type,
-        ));
+        refs.extend(phpdoc::extract_phpdoc_refs(content, &[], file_type));
         Ok(refs)
     }
 
@@ -286,8 +278,32 @@ impl LanguageParser for PhpParser {
             }
         }
 
-        Ok(symbols)
+        Ok(merge_repeated_declarations(symbols))
     }
+}
+
+/// The query matches a class once per implemented interface; keep one symbol per declaration
+/// with all its parents.
+fn merge_repeated_declarations(symbols: Vec<ParsedSymbol>) -> Vec<ParsedSymbol> {
+    let mut merged: Vec<ParsedSymbol> = Vec::with_capacity(symbols.len());
+    let mut seen: HashMap<(&'static str, String, usize), usize> = HashMap::new();
+    for symbol in symbols {
+        let key = (symbol.kind.as_str(), symbol.name.clone(), symbol.line);
+        match seen.get(&key) {
+            Some(&i) => {
+                for parent in symbol.parents {
+                    if !merged[i].parents.contains(&parent) {
+                        merged[i].parents.push(parent);
+                    }
+                }
+            }
+            None => {
+                seen.insert(key, merged.len());
+                merged.push(symbol);
+            }
+        }
+    }
+    merged
 }
 
 /// Find a capture by index in a match
@@ -299,50 +315,35 @@ fn find_capture<'a>(
     m.captures.iter().find(|c| c.index == idx)
 }
 
-/// `function name(` / `function &name(` on this line.
-fn declares_function(line: &str, name: &str) -> bool {
-    let Some(pos) = line.find("function") else {
-        return false;
-    };
-    let rest = line[pos + "function".len()..].trim_start();
-    let rest = rest.strip_prefix('&').unwrap_or(rest).trim_start();
-    rest.strip_prefix(name)
-        .is_some_and(|after| after.trim_start().starts_with('('))
+/// Built-in PHP functions (`scripts/php-builtin-functions.php`): calls to them are noise in the
+/// index, while project functions such as `is_spec()` or `plural_form()` are references.
+static BUILTIN_FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    include_str!("../php_builtin_functions.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .collect()
+});
+
+/// `name` is a built-in function and every occurrence on the line is a global call, not a method
+/// (`count($a)` is noise, `$list->count()` is not).
+fn calls_builtin_only(line: &str, name: &str) -> bool {
+    BUILTIN_FUNCTIONS.contains(name)
+        && !line.match_indices(name).any(|(pos, _)| {
+            let before = line[..pos].trim_end();
+            before.ends_with("->") || before.ends_with("::")
+        })
 }
 
 static SNAKE_CALL_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"([$\w]?)\b([a-z][a-z0-9]*_[a-z0-9_]*)\s*\(").unwrap());
-
-static CALLABLE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    LazyLock::new(|| regex::Regex::new(r"\b([a-z][a-z0-9]*_[a-z0-9_]*)\s*\(").unwrap());
+static CALLABLE_ARRAY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
-        r#"\[\s*(?:\\?[\w\\]+::class|'[\w\\]+'|"[\w\\]+")\s*,\s*['"]([A-Za-z_]\w*)['"]\s*\]|['"]\\?[\w\\]+::([A-Za-z_]\w*)['"]"#,
+        r#"(?:\[|\barray\s*\()\s*(\\?[\w\\]+::class|\$\w+|'[^'\s]+'|"[^"\s]+")\s*,\s*['"]([A-Za-z_]\w*)['"]\s*[\])]"#,
     )
     .unwrap()
 });
-
-/// Methods named in callables: `[Foo::class, 'handle']`, `['App\\Foo', 'handle']`,
-/// `'Foo::handle'` — how Bitrix event handlers and agents are registered. Without these the
-/// handler methods looked unused.
-fn callable_methods(lines: &[&str]) -> Vec<ParsedRef> {
-    let mut refs = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.len() > 2000 || trimmed.starts_with("//") || trimmed.starts_with('*') {
-            continue;
-        }
-        for caps in CALLABLE_RE.captures_iter(line) {
-            if let Some(name) = caps.get(1).or_else(|| caps.get(2)) {
-                refs.push(ParsedRef {
-                    name: name.as_str().to_string(),
-                    line: idx + 1,
-                    context: crate::parsers::truncate_context(trimmed),
-                });
-            }
-        }
-    }
-    refs
-}
-
+static CALLABLE_STRING_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"['"]\\?[A-Z][\w\\]*::([A-Za-z_]\w*)['"]"#).unwrap());
 static UNDERSCORE_CLASS_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\b([A-Z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)\b").unwrap());
 static LOWERCASE_CLASS_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -354,11 +355,16 @@ static LOWERCASE_CLASS_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static SHORT_METHOD_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?:->|::)\s*([A-Za-z_]\w?)\s*\(").unwrap());
 
-/// Names the generic extractor, built around Java/Kotlin naming, does not see: class names with
-/// underscores (Bitrix ORM `EO_Product_Collection`), lower-case class names in class positions
-/// (module installers `orteka_core`, legacy `nf_pp::`), and one- or two-letter method calls
-/// (`->id()`). ALL-CAPS names with underscores are constants and are skipped.
-fn php_only_names(lines: &[&str]) -> Vec<ParsedRef> {
+/// References the generic extractor, built around Java/Kotlin naming, does not see:
+/// - snake_case calls (`$this->get_items()`, project functions);
+/// - methods named in callables — `[Foo::class, 'handle']`, `[$this, 'onEvent']`,
+///   `array('App\Foo', 'handle')`, `'Foo::handle'` — how Bitrix event handlers and agents are
+///   registered;
+/// - class names with underscores (Bitrix ORM `EO_Product_Collection`) and lower-case class
+///   names in class positions (module installers `orteka_core`, legacy `nf_pp::`);
+/// - one- and two-letter method calls (`->id()`).
+fn php_extra_refs(lines: &[&str]) -> Vec<ParsedRef> {
+    let has_lower = |s: &str| s.chars().any(|c| c.is_ascii_lowercase());
     let mut refs = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -378,10 +384,31 @@ fn php_only_names(lines: &[&str]) -> Vec<ParsedRef> {
                 });
             }
         };
+
+        // Built-in functions are dropped later, together with the generic extractor's calls.
+        for caps in SNAKE_CALL_RE.captures_iter(line) {
+            let m = caps.get(1).expect("group 1 always matches");
+            if !line[..m.start()].ends_with('$') {
+                push(m.as_str());
+            }
+        }
+        for caps in CALLABLE_ARRAY_RE.captures_iter(line) {
+            let target = &caps[1];
+            // A quoted first element must look like a class (`['ID', 'NAME']` is a field list).
+            let quoted_class = target.starts_with(['\'', '"'])
+                && (target.contains('\\')
+                    || (target[1..].starts_with(|c: char| c.is_ascii_uppercase())
+                        && has_lower(target)));
+            if (quoted_class || !target.starts_with(['\'', '"'])) && has_lower(&caps[2]) {
+                push(&caps[2]);
+            }
+        }
+        for caps in CALLABLE_STRING_RE.captures_iter(line) {
+            push(&caps[1]);
+        }
         for caps in UNDERSCORE_CLASS_RE.captures_iter(line) {
-            let name = &caps[1];
-            if name.chars().any(|c| c.is_ascii_lowercase()) {
-                push(name);
+            if has_lower(&caps[1]) {
+                push(&caps[1]);
             }
         }
         for caps in LOWERCASE_CLASS_RE.captures_iter(line) {
@@ -391,38 +418,6 @@ fn php_only_names(lines: &[&str]) -> Vec<ParsedRef> {
         }
         for caps in SHORT_METHOD_RE.captures_iter(line) {
             push(&caps[1]);
-        }
-    }
-    refs
-}
-
-/// `get_items(` — the generic extractor sees only camelCase calls. Magic `__*` names and
-/// `$variable(` calls are skipped, and so are comment lines and declarations.
-fn snake_case_calls(lines: &[&str]) -> Vec<ParsedRef> {
-    let mut refs = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.len() > 2000
-            || trimmed.starts_with("//")
-            || trimmed.starts_with('#')
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with('*')
-        {
-            continue;
-        }
-        for caps in SNAKE_CALL_RE.captures_iter(line) {
-            if caps.get(1).is_some_and(|m| m.as_str() == "$") {
-                continue;
-            }
-            let name = &caps[2];
-            if declares_function(line, name) {
-                continue;
-            }
-            refs.push(ParsedRef {
-                name: name.to_string(),
-                line: idx + 1,
-                context: crate::parsers::truncate_context(trimmed),
-            });
         }
     }
     refs
@@ -695,7 +690,7 @@ class User extends Model implements Authenticatable {
         };
         assert_eq!(at("builderClass"), vec![8]);
         assert_eq!(at("get_items"), vec![9]);
-        assert_eq!(at("array_map"), vec![13]);
+        assert!(at("array_map").is_empty(), "built-in functions are noise");
         assert!(at("callback_fn").is_empty());
         assert!(at("Base").is_empty());
     }
@@ -739,5 +734,93 @@ class User extends Model implements Authenticatable {
         assert_eq!(at("onAdminListDisplay"), vec![3]);
         assert_eq!(at("run_daily"), vec![4]);
         assert_eq!(at("cleanup"), vec![5]);
+    }
+
+    #[test]
+    fn callables_name_methods_but_field_lists_do_not() {
+        let content = "<?php\n$em->addEventHandler('main', 'OnProlog', [$this, 'onEvent']);\nAddEventHandler('main', 'OnEnd', array('CLegacyHandler', 'OnEndHandler'));\n$select = ['ID', 'NAME']; $order = ['asc', 'desc'];\n$x = $this->array_thing(); $y = array_map(null, []);\n";
+        let refs = PHP_PARSER.extract_refs(content, &[]).unwrap();
+        let has = |name: &str, line: usize| refs.iter().any(|r| r.name == name && r.line == line);
+        assert!(has("onEvent", 2));
+        assert!(has("OnEndHandler", 3));
+        // `desc` could come only from reading `['asc', 'desc']` as a callable.
+        assert!(!has("desc", 4));
+        assert!(has("array_thing", 5));
+        assert!(!has("array_map", 5));
+    }
+
+    #[test]
+    fn a_class_references_itself_but_its_declaration_is_not_a_reference() {
+        let content = "<?php\nfinal class Runner\n{\n    public static function make(): self { return new Runner(); }\n    /** @return Runner */\n    public function copy(): Runner { return Runner::make(); }\n}\n";
+        let symbols = PHP_PARSER.parse_symbols(content).unwrap();
+        let refs = PHP_PARSER.extract_refs(content, &symbols).unwrap();
+        let mut lines: Vec<usize> = refs
+            .iter()
+            .filter(|r| r.name == "Runner")
+            .map(|r| r.line)
+            .collect();
+        lines.sort();
+        lines.dedup();
+        assert_eq!(lines, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn a_class_with_several_interfaces_is_one_symbol() {
+        let content = "<?php\nfinal class Adapter implements First, Second, Third {}\n";
+        let symbols = PHP_PARSER.parse_symbols(content).unwrap();
+        let classes: Vec<&ParsedSymbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(classes.len(), 1);
+        let parents: Vec<&str> = classes[0].parents.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(parents, vec!["First", "Second", "Third"]);
+    }
+
+    #[test]
+    fn project_functions_that_look_built_in_are_references() {
+        let content = "<?php\n$ok = is_valid_item($x) && is_array($x);\n$t = mb_ucfirst($s) . mb_strtolower($s);\n";
+        let refs = PHP_PARSER.extract_refs(content, &[]).unwrap();
+        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"is_valid_item") && names.contains(&"mb_ucfirst"),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"is_array") && !names.contains(&"mb_strtolower"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyword_later_on_the_line_does_not_hide_a_reference() {
+        let content = "<?php\nfinal class Maker\n{\n    public function make(): AbstractItem { return $this->item; } // was function AbstractItem\n}\n";
+        let symbols = PHP_PARSER.parse_symbols(content).unwrap();
+        let refs = PHP_PARSER.extract_refs(content, &symbols).unwrap();
+        assert!(refs.iter().any(|r| r.name == "AbstractItem" && r.line == 4));
+        assert!(!refs.iter().any(|r| r.name == "make" && r.line == 4));
+        assert!(!refs.iter().any(|r| r.name == "Maker"));
+    }
+
+    #[test]
+    fn a_method_named_like_its_return_class_keeps_the_class_references() {
+        let content = "<?php\nfinal class Factory\n{\n    public function Logger(): Logger { return new Logger(); }\n}\n";
+        let symbols = PHP_PARSER.parse_symbols(content).unwrap();
+        let refs = PHP_PARSER.extract_refs(content, &symbols).unwrap();
+        let n = refs
+            .iter()
+            .filter(|r| r.name == "Logger" && r.line == 4)
+            .count();
+        assert_eq!(n, 2, "the declaration hides one of three occurrences");
+    }
+
+    #[test]
+    fn global_built_in_calls_are_dropped_but_methods_named_alike_are_kept() {
+        let content =
+            "<?php\n$n = count($a) + strlen($s) + bcadd('1', '2');\n$m = $list->count();\n";
+        let refs = PHP_PARSER.extract_refs(content, &[]).unwrap();
+        let has = |name: &str, line: usize| refs.iter().any(|r| r.name == name && r.line == line);
+        assert!(!has("count", 2) && !has("strlen", 2) && !has("bcadd", 2));
+        assert!(has("count", 3));
     }
 }

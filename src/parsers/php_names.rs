@@ -27,7 +27,18 @@ pub struct PhpNames {
 
 pub fn resolve(content: &str, symbols: &[ParsedSymbol], refs: &[ParsedRef]) -> PhpNames {
     let lines: Vec<&str> = content.lines().collect();
-    let analysis = analyze(&lines, &local_type_names(content));
+    // The parser already knows where each namespace starts, `<?php declare(…); namespace X;` too.
+    let namespace_lines: HashMap<usize, String> = symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Package)
+        .map(|s| {
+            (
+                s.line.wrapping_sub(1),
+                s.name.trim_start_matches('\\').to_string(),
+            )
+        })
+        .collect();
+    let analysis = analyze(&lines, &local_type_names(content), &namespace_lines);
 
     let ref_names = refs
         .iter()
@@ -105,6 +116,44 @@ enum Event {
     Name { start: usize, end: usize, doc: bool },
     /// A fully qualified name inside a string literal or heredoc (escapes already applied).
     StringFqn(String),
+    /// A bracket in code: `(`, `)`, `[`, `]`, `{`.
+    Bracket { at: usize, c: char },
+}
+
+/// A clause in which names have a known kind: an attribute `#[…]`, an `extends`/`implements`
+/// list up to the class body, a `catch (…)`. It may span lines.
+#[derive(Clone, Copy)]
+struct Clause {
+    kind: &'static str,
+    /// Open `[` (attribute) or `(` (catch) inside the clause.
+    depth: i32,
+}
+
+/// Update the open clause for a bracket in code; `prev` is the char before it.
+fn track_clause(clause: &mut Option<Clause>, c: char, prev: Option<char>) {
+    let Some(open) = clause.as_mut() else {
+        if c == '[' && prev == Some('#') {
+            *clause = Some(Clause {
+                kind: "attribute",
+                depth: 1,
+            });
+        }
+        return;
+    };
+    // An `extends`/`implements` list ends at the class body.
+    let (opener, closer) = match open.kind {
+        "attribute" => ('[', ']'),
+        "check" => ('(', ')'),
+        _ => ('{', '{'),
+    };
+    if c == closer {
+        open.depth -= 1;
+        if open.depth <= 0 {
+            *clause = None;
+        }
+    } else if c == opener {
+        open.depth += 1;
+    }
 }
 
 struct Analysis {
@@ -121,7 +170,14 @@ struct Scope {
     imports: HashMap<String, String>,
 }
 
-fn analyze(lines: &[&str], local_types: &HashSet<String>) -> Analysis {
+/// Lines longer than this are generated or minified; the generic extractor skips them too.
+const MAX_LINE_LEN: usize = 2000;
+
+fn analyze(
+    lines: &[&str],
+    local_types: &HashSet<String>,
+    namespace_lines: &HashMap<usize, String>,
+) -> Analysis {
     let mut names = vec![HashMap::new(); lines.len()];
     let mut namespaces = vec![String::new(); lines.len()];
     let mut scope = Scope::default();
@@ -131,88 +187,106 @@ fn analyze(lines: &[&str], local_types: &HashSet<String>) -> Analysis {
     let mut import_depth = 0usize;
     // A `use` statement can span lines (group use): its text and line indexes so far.
     let mut pending_use: Option<(String, Vec<usize>)> = None;
+    let mut clause: Option<Clause> = None;
 
     for (idx, line) in lines.iter().enumerate() {
+        if let Some(namespace) = namespace_lines.get(&idx) {
+            let braced = line
+                .split_once("namespace")
+                .is_some_and(|(_, rest)| rest.contains('{'))
+                || lines
+                    .get(idx + 1)
+                    .is_some_and(|next| next.trim_start().starts_with('{'));
+            import_depth = if braced { depth + 1 } else { depth };
+            scope = Scope {
+                namespace: namespace.clone(),
+                imports: HashMap::new(),
+            };
+        }
+        namespaces[idx] = scope.namespace.clone();
+
         let trimmed = line.trim_start();
-        // A statement can follow the opening tag on the same line: `<?php namespace App;`.
+        // A statement can follow the opening tag on the same line: `<?php use App\Foo;`.
         let statement = match (&mode, trimmed.strip_prefix("<?php")) {
             (Mode::Html, Some(rest)) => Some(rest.trim_start()),
             (Mode::Code, _) => Some(trimmed),
             _ => None,
         };
-
-        if let Some((mut text, mut idxs)) = pending_use.take() {
+        let use_rest = statement.and_then(|s| keyword_rest(s, "use"));
+        let import_line = if let Some((mut text, mut idxs)) = pending_use.take() {
             text.push(' ');
             text.push_str(line);
             idxs.push(idx);
-            if text.contains(';') {
-                finish_use(&text, &idxs, &mut scope, &mut names);
-            } else {
-                pending_use = Some((text, idxs));
-            }
-            namespaces[idx] = scope.namespace.clone();
-            lex_line(line, &mut mode, &mut depth, |_| {});
-            continue;
+            pending_use = Some((text, idxs));
+            true
+        } else if let Some(rest) =
+            use_rest.filter(|r| depth == import_depth && !r.trim_start().starts_with('('))
+        {
+            pending_use = Some((rest.to_string(), vec![idx]));
+            true
+        } else {
+            false
+        };
+        if pending_use
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains(';'))
+        {
+            let (text, idxs) = pending_use.take().expect("checked above");
+            finish_use(&text, &idxs, &mut scope, &mut names);
         }
 
-        if let Some(statement) = statement {
-            if let Some(rest) = keyword_rest(statement, "namespace") {
-                let rest = rest.trim_start();
-                if !rest.starts_with('\\') {
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '\\')
-                        .collect();
-                    import_depth = if rest.contains('{') { depth + 1 } else { depth };
-                    scope = Scope {
-                        namespace: name.trim_start_matches('\\').to_string(),
-                        imports: HashMap::new(),
-                    };
-                    namespaces[idx] = scope.namespace.clone();
-                    lex_line(line, &mut mode, &mut depth, |_| {});
-                    continue;
-                }
-            } else if let Some(rest) = keyword_rest(statement, "use") {
-                if depth == import_depth && !rest.trim_start().starts_with('(') {
-                    namespaces[idx] = scope.namespace.clone();
-                    if rest.contains(';') {
-                        finish_use(rest, &[idx], &mut scope, &mut names);
-                    } else {
-                        pending_use = Some((rest.to_string(), vec![idx]));
-                    }
-                    lex_line(line, &mut mode, &mut depth, |_| {});
-                    continue;
-                }
-            }
-        }
-
-        namespaces[idx] = scope.namespace.clone();
-        let trait_use = statement.is_some_and(|s| keyword_rest(s, "use").is_some());
-        let attribute_line = trimmed.starts_with("#[");
-        let chars: Vec<char> = line.chars().collect();
+        let resolve_names = !import_line && line.len() <= MAX_LINE_LEN;
+        let chars: Vec<char> = if resolve_names {
+            line.chars().collect()
+        } else {
+            Vec::new()
+        };
+        let site_line = SiteLine {
+            chars: &chars,
+            trait_use: use_rest.is_some() && !import_line,
+        };
         let line_names = &mut names[idx];
-        lex_line(line, &mut mode, &mut depth, |event| match event {
-            Event::StringFqn(fqn) => {
-                let last = fqn.rsplit('\\').next().unwrap_or(&fqn).to_string();
-                line_names.entry(last).or_insert((fqn, "string"));
+        lex_line(line, &mut mode, &mut depth, |event| {
+            if !resolve_names {
+                return;
             }
-            Event::Name { start, end, doc } => {
-                let token: String = chars[start..end].iter().collect();
-                let last = token.rsplit('\\').next().unwrap_or(&token).to_string();
-                if last.is_empty() || line_names.contains_key(&last) || local_types.contains(&token)
-                {
-                    return;
+            match event {
+                Event::Bracket { at, c } => {
+                    track_clause(&mut clause, c, at.checked_sub(1).map(|p| chars[p]))
                 }
-                let site = Site {
-                    chars: &chars,
-                    start,
-                    end,
-                    doc,
-                    trait_use,
-                    attribute_line,
-                };
-                if let Some(resolved) = classify(&site, &token, &scope) {
-                    line_names.insert(last, resolved);
+                Event::StringFqn(fqn) => {
+                    let last = fqn.rsplit('\\').next().unwrap_or(&fqn).to_string();
+                    line_names.entry(last).or_insert((fqn, "string"));
+                }
+                Event::Name { start, end, doc } => {
+                    let token: String = chars[start..end].iter().collect();
+                    if !doc && clause.is_none() {
+                        let opens = match token.to_ascii_lowercase().as_str() {
+                            "extends" | "implements" => Some("inheritance"),
+                            "catch" => Some("check"),
+                            _ => None,
+                        };
+                        if let Some(kind) = opens {
+                            clause = Some(Clause { kind, depth: 0 });
+                            return;
+                        }
+                    }
+                    let last = token.rsplit('\\').next().unwrap_or(&token).to_string();
+                    if last.is_empty()
+                        || line_names.contains_key(&last)
+                        || local_types.contains(&token)
+                    {
+                        return;
+                    }
+                    let site = Site {
+                        start,
+                        end,
+                        doc,
+                        clause: clause.map(|c| c.kind),
+                    };
+                    if let Some(resolved) = classify(&site_line, &site, &token, &scope) {
+                        line_names.insert(last, resolved);
+                    }
                 }
             }
         });
@@ -326,13 +400,20 @@ fn lex_line(line: &str, mode: &mut Mode, depth: &mut usize, mut on_event: impl F
         let c = chars[i];
         match mode.clone() {
             Mode::Html => {
-                if starts(i, "<?php") {
+                let php_tag = chars
+                    .get(i..i + 5)
+                    .is_some_and(|t| t.iter().collect::<String>().eq_ignore_ascii_case("<?php"));
+                let xml_tag = chars
+                    .get(i..i + 5)
+                    .is_some_and(|t| t.iter().collect::<String>().eq_ignore_ascii_case("<?xml"));
+                if php_tag {
                     *mode = Mode::Code;
                     i += 5;
                 } else if starts(i, "<?=") {
                     *mode = Mode::Code;
                     i += 3;
-                } else if starts(i, "<?") {
+                } else if starts(i, "<?") && !xml_tag {
+                    // Short open tag, with or without a space: `<?if (…):`, `<?$APPLICATION->…`.
                     *mode = Mode::Code;
                     i += 2;
                 } else {
@@ -388,8 +469,16 @@ fn lex_line(line: &str, mode: &mut Mode, depth: &mut usize, mut on_event: impl F
                     i += 2;
                     continue;
                 }
+                // A one-line comment ends at the line end or at `?>`, which closes PHP even there.
                 if starts(i, "//") || (c == '#' && at(i + 1) != Some('[')) {
-                    return;
+                    match (i..chars.len()).find(|&k| starts(k, "?>")) {
+                        Some(k) => {
+                            *mode = Mode::Html;
+                            i = k + 2;
+                            continue;
+                        }
+                        None => return,
+                    }
                 }
                 if starts(i, "/*") {
                     let doc = at(i + 2) == Some('*') && at(i + 3) != Some('/');
@@ -418,6 +507,11 @@ fn lex_line(line: &str, mode: &mut Mode, depth: &mut usize, mut on_event: impl F
                     }
                     '{' => {
                         *depth += 1;
+                        on_event(Event::Bracket { at: i, c });
+                        i += 1;
+                    }
+                    '(' | ')' | '[' | ']' => {
+                        on_event(Event::Bracket { at: i, c });
                         i += 1;
                     }
                     '}' => {
@@ -478,24 +572,46 @@ fn token_end(chars: &[char], i: usize) -> usize {
 // Deciding what a name in code is
 // ---------------------------------------------------------------------------
 
-struct Site<'a> {
+/// What `classify` needs to know about the line a name stands on.
+struct SiteLine<'a> {
     chars: &'a [char],
+    /// `use Trait;` inside a class.
+    trait_use: bool,
+}
+
+/// A name on the line: char positions, whether it is in a PHPDoc block, and the clause it is in.
+struct Site {
     start: usize,
     end: usize,
     doc: bool,
-    trait_use: bool,
-    attribute_line: bool,
+    clause: Option<&'static str>,
 }
 
-fn classify(site: &Site, token: &str, scope: &Scope) -> Option<(String, &'static str)> {
-    let chars = site.chars;
-    let before: String = chars[..site.start].iter().collect();
-    let trimmed_before = before.trim_end();
-    if trimmed_before.ends_with("->") || trimmed_before.ends_with("::") {
+fn classify(
+    line: &SiteLine,
+    site: &Site,
+    token: &str,
+    scope: &Scope,
+) -> Option<(String, &'static str)> {
+    let chars = line.chars;
+    let (start, end) = (site.start, site.end);
+    let mut before_end = start;
+    while before_end > 0 && chars[before_end - 1].is_whitespace() {
+        before_end -= 1;
+    }
+    let ends_with = |s: &str| {
+        let n = s.chars().count();
+        before_end >= n
+            && chars[before_end - n..before_end]
+                .iter()
+                .copied()
+                .eq(s.chars())
+    };
+    if ends_with("->") || ends_with("::") {
         return None;
     }
-    let prev_word = previous_word(chars, site.start);
-    let after = |k: usize| chars.get(site.end + k).copied();
+    let prev_word = previous_word(chars, start);
+    let after = |k: usize| chars.get(end + k).copied();
     let after_is_scope = after(0) == Some(':') && after(1) == Some(':');
     // Declared names (functions, constants, enum cases, the class itself) are not references;
     // `case Status::ACTIVE:` in a switch is.
@@ -511,49 +627,61 @@ fn classify(site: &Site, token: &str, scope: &Scope) -> Option<(String, &'static
             | "trait"
             | "enum"
     ) || (prev_word == "case" && !after_is_scope);
-    if declares {
-        return None;
-    }
-    let in_attribute = site.attribute_line || trimmed_before.ends_with("#[");
     // `name: value` — a named argument or a label, not a type.
-    if after(0) == Some(':') && !after_is_scope {
+    if declares || (after(0) == Some(':') && !after_is_scope) {
         return None;
     }
-    let next = chars[site.end..]
-        .iter()
-        .find(|c| !c.is_whitespace())
-        .copied();
+    let in_attribute = site.clause == Some("attribute");
+    let next = chars[end..].iter().find(|c| !c.is_whitespace()).copied();
     if next == Some('(') && prev_word != "new" && !after_is_scope && !in_attribute {
         return None;
     }
-
     let lower = token.to_ascii_lowercase();
     // Keywords are case-insensitive: `Throw New Exception()` is not a class `Throw`.
     if RESERVED.contains(lower.as_str()) {
         return None;
     }
-    let in_inheritance = before.contains(" extends ") || before.contains(" implements ");
-    let strong_class_site = prev_word == "new"
-        || after_is_scope
-        || in_inheritance
-        || prev_word == "instanceof"
-        || site.trait_use;
+
+    let class_constant = after_is_scope
+        && chars
+            .get(end + 2..end + 7)
+            .is_some_and(|t| t.iter().copied().eq("class".chars()))
+        && after(7).is_none_or(|c| !is_ident_char(c));
+    let kind = if site.doc {
+        "phpdoc"
+    } else if line.trait_use {
+        "trait-use"
+    } else if class_constant {
+        "::class"
+    } else if in_attribute && !after_is_scope {
+        "attribute"
+    } else if after_is_scope {
+        "static"
+    } else if prev_word == "new" {
+        "new"
+    } else if site.clause == Some("inheritance") {
+        "inheritance"
+    } else if prev_word == "instanceof" || site.clause == Some("check") {
+        "check"
+    } else {
+        "type"
+    };
+
+    // Where only a class can stand, any spelling is a class. Elsewhere lower-case names are
+    // functions and keywords, ALL-CAPS names (and a lone capital) constants, template parameters
+    // or prose (`mode Y`) — unless the file imports that name.
+    let certain = matches!(
+        kind,
+        "trait-use" | "::class" | "static" | "new" | "inheritance" | "check"
+    );
     let last = token.rsplit('\\').next().unwrap_or(token);
     let unqualified = !token.contains('\\');
     let imported = unqualified && scope.imports.contains_key(&lower);
-    // Lower-case names are functions and keywords; ALL-CAPS names are constants.
-    if last.starts_with(|c: char| c.is_ascii_lowercase()) && !strong_class_site && !imported {
-        return None;
-    }
-    // A lone capital letter is a template parameter or prose (`mode Y`), not a class.
-    if last.len() == 1 && unqualified && !imported && !strong_class_site {
-        return None;
-    }
-    let all_caps = last.len() > 1
-        && last
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if all_caps && unqualified && !imported && !strong_class_site {
+    let all_caps = last
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    let lowercase = last.starts_with(|c: char| c.is_ascii_lowercase());
+    if !certain && !imported && (lowercase || (unqualified && all_caps)) {
         return None;
     }
 
@@ -575,27 +703,6 @@ fn classify(site: &Site, token: &str, scope: &Scope) -> Option<(String, &'static
             .cloned()
             .unwrap_or_else(|| qualify(&scope.namespace, token))
     };
-
-    let after_text: String = chars[site.end..].iter().take(7).collect();
-    let kind = if site.doc {
-        "phpdoc"
-    } else if site.trait_use {
-        "trait-use"
-    } else if after_text.starts_with("::class") {
-        "::class"
-    } else if in_attribute && !after_is_scope {
-        "attribute"
-    } else if after_is_scope {
-        "static"
-    } else if prev_word == "new" {
-        "new"
-    } else if in_inheritance {
-        "inheritance"
-    } else if prev_word == "instanceof" || before.contains("catch") {
-        "check"
-    } else {
-        "type"
-    };
     Some((fqn, kind))
 }
 
@@ -616,6 +723,7 @@ const PHP_KEYWORDS: &[&str] = &[
     "continue",
     "declare",
     "default",
+    "die",
     "do",
     "echo",
     "else",
@@ -962,5 +1070,97 @@ final class OrderService
             vec!["App\\Real".to_string(), "App\\Render".to_string()],
             "{fqns:?}"
         );
+    }
+
+    #[test]
+    fn closing_tag_in_a_line_comment_ends_php() {
+        let code = "<?php $a = new Real(); ?>\n<div><?//= Loc::getMessage('X') ?></div>\n<p>Don't Panic Ghost</p>\n<?php $b = new Second(); ?>\n<p>It's Phantom</p>\n<?php $c = new Third(); # done ?>\n<p>Wraith</p>\n";
+        let mut fqns = all_fqns(code);
+        fqns.sort();
+        assert_eq!(fqns, vec!["Real", "Second", "Third"], "{fqns:?}");
+    }
+
+    #[test]
+    fn xml_declaration_is_markup() {
+        let code = "<?xml version=\"1.0\"?>\n<root>Item Value</root>\n<?php $a = new Real();\n";
+        assert_eq!(all_fqns(code), vec!["Real".to_string()]);
+    }
+
+    #[test]
+    fn namespace_after_declare_on_the_opening_line() {
+        let code = "<?php declare(strict_types=1); namespace Fx\\One;\nfinal class One { public function a(): Two { return new Two(); } }\n";
+        assert_eq!(fqn_of(code, "Two", 2).as_deref(), Some("Fx\\One\\Two"));
+        let symbols = PHP_PARSER.parse_symbols(code).unwrap();
+        let names = resolve(code, &symbols, &[]);
+        assert!(names.qualified.values().any(|fqn| fqn == "Fx\\One\\One"));
+    }
+
+    #[test]
+    fn short_open_tags_without_a_space_are_code() {
+        let code = "<div>\n<?if (\\App\\Settings::I()->on()):?>\n<?$APPLICATION->IncludeComponent(Widget::NAME);?>\n<?endif?>\n</div>\n";
+        assert_eq!(
+            fqn_of(code, "Settings", 2).as_deref(),
+            Some("App\\Settings")
+        );
+        assert_eq!(fqn_of(code, "Widget", 3).as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn inheritance_and_catch_kinds_end_with_their_clause() {
+        let code = "<?php\nnamespace T;\n$x = new class extends Base { public function p(): Palette { return Palette::make(MAX_ITEMS); } };\ntry { run(); } catch (Failure $e) { log(Level::ERROR, LIMIT_X); }\n";
+        assert_eq!(
+            kind_of(code, "Base", 3),
+            Some(("T\\Base".to_string(), "inheritance"))
+        );
+        assert_eq!(
+            kind_of(code, "Palette", 3),
+            Some(("T\\Palette".to_string(), "type"))
+        );
+        assert_eq!(fqn_of(code, "MAX_ITEMS", 3), None);
+        assert_eq!(
+            kind_of(code, "Failure", 4),
+            Some(("T\\Failure".to_string(), "check"))
+        );
+        assert_eq!(fqn_of(code, "LIMIT_X", 4), None);
+    }
+
+    #[test]
+    fn clauses_span_lines_and_end_where_they_close() {
+        let code = "<?php\nnamespace T;\nfinal class A extends Base implements\n    First,\n    Second\n{\n    #[Route('/a')] public function route(Omicron $o): Pi { return new Pi(); }\n    #[Assert\\Choice(\n        choices: Status::ALL,\n    )]\n    public function b(): void\n    {\n        try { run(); } catch (\n            Upsilon | Phi $e\n        ) { log(LIMIT_X); }\n    }\n}\n";
+        assert_eq!(
+            kind_of(code, "First", 4),
+            Some(("T\\First".to_string(), "inheritance"))
+        );
+        assert_eq!(
+            kind_of(code, "Second", 5),
+            Some(("T\\Second".to_string(), "inheritance"))
+        );
+        assert_eq!(
+            kind_of(code, "Route", 7),
+            Some(("T\\Route".to_string(), "attribute"))
+        );
+        assert_eq!(
+            kind_of(code, "Omicron", 7),
+            Some(("T\\Omicron".to_string(), "type"))
+        );
+        assert_eq!(
+            kind_of(code, "Status", 9),
+            Some(("T\\Status".to_string(), "static"))
+        );
+        assert_eq!(
+            kind_of(code, "Upsilon", 14),
+            Some(("T\\Upsilon".to_string(), "check"))
+        );
+        assert_eq!(fqn_of(code, "LIMIT_X", 15), None);
+    }
+
+    #[test]
+    fn a_keyword_in_a_comment_opens_no_clause() {
+        let code = "<?php\nnamespace T;\n/**\n * This class extends the idea of a catch\n */\nfinal class A\n{\n    public function b(): Omega { return foo(MAX_X); }\n}\n";
+        assert_eq!(
+            kind_of(code, "Omega", 8),
+            Some(("T\\Omega".to_string(), "type"))
+        );
+        assert_eq!(fqn_of(code, "MAX_X", 8), None);
     }
 }

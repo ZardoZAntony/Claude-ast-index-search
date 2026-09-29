@@ -223,6 +223,9 @@ pub struct ProjectConfig {
     /// Symbol names `unused-symbols` never reports (`*` wildcards): methods a framework calls
     /// by name, such as Bitrix controller actions `*Action` or ORM `getObjectClass`.
     pub unused_ignore_names: Option<Vec<String>>,
+    /// Path fragments of deliberate copies (`/Contracts/` for DTO contracts mirrored in modules):
+    /// `duplicates` tags pairs with such a path and lists them last.
+    pub duplicate_mirrors: Option<Vec<String>>,
 }
 
 /// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root.

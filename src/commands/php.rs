@@ -39,7 +39,7 @@ files excluded from the index";
 struct RefRow {
     path: String,
     line: i64,
-    kind: &'static str,
+    kind: String,
     test: bool,
     context: String,
     #[serde(skip)]
@@ -69,13 +69,13 @@ fn open(root: &Path) -> Result<db::LeasedConnection> {
         bail!("Index not found. Run 'ast-index rebuild' first.");
     }
     let conn = db::open_db_leased(root)?;
-    let has_fqn: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM refs WHERE fqn IS NOT NULL)",
+    let has_kinds: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_kind IS NOT NULL)",
         [],
         |row| row.get(0),
     )?;
-    if !has_fqn {
-        bail!("The index has no fully qualified names yet. Run 'ast-index rebuild'.");
+    if !has_kinds {
+        bail!("The index has no resolved PHP names yet. Run 'ast-index rebuild'.");
     }
     Ok(conn)
 }
@@ -124,67 +124,7 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
-static NEW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bnew\s+\\?[\w\\]+").unwrap());
-
-/// Kind of use recorded by the indexer; `None` for rows written before kinds were stored.
-fn stored_kind(kind: Option<&str>) -> Option<&'static str> {
-    Some(match kind? {
-        "import" => "import",
-        "trait-use" => "trait-use",
-        "phpdoc" => "phpdoc",
-        "attribute" => "attribute",
-        "::class" => "::class",
-        "new" => "new",
-        "static" => "static",
-        "inheritance" => "inheritance",
-        "check" => "check",
-        "string" => "string",
-        "type" => "type",
-        _ => return None,
-    })
-}
-
-/// Kind of use on a reference line, from its text (fallback for indexes without kinds).
-fn classify(context: &str, short: &str) -> &'static str {
-    let t = context.trim_start();
-    if t.starts_with("use ") {
-        return "import";
-    }
-    if t.starts_with('*') || t.starts_with("/*") {
-        return "phpdoc";
-    }
-    if t.starts_with("#[") {
-        return "attribute";
-    }
-    if t.contains(&format!("{short}::class")) {
-        return "::class";
-    }
-    if NEW_RE.find_iter(t).any(|m| {
-        m.as_str()
-            .rsplit('\\')
-            .next()
-            .unwrap_or("")
-            .ends_with(short)
-    }) {
-        return "new";
-    }
-    if t.contains(&format!("{short}::")) {
-        return "static";
-    }
-    if t.contains(" extends ") || t.contains(" implements ") {
-        return "inheritance";
-    }
-    if t.contains("instanceof") || t.contains("catch (") || t.starts_with("catch") {
-        return "check";
-    }
-    if (t.contains('\'') || t.contains('"')) && t.contains(&format!("\\{short}")) {
-        return "string";
-    }
-    "type"
-}
-
 fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>> {
-    let short = short_name(fqn).to_string();
     let mut stmt = conn.prepare(
         "SELECT f.path, f.root_path, r.line, r.context, r.file_id, r.ref_kind
          FROM refs r JOIN files f ON f.id = r.file_id
@@ -200,7 +140,7 @@ fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>>
             row.get::<_, i64>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         ))
     })?;
     for item in mapped {
@@ -212,7 +152,7 @@ fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>>
         let context = context.unwrap_or_default();
         rows.push(RefRow {
             test: is_test_path(&shown),
-            kind: stored_kind(kind.as_deref()).unwrap_or_else(|| classify(&context, &short)),
+            kind,
             context,
             path: shown,
             line,
@@ -445,7 +385,7 @@ pub fn cmd_impact(root: &Path, fqn: &str, full: bool, format: &str) -> Result<()
 
     let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
     for r in &refs {
-        *by_kind.entry(r.kind).or_default() += 1;
+        *by_kind.entry(&r.kind).or_default() += 1;
     }
     let files: HashSet<&str> = refs.iter().map(|r| r.path.as_str()).collect();
     let tests = refs.iter().filter(|r| r.test).count();
@@ -511,7 +451,7 @@ fn print_file_summary(refs: &[RefRow]) {
             files.push((&r.path, BTreeMap::new(), Vec::new()));
         }
         let (_, kinds, lines) = files.last_mut().expect("pushed above");
-        *kinds.entry(r.kind).or_default() += 1;
+        *kinds.entry(&r.kind).or_default() += 1;
         lines.push(r.line);
     }
     for (path, kinds, lines) in files {
@@ -784,7 +724,7 @@ fn implicit_same_namespace_deps(
     own_fqn: &str,
 ) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT fqn, line, context, ref_kind FROM refs
+        "SELECT fqn, line, ref_kind FROM refs
          WHERE file_id = ?1 AND fqn IS NOT NULL ORDER BY line",
     )?;
     let rows = stmt
@@ -793,18 +733,14 @@ fn implicit_same_namespace_deps(
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     // `use Trait;` inside a class is not an import: the trait resolves by namespace too.
     let imported: HashSet<String> = rows
         .iter()
-        .filter(|(fqn, _, context, kind)| {
-            stored_kind(kind.as_deref()).unwrap_or_else(|| classify(context, short_name(fqn)))
-                == "import"
-        })
-        .map(|(f, _, _, _)| f.to_ascii_lowercase())
+        .filter(|(_, _, kind)| kind == "import")
+        .map(|(f, _, _)| f.to_ascii_lowercase())
         .collect();
     let known_class = |fqn: &str| -> bool {
         let sql = format!(
@@ -814,7 +750,7 @@ fn implicit_same_namespace_deps(
             .unwrap_or(false)
     };
     let mut deps: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    for (fqn, line, _, _) in &rows {
+    for (fqn, line, _) in &rows {
         if fqn.eq_ignore_ascii_case(own_fqn)
             || !namespace_of(fqn).eq_ignore_ascii_case(old_ns)
             || imported.contains(&fqn.to_ascii_lowercase())
@@ -854,7 +790,8 @@ struct DuplicatePair {
     name: String,
     similarity: f64,
     lines: usize,
-    contract_mirror: bool,
+    /// One of the paths is a deliberate mirror (`duplicate_mirrors` in the config).
+    mirror: bool,
     /// Both copies declare the same FQN (one of them is usually a leftover): references
     /// cannot be told apart, so the counts are shared.
     same_fqn: bool,
@@ -906,6 +843,9 @@ pub fn cmd_duplicates(
             .push((fqn, shown, line, abs));
     }
 
+    let mirrors = indexer::load_config_quiet(root)
+        .and_then(|c| c.duplicate_mirrors)
+        .unwrap_or_default();
     let mut usage_cache: HashMap<(String, String), (usize, usize)> = HashMap::new();
     let mut usage = |fqn: &str, own_path: &str| -> Result<(usize, usize)> {
         let key = (fqn.to_ascii_lowercase(), own_path.to_string());
@@ -954,7 +894,7 @@ pub fn cmd_duplicates(
                     name: short_name(fa).to_string(),
                     similarity: (similarity * 100.0).round() / 100.0,
                     lines: size,
-                    contract_mirror: pa.contains("/Contracts/") || pb.contains("/Contracts/"),
+                    mirror: mirrors.iter().any(|m| pa.contains(m) || pb.contains(m)),
                     same_fqn,
                     a: CopyInfo {
                         fqn: fa.clone(),
@@ -976,13 +916,13 @@ pub fn cmd_duplicates(
     }
     pairs.sort_by(|x, y| {
         (
-            x.contract_mirror,
+            x.mirror,
             -(x.similarity * 100.0) as i64,
             -(x.lines as i64),
             &x.name,
         )
             .cmp(&(
-                y.contract_mirror,
+                y.mirror,
                 -(y.similarity * 100.0) as i64,
                 -(y.lines as i64),
                 &y.name,
@@ -1007,9 +947,9 @@ pub fn cmd_duplicates(
         .bold()
     );
     for p in &pairs {
-        let tag = match (p.contract_mirror, p.same_fqn) {
+        let tag = match (p.mirror, p.same_fqn) {
             (_, true) => " [same FQN — reference counts are shared]",
-            (true, false) => " [contract mirror]",
+            (true, false) => " [mirror]",
             _ => "",
         };
         println!(
@@ -1048,37 +988,54 @@ type ClassBody = (Vec<String>, HashMap<String, usize>);
 /// Normalized lines of a class: declaration through the matching closing brace, without
 /// comments and blank lines.
 fn class_body(content: &str, decl_line: usize) -> Vec<String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut out = Vec::new();
+    let end = class_end_line(content, decl_line).unwrap_or(usize::MAX);
+    content
+        .lines()
+        .enumerate()
+        .skip(decl_line.saturating_sub(1))
+        .take_while(|(i, _)| *i < end)
+        .map(|(_, line)| line.trim())
+        .filter(|t| !t.is_empty() && !is_comment_line(t))
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .take(5000)
+        .collect()
+}
+
+/// Line (1-based) where the braces of the class declared at `decl_line` close.
+pub(crate) fn class_end_line(content: &str, decl_line: usize) -> Option<usize> {
     let mut depth = 0i64;
     let mut opened = false;
-    for line in lines.iter().skip(decl_line.saturating_sub(1)) {
+    for (i, line) in content
+        .lines()
+        .enumerate()
+        .skip(decl_line.saturating_sub(1))
+    {
         let t = line.trim();
-        let is_comment =
-            t.starts_with("//") || t.starts_with('#') || t.starts_with('*') || t.starts_with("/*");
-        if !t.is_empty() && !is_comment {
-            out.push(t.split_whitespace().collect::<Vec<_>>().join(" "));
+        if is_comment_line(t) {
+            continue;
         }
-        if !is_comment {
-            for c in code_chars(t) {
-                match c {
-                    '{' => {
-                        depth += 1;
-                        opened = true;
-                    }
-                    '}' => depth -= 1,
-                    _ => {}
+        for c in code_chars(t) {
+            match c {
+                '{' => {
+                    depth += 1;
+                    opened = true;
                 }
+                '}' => depth -= 1,
+                _ => {}
             }
         }
         if opened && depth <= 0 {
-            break;
-        }
-        if out.len() > 5000 {
-            break;
+            return Some(i + 1);
         }
     }
-    out
+    None
+}
+
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || (trimmed.starts_with('#') && !trimmed.starts_with("#["))
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("/*")
 }
 
 /// Characters of a line outside string literals and a trailing `//` comment, so braces in
@@ -1278,7 +1235,7 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
 
     let mut stmt = conn.prepare(
         "SELECT DISTINCT r.file_id, f.path, f.root_path FROM refs r JOIN files f ON f.id = r.file_id
-         WHERE r.name = ?1 AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')",
+         WHERE r.name = ?1 COLLATE NOCASE AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')",
     )?;
     let files = stmt
         .query_map(params![method], |row| {
@@ -1290,8 +1247,15 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let call_re = Regex::new(&format!(r"(->|\?->|::)\s*{}\s*\(", regex::escape(&method)))?;
-    let decl_re = Regex::new(&format!(r"\bfunction\s+&?{}\s*\(", regex::escape(&method)))?;
+    // Method names are case-insensitive in PHP: legacy code calls `GetList` as `getList`.
+    let call_re = Regex::new(&format!(
+        r"(->|\?->|::)\s*(?i:{})\s*\(",
+        regex::escape(&method)
+    ))?;
+    let decl_re = Regex::new(&format!(
+        r"\bfunction\s+&?(?i:{})\s*\(",
+        regex::escape(&method)
+    ))?;
     let mut calls = Vec::new();
     let mut via_supertype = Vec::new();
     let mut unresolved = Vec::new();
@@ -1313,8 +1277,7 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
             }
             let line_no = idx as i64 + 1;
             for m in call_re.find_iter(line) {
-                let receiver =
-                    receiver_type(&conn, file_id, &lines, idx, &line[..m.start()], m.as_str());
+                let receiver = receiver_type(&conn, file_id, &lines, idx, &line[..m.start()]);
                 let site = CallSite {
                     path: shown.clone(),
                     line: line_no,
@@ -1367,47 +1330,34 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
     for d in &declarations {
         println!("  {}:{}  {}", d.path.cyan(), d.line, d.owner);
     }
-    println!(
-        "calls on these types: {} (showing {})",
-        total_calls,
-        calls.len()
+    print_sites(
+        &format!(
+            "calls on these types: {total_calls} (showing {})",
+            calls.len()
+        ),
+        &calls,
+        true,
     );
-    for c in &calls {
-        println!(
-            "  {}:{}  [{}]  {}",
-            c.path.cyan(),
-            c.line,
-            short_name(c.receiver.as_deref().unwrap_or("")),
-            c.context
-        );
-    }
     if !via_supertype.is_empty() {
-        println!(
-            "calls typed as a supertype ({}) — may dispatch here: {}",
-            via_supertypes
-                .iter()
-                .map(|t| short_name(t))
-                .collect::<Vec<_>>()
-                .join(", "),
-            via_supertype.len()
+        let names: Vec<&str> = via_supertypes.iter().map(|t| short_name(t)).collect();
+        print_sites(
+            &format!(
+                "calls typed as a supertype ({}) — may dispatch here: {}",
+                names.join(", "),
+                via_supertype.len()
+            ),
+            &via_supertype,
+            true,
         );
-        for c in &via_supertype {
-            println!(
-                "  {}:{}  [{}]  {}",
-                c.path.cyan(),
-                c.line,
-                short_name(c.receiver.as_deref().unwrap_or("")),
-                c.context
-            );
-        }
     }
-    println!(
-        "receiver not inferred — check by hand: {}",
-        unresolved.len()
+    print_sites(
+        &format!(
+            "receiver not inferred — check by hand: {}",
+            unresolved.len()
+        ),
+        &unresolved,
+        false,
     );
-    for c in &unresolved {
-        println!("  {}:{}  {}", c.path.cyan(), c.line, c.context);
-    }
     println!("excluded (other types): {}", excluded.len());
     for c in &excluded {
         println!(
@@ -1418,6 +1368,18 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
         );
     }
     Ok(())
+}
+
+fn print_sites(title: &str, sites: &[CallSite], with_receiver: bool) {
+    println!("{title}");
+    for c in sites {
+        let receiver = if with_receiver {
+            format!("  [{}]", short_name(c.receiver.as_deref().unwrap_or("")))
+        } else {
+            String::new()
+        };
+        println!("  {}:{}{receiver}  {}", c.path.cyan(), c.line, c.context);
+    }
 }
 
 fn type_fqns(conn: &Connection, type_part: &str) -> Result<Vec<String>> {
@@ -1469,21 +1431,18 @@ fn local_names(conn: &Connection, fqn: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Does the `extends`/`implements` name `parent_name` on a declaration at `line` resolve to
-/// `parent`? The name may sit a few lines below the `class` line (multi-line lists, attributes).
-fn parent_resolves(
+/// FQN of an `extends`/`implements` name written on the declaration at `decl_line`. The name may
+/// sit a few lines below the `class` line (multi-line lists, attributes).
+fn resolve_parent(
     conn: &Connection,
     file_id: i64,
-    line: i64,
+    decl_line: i64,
     parent_name: &str,
-    parent: &str,
-) -> bool {
+) -> Option<String> {
     if let Some(stripped) = parent_name.strip_prefix('\\') {
-        return stripped.eq_ignore_ascii_case(parent);
+        return Some(stripped.to_string());
     }
-    let last = short_name(parent_name);
-    (line..=line + 10)
-        .any(|l| fqn_at(conn, file_id, l, last).is_some_and(|f| f.eq_ignore_ascii_case(parent)))
+    (decl_line..=decl_line + 10).find_map(|l| fqn_at(conn, file_id, l, short_name(parent_name)))
 }
 
 /// The types plus every class/interface that extends or implements one of them, transitively.
@@ -1513,9 +1472,9 @@ fn with_subtypes(conn: &Connection, roots: &[String]) -> Result<Vec<String>> {
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             for (child, file_id, line, parent_name) in children {
-                if parent_resolves(conn, file_id, line, &parent_name, &parent)
-                    && seen.insert(child.to_ascii_lowercase())
-                {
+                let resolves = resolve_parent(conn, file_id, line, &parent_name)
+                    .is_some_and(|p| p.eq_ignore_ascii_case(&parent));
+                if resolves && seen.insert(child.to_ascii_lowercase()) {
                     all.push(child.clone());
                     queue.push(child);
                 }
@@ -1548,12 +1507,7 @@ fn supertypes(conn: &Connection, types: &[String]) -> Result<Vec<String>> {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for (file_id, line, parent_name) in parents {
-            let resolved = match parent_name.strip_prefix('\\') {
-                Some(stripped) => Some(stripped.to_string()),
-                None => (line..=line + 10)
-                    .find_map(|l| fqn_at(conn, file_id, l, short_name(&parent_name))),
-            };
-            if let Some(parent) = resolved {
+            if let Some(parent) = resolve_parent(conn, file_id, line, &parent_name) {
                 if seen.insert(parent.to_ascii_lowercase()) {
                     out.push(parent.clone());
                     queue.push(parent);
@@ -1591,7 +1545,11 @@ fn method_in_class(conn: &Connection, file_id: i64, class_line: i64, method: &st
 /// Line of `function <method>(` at or after `from_line` (1-based) within the next 400 lines —
 /// for anonymous classes, which have no symbol of their own.
 fn find_method_decl(content: &str, from_line: usize, method: &str) -> Option<usize> {
-    let re = Regex::new(&format!(r"\bfunction\s+&?{}\s*\(", regex::escape(method))).ok()?;
+    let re = Regex::new(&format!(
+        r"\bfunction\s+&?(?i:{})\s*\(",
+        regex::escape(method)
+    ))
+    .ok()?;
     content
         .lines()
         .enumerate()
@@ -1610,17 +1568,18 @@ static NEW_IN_PARENS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\(\s*new\s+(\\?[A-Za-z_][\w\\]*)").unwrap());
 
 /// Best-effort receiver type of a call: `$this`, `$this->prop`, `$var`, `(new T)`, `T::`.
+/// `prefix` is the line up to the `->`/`::` of the call.
 fn receiver_type(
     conn: &Connection,
     file_id: i64,
     lines: &[&str],
     idx: usize,
     prefix: &str,
-    operator: &str,
 ) -> Option<String> {
     let line_no = idx as i64 + 1;
+    let rest = &lines[idx][prefix.len()..];
     let prefix = prefix.trim_end();
-    if operator.starts_with("::") {
+    if rest.starts_with("::") {
         let token = TRAILING_NAME.captures(prefix)?.get(1)?.as_str();
         return match token.to_ascii_lowercase().as_str() {
             "self" | "static" => enclosing_class(conn, file_id, line_no),
@@ -1632,12 +1591,10 @@ fn receiver_type(
         return enclosing_class(conn, file_id, line_no);
     }
     if let Some(c) = TRAILING_THIS_PROP.captures(prefix) {
-        let prop = c.get(1)?.as_str();
-        return property_type(conn, file_id, lines, prop);
+        return property_type(conn, file_id, lines, c.get(1)?.as_str());
     }
     if let Some(c) = TRAILING_VAR.captures(prefix) {
-        let var = c.get(1)?.as_str();
-        return variable_type(conn, file_id, lines, idx, var);
+        return variable_type(conn, file_id, lines, idx, prefix, c.get(1)?.as_str());
     }
     if prefix.ends_with(')') {
         if let Some(c) = NEW_IN_PARENS.captures_iter(prefix).last() {
@@ -1655,26 +1612,25 @@ fn resolve_name(conn: &Connection, file_id: i64, line: i64, token: &str) -> Opti
     fqn_at(conn, file_id, line, short_name(token))
 }
 
-fn enclosing_class(conn: &Connection, file_id: i64, line: i64) -> Option<String> {
+/// The class-like declaration a line belongs to: symbol id, line and FQN.
+fn class_at(conn: &Connection, file_id: i64, line: i64) -> Option<(i64, i64, Option<String>)> {
     let sql = format!(
-        "SELECT qualified_name FROM symbols WHERE file_id = ?1 AND line <= ?2
-           AND qualified_name IS NOT NULL AND kind IN {CLASS_KINDS} ORDER BY line DESC LIMIT 1"
+        "SELECT id, line, qualified_name FROM symbols WHERE file_id = ?1 AND line <= ?2
+           AND kind IN {CLASS_KINDS} ORDER BY line DESC LIMIT 1"
     );
-    conn.query_row(&sql, params![file_id, line], |row| row.get(0))
-        .ok()
+    conn.query_row(&sql, params![file_id, line], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+    .ok()
+}
+
+fn enclosing_class(conn: &Connection, file_id: i64, line: i64) -> Option<String> {
+    class_at(conn, file_id, line)?.2
 }
 
 /// The class the enclosing class extends.
 fn parent_class(conn: &Connection, file_id: i64, line: i64) -> Option<String> {
-    let sql = format!(
-        "SELECT s.id, s.line FROM symbols s WHERE s.file_id = ?1 AND s.line <= ?2
-           AND s.kind IN {CLASS_KINDS} ORDER BY s.line DESC LIMIT 1"
-    );
-    let (id, class_line): (i64, i64) = conn
-        .query_row(&sql, params![file_id, line], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .ok()?;
+    let (id, class_line, _) = class_at(conn, file_id, line)?;
     let parent_name: String = conn
         .query_row(
             "SELECT parent_name FROM inheritance WHERE child_id = ?1 AND kind = 'extends' LIMIT 1",
@@ -1682,36 +1638,35 @@ fn parent_class(conn: &Connection, file_id: i64, line: i64) -> Option<String> {
             |row| row.get(0),
         )
         .ok()?;
-    if let Some(stripped) = parent_name.strip_prefix('\\') {
-        return Some(stripped.to_string());
-    }
-    (class_line..=class_line + 10).find_map(|l| fqn_at(conn, file_id, l, short_name(&parent_name)))
+    resolve_parent(conn, file_id, class_line, &parent_name)
 }
+
+const TYPE: &str = r"(\??\\?[A-Za-z_][\w\\|]*)";
+
+static PROPERTY_DECL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?:private|protected|public|readonly|var)\b[^$;=]*?{TYPE}\s+\$(\w+)\b"
+    ))
+    .unwrap()
+});
+static DOC_VAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"@var\s+{TYPE}(?:\s+\$(\w+))?")).unwrap());
 
 /// Declared type of `$prop`: typed property / promoted constructor parameter, or `@var`.
 fn property_type(conn: &Connection, file_id: i64, lines: &[&str], prop: &str) -> Option<String> {
-    let decl = Regex::new(&format!(
-        r"(?:private|protected|public|readonly|var)\b[^$;=]*?(\??\\?[A-Za-z_][\w\\|]*)\s+\${}\b",
-        regex::escape(prop)
-    ))
-    .ok()?;
-    let doc = Regex::new(&format!(
-        r"@var\s+(\??\\?[A-Za-z_][\w\\|]*)(?:\s+\${})?",
-        regex::escape(prop)
-    ))
-    .ok()?;
     for (i, line) in lines.iter().enumerate() {
-        if let Some(c) = decl.captures(line) {
-            if let Some(t) = first_type(conn, file_id, i as i64 + 1, c.get(1)?.as_str()) {
-                return Some(t);
-            }
-            // Untyped declaration: fall back to a `@var` right above it.
-            if i > 0 {
-                if let Some(c) = doc.captures(lines[i - 1]) {
-                    return first_type(conn, file_id, i as i64, c.get(1)?.as_str());
-                }
-            }
+        let Some(c) = PROPERTY_DECL.captures_iter(line).find(|c| &c[2] == prop) else {
+            continue;
+        };
+        if let Some(t) = first_type(conn, file_id, i as i64 + 1, &c[1]) {
+            return Some(t);
         }
+        // Untyped declaration: fall back to a `@var` right above it.
+        let above = i.checked_sub(1).map(|j| lines[j]).unwrap_or("");
+        return DOC_VAR
+            .captures_iter(above)
+            .find(|c| c.get(2).is_none_or(|v| v.as_str() == prop))
+            .and_then(|c| first_type(conn, file_id, i as i64, &c[1]));
     }
     None
 }
@@ -1719,50 +1674,69 @@ fn property_type(conn: &Connection, file_id: i64, lines: &[&str], prop: &str) ->
 static NAMED_FUNCTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bfunction\s+&?\w+\s*\(").unwrap());
 
+/// Patterns that type a variable: (regex, variable group, type group).
+static VARIABLE_TYPERS: LazyLock<Vec<(Regex, usize, usize)>> =
+    LazyLock::new(|| {
+        [
+        (r"\$(\w+)\s*=\s*\(?\s*new\s+(\\?[A-Za-z_][\w\\]*)".to_string(), 1, 2),
+        (r"\$(\w+)\s*=[^;]*?\bget\(\s*(\\?[A-Za-z_][\w\\]*)::class".to_string(), 1, 2),
+        (format!(r"@var\s+{TYPE}\s+\$(\w+)\b"), 2, 1),
+        (format!(r"[(,]\s*{TYPE}\s+&?(?:\.\.\.)?\$(\w+)\b"), 2, 1),
+        // A parameter on its own line of a multi-line signature.
+        (
+            format!(
+                r"^\s*(?:(?:private|protected|public|readonly)\s+)*{TYPE}\s+&?(?:\.\.\.)?\$(\w+)\b"
+            ),
+            2,
+            1,
+        ),
+    ]
+    .into_iter()
+    .map(|(re, var, ty)| (Regex::new(&re).unwrap(), var, ty))
+    .collect()
+    });
+static ASSIGNMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$(\w+)\s*(?:=[^=>]|=$)").unwrap());
+static FOREACH_BINDING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bas\s+(?:\$\w+\s*=>\s*)?&?\$(\w+)\b").unwrap());
+
 /// Type of `$var` from the nearest earlier typed parameter, `@var`, `new`, or `get(T::class)`,
 /// within the enclosing named function. Another assignment or a `foreach … as $var` on the way
-/// makes the type unknown rather than a guess.
+/// — the call's own line included — makes the type unknown rather than a guess.
 fn variable_type(
     conn: &Connection,
     file_id: i64,
     lines: &[&str],
     idx: usize,
+    prefix: &str,
     var: &str,
 ) -> Option<String> {
-    let v = regex::escape(var);
-    let typed = [
-        format!(r"\$(?:{v})\s*=\s*\(?\s*new\s+(\\?[A-Za-z_][\w\\]*)"),
-        format!(r"\$(?:{v})\s*=\s*.*?\bget\(\s*(\\?[A-Za-z_][\w\\]*)::class"),
-        format!(r"@var\s+(\??\\?[A-Za-z_][\w\\|]*)\s+\$(?:{v})\b"),
-        format!(r"[(,]\s*(\??\\?[A-Za-z_][\w\\|]*)\s+&?(?:\.\.\.)?\$(?:{v})\b"),
-        // A parameter on its own line of a multi-line signature.
-        format!(
-            r"^\s*(?:(?:private|protected|public|readonly)\s+)*(\??\\?[A-Za-z_][\w\\|]*)\s+&?(?:\.\.\.)?\$(?:{v})\b"
-        ),
-    ];
-    let typed: Vec<Regex> = typed.iter().filter_map(|p| Regex::new(p).ok()).collect();
-    let rebinds = Regex::new(&format!(
-        r"\$(?:{v})\s*(?:=[^=>]|=$)|\bas\s+(?:\$\w+\s*=>\s*)?&?\$(?:{v})\b"
-    ))
-    .ok()?;
-    let doc_above = Regex::new(r"@var\s+(\??\\?[A-Za-z_][\w\\|]*)").ok()?;
     for i in (0..=idx).rev() {
-        let line = lines[i];
-        for re in &typed {
-            if let Some(c) = re.captures(line) {
-                if let Some(t) = first_type(conn, file_id, i as i64 + 1, c.get(1)?.as_str()) {
-                    return Some(t);
-                }
-            }
+        // On the call's line only the text before the call counts.
+        let text = if i == idx { prefix } else { lines[i] };
+        let typed = VARIABLE_TYPERS.iter().find_map(|(re, v, t)| {
+            re.captures_iter(text)
+                .filter(|c| &c[*v] == var)
+                .find_map(|c| first_type(conn, file_id, i as i64 + 1, &c[*t]))
+        });
+        if typed.is_some() {
+            return typed;
         }
-        if i < idx && rebinds.is_match(line) {
+        // An assignment counts once its statement is over: in `$node = $node->parent()` the
+        // receiver is still the old value.
+        let assigned = ASSIGNMENT
+            .captures_iter(text)
+            .any(|c| &c[1] == var && (i < idx || text[c.get(0).unwrap().end()..].contains(';')));
+        let bound = FOREACH_BINDING.captures_iter(text).any(|c| &c[1] == var);
+        if assigned || bound {
             // `/** @var T */` right above an assignment types it.
             let above = i.checked_sub(1).map(|j| lines[j]).unwrap_or("");
-            return doc_above
-                .captures(above)
-                .and_then(|c| first_type(conn, file_id, i as i64, c.get(1)?.as_str()));
+            return DOC_VAR
+                .captures_iter(above)
+                .find(|c| c.get(2).is_none_or(|v| v.as_str() == var))
+                .and_then(|c| first_type(conn, file_id, i as i64, &c[1]));
         }
-        if NAMED_FUNCTION.is_match(line) {
+        if NAMED_FUNCTION.is_match(text) {
             return None;
         }
     }
@@ -1821,17 +1795,6 @@ mod tests {
             .as_deref(),
             Some("local/modules/orteka.main/lib/geo/metro/MetroTable.php")
         );
-    }
-
-    #[test]
-    fn classify_reference_lines() {
-        assert_eq!(classify("use App\\Foo;", "Foo"), "import");
-        assert_eq!(classify("* @var Foo[]", "Foo"), "phpdoc");
-        assert_eq!(classify("Foo::class => [", "Foo"), "::class");
-        assert_eq!(classify("$x = new \\App\\Foo();", "Foo"), "new");
-        assert_eq!(classify("return Foo::make();", "Foo"), "static");
-        assert_eq!(classify("private Foo $foo,", "Foo"), "type");
-        assert_eq!(classify("#[CoversClass(Foo::class)]", "Foo"), "attribute");
     }
 
     #[test]

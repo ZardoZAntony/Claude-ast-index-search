@@ -619,3 +619,136 @@ fn short_name_usages_warn_about_namesakes() {
     let text = run_text(tmp.path(), cache.path(), &["usages", "OrderDto"]);
     assert!(text.contains("2 classes are named OrderDto"), "{text}");
 }
+
+/// The second review's cases: a class referencing itself, calls on one line with a `foreach`,
+/// method names in another letter case, a root `di/`, callables with `$this`, a template with
+/// `?>` in a one-line comment.
+fn project3() -> (TempDir, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    write(root, "src/RunnerInterface.php", "<?php\nnamespace Fx\\Calls;\ninterface RunnerInterface { public function run(int $n): void; }\n");
+    write(root, "src/Helper.php", "<?php\nnamespace Fx\\Calls;\nfinal class Helper { public function run(int $n): void {} }\n");
+    write(root, "src/AbstractRunner.php", "<?php\nnamespace Fx\\Calls;\nabstract class AbstractRunner implements RunnerInterface\n{\n    public function run(int $n): void {}\n    public function GetList(): array { return []; }\n}\n");
+    write(root, "src/Runner.php", "<?php\nnamespace Fx\\Calls;\n\nfinal class Runner extends AbstractRunner\n{\n    public function __construct(private RunnerInterface $inner, private Helper $helper) {}\n\n    public function go(Helper $h): void\n    {\n        $this->inner->run(1);\n        $this->run(2); $this->helper->run(3);\n        parent::run(5);\n        foreach ($this->all() as $h) { $h->run(6); }\n        $r = new Runner($this->inner, $h);\n        $r->run(7);\n        $this->getList();\n        $handlers = [[$this, 'onEvent'], [self::class, 'onStatic']];\n    }\n    public static function make(): self { return new Runner(new Helper(), new Helper()); }\n    public function onEvent(): void {}\n    public function onStatic(): void {}\n    private function all(): array { return []; }\n}\n");
+    write(
+        root,
+        "src/OnlyRegistered.php",
+        "<?php\nnamespace Fx\\Calls;\nfinal class OnlyRegistered {}\n",
+    );
+    write(root, "di/Services.php", "<?php\nuse Fx\\Calls\\OnlyRegistered;\nreturn [\n    OnlyRegistered::class => ['className' => OnlyRegistered::class],\n];\n");
+    write(
+        root,
+        "src/Shapes.php",
+        "<?php\nnamespace Fx\\Calls;\n\ninterface Shape {}\n\nfinal class Square implements Shape\n{\n    public static function unit(): Square { return new Square(); }\n}\n",
+    );
+    write(
+        root,
+        "src/Tail.php",
+        "<?php\nnamespace Fx\\Calls;\n\nenum Suit\n{\n    case Hearts;\n}\n\nfinal class Deck {}\n\n$x = Suit::Hearts;\n$d = new Deck();\n",
+    );
+    write(root, "tpl/template.php", "<?php $a = new Real(); ?>\n<div><?//= Loc::getMessage('X') ?></div>\n<p>Don't Panic Ghost</p>\n<?php $b = new Second(); ?>\n");
+
+    run(root, cache.path(), &["rebuild"]);
+    (tmp, cache)
+}
+
+#[test]
+fn impact_lists_references_from_the_class_own_file() {
+    let (tmp, cache) = project3();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &["--format", "json", "impact", "Fx\\Calls\\Runner"],
+    );
+    let lines: Vec<String> = v["references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| format!("{}:{}", r["path"].as_str().unwrap(), r["line"]))
+        .collect();
+    assert_eq!(lines, vec!["src/Runner.php:14", "src/Runner.php:19"]);
+}
+
+#[test]
+fn callers_handle_own_class_foreach_on_the_line_and_letter_case() {
+    let (tmp, cache) = project3();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "callers",
+            "Fx\\Calls\\RunnerInterface::run",
+        ],
+    );
+    assert_eq!(
+        paths(&v, "calls"),
+        vec![
+            "src/Runner.php:10".to_string(),
+            "src/Runner.php:11".to_string(),
+            "src/Runner.php:12".to_string(),
+            "src/Runner.php:15".to_string(),
+        ]
+    );
+    assert_eq!(
+        paths(&v, "unresolved"),
+        vec!["src/Runner.php:13".to_string()]
+    );
+    assert_eq!(paths(&v, "excluded"), vec!["src/Runner.php:11".to_string()]);
+
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "callers",
+            "Fx\\Calls\\AbstractRunner::GetList",
+        ],
+    );
+    assert_eq!(paths(&v, "calls"), vec!["src/Runner.php:16".to_string()]);
+}
+
+#[test]
+fn unused_symbols_see_root_di_callables_and_letter_case() {
+    let (tmp, cache) = project3();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &["--format", "json", "unused-symbols", "--limit", "500"],
+    );
+    let rows = v.as_array().unwrap();
+    let names: Vec<&str> = rows.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    // Suit and Deck are used by code after the last class of their file.
+    for used in ["onEvent", "onStatic", "GetList", "Shape", "Suit", "Deck"] {
+        assert!(!names.contains(&used), "{used}: {names:?}");
+    }
+    // Square references only itself.
+    assert!(names.contains(&"Square"), "{names:?}");
+    let registered = rows
+        .iter()
+        .find(|s| s["name"] == "OnlyRegistered")
+        .expect("OnlyRegistered reported");
+    assert_eq!(registered["reason"], "registered in DI only");
+}
+
+#[test]
+fn closing_tag_in_a_template_comment_keeps_html_out_of_code() {
+    let (tmp, cache) = project3();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &["--format", "json", "impact", "Second"],
+    );
+    assert_eq!(v["summary"]["references"], 1, "{v}");
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &["--format", "json", "impact", "Don"],
+    );
+    assert_eq!(v["summary"]["references"], 0, "{v}");
+}

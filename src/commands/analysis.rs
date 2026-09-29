@@ -164,17 +164,40 @@ pub fn cmd_unused_symbols(
                 "class" | "interface" | "trait" | "enum" | "object"
             );
         if php_class {
+            // A class's own body does not use it; its neighbours in the same file do — also code
+            // after the last class. The file is read only when it references the class below
+            // the declaration.
+            let own_file_below: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM refs r JOIN files f ON f.id = r.file_id
+                     WHERE r.fqn = ?1 COLLATE NOCASE AND f.path = ?2 AND r.line > ?3)",
+                    params![sym.qualified_name, sym.path, sym.line],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            let body_end = own_file_below
+                .then(|| std::fs::read(root.join(&sym.path)).ok())
+                .flatten()
+                .and_then(|bytes| {
+                    let content = String::from_utf8_lossy(&bytes);
+                    super::php::class_end_line(&content, sym.line as usize)
+                })
+                .map_or(i64::MAX, |end| end as i64);
             let mut stmt = conn.prepare_cached(
                 "SELECT f.path, r.context FROM refs r JOIN files f ON f.id = r.file_id
-                 WHERE r.fqn = ?1 COLLATE NOCASE AND f.path <> ?2",
+                 WHERE r.fqn = ?1 COLLATE NOCASE
+                   AND (f.path <> ?2 OR r.line < ?3 OR r.line > ?4)",
             )?;
             let refs = stmt
-                .query_map(params![sym.qualified_name, sym.path], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    ))
-                })?
+                .query_map(
+                    params![sym.qualified_name, sym.path, sym.line, body_end],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        ))
+                    },
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             if refs.is_empty() {
                 unused.push(sym);
@@ -192,16 +215,18 @@ pub fn cmd_unused_symbols(
             continue;
         }
 
-        // Check refs table
-        let ref_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1",
-                params![sym.name],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if ref_count > 0 {
+        // Check refs table. PHP names of functions and methods are case-insensitive
+        // (`GetList` called as `getList`); the exact lookup uses the index, the other runs only
+        // for what it did not find.
+        let count = |sql: &str| -> i64 {
+            conn.query_row(sql, params![sym.name], |row| row.get(0))
+                .unwrap_or(0)
+        };
+        let ref_count = count("SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1");
+        if ref_count > 0
+            || (is_php
+                && count("SELECT COUNT(*) FROM refs WHERE name = ?1 COLLATE NOCASE LIMIT 1") > 0)
+        {
             continue;
         }
 
@@ -319,7 +344,8 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 /// A reference in a DI config that registers the class (`Foo::class => [...]`,
 /// `'className' => Foo::class`) rather than requesting it (`->get(Foo::class)`, `new Foo`).
 fn is_di_registration(path: &str, context: &str) -> bool {
-    let di_config = path.contains("/di/") || path.ends_with(".settings.php");
+    let mut segments = path.split('/');
+    let di_config = path.ends_with(".settings.php") || segments.any(|s| s == "di");
     di_config && !context.contains("get(") && !context.contains("new ")
 }
 
