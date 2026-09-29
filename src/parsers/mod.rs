@@ -18,6 +18,7 @@
 //! - Dart/Flutter
 
 pub mod perl;
+pub mod phpdoc;
 pub mod typescript;
 pub mod wsdl;
 
@@ -700,37 +701,8 @@ pub fn parse_file_symbols(
     Ok((symbols, refs))
 }
 
-/// Extract references/usages from file content
-pub fn extract_references(
-    content: &str,
-    defined_symbols: &[ParsedSymbol],
-) -> Result<Vec<ParsedRef>> {
-    extract_references_for_lang(content, defined_symbols, None)
-}
-
-/// Extract references/usages from file content, with optional language-specific filtering
-pub fn extract_references_for_lang(
-    content: &str,
-    defined_symbols: &[ParsedSymbol],
-    file_type: Option<FileType>,
-) -> Result<Vec<ParsedRef>> {
-    let mut refs = Vec::new();
-
-    // Build set of locally defined symbol names (to skip them)
-    let defined_names: HashSet<&str> = defined_symbols.iter().map(|s| s.name.as_str()).collect();
-
-    // Regex for identifiers that might be references:
-    // - CamelCase identifiers (types, classes) like PaymentRepository, String
-    // - Function calls like getCards(, process(
-    static IDENTIFIER_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b").unwrap());
-
-    let identifier_re = &*IDENTIFIER_RE; // CamelCase types
-    static FUNC_CALL_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(").unwrap());
-
-    let func_call_re = &*FUNC_CALL_RE; // function calls
-
+/// Whether a reference candidate is language noise (keyword, stdlib type) rather than a project symbol.
+pub(crate) fn is_noise_ref_name(name: &str, file_type: Option<FileType>) -> bool {
     // Common keywords to skip across all languages
     static BASE_KEYWORDS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
         [
@@ -901,12 +873,45 @@ pub fn extract_references_for_lang(
         .collect()
     });
 
-    let base_keywords = &*BASE_KEYWORDS;
     let extra_keywords: &HashSet<&str> = match file_type {
         Some(FileType::Swift) => &SWIFT_KEYWORDS,
         Some(FileType::Kotlin) | Some(FileType::Java) => &KOTLIN_JAVA_KEYWORDS,
         _ => &KOTLIN_JAVA_KEYWORDS, // default for backward compat
     };
+
+    BASE_KEYWORDS.contains(name) || extra_keywords.contains(name)
+}
+
+/// Extract references/usages from file content
+pub fn extract_references(
+    content: &str,
+    defined_symbols: &[ParsedSymbol],
+) -> Result<Vec<ParsedRef>> {
+    extract_references_for_lang(content, defined_symbols, None)
+}
+
+/// Extract references/usages from file content, with optional language-specific filtering
+pub fn extract_references_for_lang(
+    content: &str,
+    defined_symbols: &[ParsedSymbol],
+    file_type: Option<FileType>,
+) -> Result<Vec<ParsedRef>> {
+    let mut refs = Vec::new();
+
+    // Build set of locally defined symbol names (to skip them)
+    let defined_names: HashSet<&str> = defined_symbols.iter().map(|s| s.name.as_str()).collect();
+
+    // Regex for identifiers that might be references:
+    // - CamelCase identifiers (types, classes) like PaymentRepository, String
+    // - Function calls like getCards(, process(
+    static IDENTIFIER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b").unwrap());
+
+    let identifier_re = &*IDENTIFIER_RE; // CamelCase types
+    static FUNC_CALL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(").unwrap());
+
+    let func_call_re = &*FUNC_CALL_RE; // function calls
 
     let is_swift = matches!(file_type, Some(FileType::Swift));
 
@@ -937,8 +942,7 @@ pub fn extract_references_for_lang(
         for caps in identifier_re.captures_iter(line) {
             let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             if !name.is_empty()
-                && !base_keywords.contains(name)
-                && !extra_keywords.contains(name)
+                && !is_noise_ref_name(name, file_type)
                 && !defined_names.contains(name)
             {
                 refs.push(ParsedRef {
@@ -953,8 +957,7 @@ pub fn extract_references_for_lang(
         for caps in func_call_re.captures_iter(line) {
             let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             if !name.is_empty()
-                && !base_keywords.contains(name)
-                && !extra_keywords.contains(name)
+                && !is_noise_ref_name(name, file_type)
                 && !defined_names.contains(name)
             {
                 // Only add if name length > 2 to avoid noise

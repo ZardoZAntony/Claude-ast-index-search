@@ -6,7 +6,7 @@ use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
-use crate::parsers::ParsedSymbol;
+use crate::parsers::{extract_references_for_lang, phpdoc, FileType, ParsedRef, ParsedSymbol};
 
 static PHP_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_php::LANGUAGE_PHP.into());
 
@@ -20,6 +20,23 @@ pub static PHP_PARSER: PhpParser = PhpParser;
 pub struct PhpParser;
 
 impl LanguageParser for PhpParser {
+    fn extract_refs(&self, content: &str, defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
+        self.extract_refs_for_lang(content, defined, FileType::Php)
+    }
+
+    /// Code references plus class names from PHPDoc type positions, which the generic
+    /// extractor skips together with the rest of the comment.
+    fn extract_refs_for_lang(
+        &self,
+        content: &str,
+        defined: &[ParsedSymbol],
+        file_type: FileType,
+    ) -> Result<Vec<ParsedRef>> {
+        let mut refs = extract_references_for_lang(content, defined, Some(file_type))?;
+        refs.extend(phpdoc::extract_phpdoc_refs(content, defined, file_type));
+        Ok(refs)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &PHP_LANGUAGE)?;
         let mut symbols = Vec::new();
