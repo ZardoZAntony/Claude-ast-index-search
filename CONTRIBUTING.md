@@ -10,7 +10,7 @@ Thank you for your interest in contributing to ast-index!
 ## Getting Started
 
 ```bash
-git clone https://github.com/defendend/Claude-ast-index-search.git
+git clone https://github.com/ZardoZAntony/Claude-ast-index-search.git
 cd Claude-ast-index-search
 cargo build
 ```

@@ -19,8 +19,7 @@ ast-index version
 
 If not installed, inform user to run:
 ```bash
-brew tap defendend/ast-index
-brew install ast-index
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
 ### 2. Create/Update .claude/settings.json
@@ -36,15 +35,15 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
 ```json
 {
   "extraKnownMarketplaces": {
-    "ast-index": {
+    "ast-index-php": {
       "source": {
         "source": "github",
-        "repo": "defendend/Claude-ast-index-search"
+        "repo": "ZardoZAntony/Claude-ast-index-search"
       }
     }
   },
   "enabledPlugins": {
-    "ast-index@ast-index": true
+    "ast-index@ast-index-php": true
   },
   "permissions": {
     "allow": [

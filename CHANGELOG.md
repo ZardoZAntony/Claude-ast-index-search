@@ -245,7 +245,7 @@
 - **Fix project root detection** — `rebuild` now uses CWD instead of searching upward, fixing wrong root in monorepos
 
 ## 3.26.1
-- **Windows support** — `winget install defendend.ast-index` now available (contributed by @kulemeevag)
+- **Windows support** — winget package now available (contributed by @kulemeevag)
 - **Gemini CLI support** — added skill installation instructions
 - **MIT license** — added LICENSE file
 - **Release automation** — winget auto-update in GitHub Actions release workflow (contributed by @kulemeevag)
@@ -527,7 +527,7 @@
 ## 3.5.0
 - **Renamed to ast-index** — project renamed from `kotlin-index`
   - New CLI command: `ast-index` (was `kotlin-index`)
-  - New Homebrew tap: `defendend/ast-index` (was `defendend/kotlin-index`)
+  - Homebrew tap renamed from `kotlin-index` to `ast-index`
   - New repo: `Claude-ast-index-search` (was `Claude-index-search-android-studio`)
 
 ## 3.4.1

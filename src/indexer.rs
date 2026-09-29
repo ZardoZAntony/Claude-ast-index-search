@@ -295,6 +295,33 @@ impl HiddenPolicy {
         self.allow.is_none()
     }
 
+    /// Path form of [`HiddenPolicy::allows`], for paths that come from outside a walk (file
+    /// watcher events): every hidden component of `path` below `root` must be allowed.
+    pub fn allows_path(&self, root: &Path, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return true;
+        };
+        let components: Vec<_> = relative.components().collect();
+        let mut current = root.to_path_buf();
+        for (i, component) in components.iter().enumerate() {
+            current.push(component);
+            let hidden = component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.'));
+            if !hidden {
+                continue;
+            }
+            let Some(allow) = &self.allow else {
+                return false;
+            };
+            if !allow.matched(&current, i + 1 < components.len()).is_ignore() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Entry filter to combine with the walk's `filter_entry`.
     pub fn allows(&self, entry: &ignore::DirEntry) -> bool {
         let Some(allow) = &self.allow else {
@@ -1393,7 +1420,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
 /// Directories to always exclude from indexing (regardless of .gitignore).
 /// Keep this list to generated caches/build outputs only; ordinary dependency
 /// or source directories can be excluded via .gitignore or .ast-index.yaml.
-const EXCLUDED_DIRS: &[&str] = &[
+pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
     "__pycache__",
     ".build",

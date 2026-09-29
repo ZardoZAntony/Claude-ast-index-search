@@ -56,20 +56,6 @@ echo "  ✓ .claude-plugin/plugin.json"
 sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" .claude-plugin/marketplace.json
 echo "  ✓ .claude-plugin/marketplace.json"
 
-# 8. npm/package.json (version + optionalDependencies)
-if [ -f npm/package.json ]; then
-    sed -i '' "s/$CURRENT/$VERSION/g" npm/package.json
-    echo "  ✓ npm/package.json"
-fi
-
-# 9. npm platform packages
-for pkg in npm/platforms/*/package.json; do
-    if [ -f "$pkg" ]; then
-        sed -i '' "s/$CURRENT/$VERSION/g" "$pkg"
-        echo "  ✓ $pkg"
-    fi
-done
-
 # 8. Build and test
 echo ""
 echo "Building release..."
@@ -91,8 +77,7 @@ git add Cargo.toml Cargo.lock README.md \
     plugin/.codex-plugin/plugin.json \
     plugin/.cursor-plugin/plugin.json \
     .claude-plugin/plugin.json \
-    .claude-plugin/marketplace.json \
-    npm/package.json npm/platforms/*/package.json 2>/dev/null || true
+    .claude-plugin/marketplace.json 2>/dev/null || true
 git commit -m "Bump to v$VERSION"
 git tag "v$VERSION"
 git push origin main --tags

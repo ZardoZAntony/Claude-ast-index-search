@@ -19,8 +19,7 @@ ast-index version
 If it is missing, install it:
 
 ```bash
-brew tap defendend/ast-index
-brew install ast-index
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
 2. Create a Cursor project rule:

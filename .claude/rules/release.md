@@ -21,14 +21,13 @@ git commit -m "Fix X when Y"
 ```
 
 `scripts/bump.sh` is the only sanctioned way to change the version. It
-rewrites 12 files in lockstep:
+rewrites the version in lockstep in:
 
 - `Cargo.toml` — `version`
 - `README.md` — title and changelog section
 - `plugin/.claude-plugin/plugin.json`
 - `.claude-plugin/plugin.json`
 - `.claude-plugin/marketplace.json`
-- `npm/package.json` + `npm/platforms/*/package.json` (5 platform files)
 
 It then runs `cargo build --release`, commits `Bump to vX.Y.Z` with `git
 add -A`, creates the `vX.Y.Z` tag, and pushes.
@@ -54,12 +53,9 @@ GitHub Actions (`.github/workflows/release.yml`) automatically:
 
 - builds five binaries (darwin-arm64, darwin-x86_64, linux-x86_64,
   linux-arm64, windows-x86_64);
-- creates the GitHub Release with artifacts;
-- publishes the npm meta-package + five platform sub-packages;
-- opens a PR against the Homebrew tap (`defendend/homebrew-ast-index`) with
-  the new URL and sha256.
+- creates the GitHub Release with artifacts.
 
-No further local steps are required for GitHub/Homebrew/npm.
+No further local steps are required.
 
 ## Changelog tone
 

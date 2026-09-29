@@ -26,8 +26,7 @@ ast-index version
 If it is not installed, tell the user to run:
 
 ```bash
-brew tap defendend/ast-index
-brew install ast-index
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
 Stop there until the binary exists.
@@ -115,15 +114,15 @@ create it with this content:
 ```json
 {
   "extraKnownMarketplaces": {
-    "ast-index": {
+    "ast-index-php": {
       "source": {
         "source": "github",
-        "repo": "defendend/Claude-ast-index-search"
+        "repo": "ZardoZAntony/Claude-ast-index-search"
       }
     }
   },
   "enabledPlugins": {
-    "ast-index@ast-index": true
+    "ast-index@ast-index-php": true
   },
   "permissions": {
     "allow": [
@@ -220,6 +219,13 @@ When KMP is detected, add this section:
 For Python/Go/Dart/PHP/Scala-only repos, add a short section that points the
 agent at the generic commands that matter most for that language. Keep it short
 and practical.
+
+For PHP, take that section from `plugin/skills/ast-index/references/php-commands.md`: the
+one-call refactoring commands (`impact`, `move-plan`, `usages <FQN>`, `implementations <FQN>`,
+`callers 'Type::method'`, `unused-symbols`, `duplicates`) and when to use grep instead. If the
+framework keeps code in hidden paths or calls entry points by convention (Bitrix: `.default/`,
+`.settings.php`, installers, `*Action` methods), propose a `.ast-index.yaml` with
+`include_hidden`, `exclude`, `unused_ignore` and `unused_ignore_names` before the first build.
 
 ### 6. Build the index
 

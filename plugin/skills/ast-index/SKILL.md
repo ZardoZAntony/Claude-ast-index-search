@@ -32,8 +32,7 @@ Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swif
 Install the CLI before use:
 
 ```bash
-brew tap defendend/ast-index
-brew install ast-index
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
 Initialize index in project root:

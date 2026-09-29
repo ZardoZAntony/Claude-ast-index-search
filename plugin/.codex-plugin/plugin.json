@@ -3,10 +3,10 @@
   "version": "3.55.0",
   "description": "Fast structural code search for multi-language projects using the ast-index CLI.",
   "author": {
-    "name": "defendend"
+    "name": "ZardoZAntony"
   },
-  "homepage": "https://github.com/defendend/Claude-ast-index-search",
-  "repository": "https://github.com/defendend/Claude-ast-index-search",
+  "homepage": "https://github.com/ZardoZAntony/Claude-ast-index-search",
+  "repository": "https://github.com/ZardoZAntony/Claude-ast-index-search",
   "license": "MIT",
   "keywords": [
     "code-search",
@@ -21,12 +21,12 @@
     "displayName": "ast-index",
     "shortDescription": "Fast structural code search for AI coding agents.",
     "longDescription": "Guides agents to use ast-index for file, symbol, usage, hierarchy, dependency, and project-map queries before falling back to broad text search.",
-    "developerName": "defendend",
+    "developerName": "ZardoZAntony",
     "category": "Productivity",
     "capabilities": [
       "Read"
     ],
-    "websiteURL": "https://github.com/defendend/Claude-ast-index-search",
+    "websiteURL": "https://github.com/ZardoZAntony/Claude-ast-index-search",
     "defaultPrompt": [
       "Use ast-index to find usages of a symbol before editing it.",
       "Use ast-index to map the project structure before planning a large change.",

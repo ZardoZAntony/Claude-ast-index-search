@@ -52,16 +52,7 @@ compact text format reliably.
 `ast-index` must be on `PATH`. Install per your platform:
 
 ```bash
-# macOS / Linux
-brew tap defendend/ast-index
-brew install ast-index
-
-# npm (all platforms)
-npm install -g @defendend/ast-index
-
-# From source
-git clone https://github.com/defendend/Claude-ast-index-search.git
-cd Claude-ast-index-search && cargo build --release
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
 Verify: `ast-index version`.
@@ -69,7 +60,7 @@ Verify: `ast-index version`.
 ### Build the MCP server
 
 ```bash
-git clone https://github.com/defendend/Claude-ast-index-search.git
+git clone https://github.com/ZardoZAntony/Claude-ast-index-search.git
 cd Claude-ast-index-search
 cargo build --release -p ast-index-mcp
 ```

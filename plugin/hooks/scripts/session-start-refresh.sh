@@ -9,6 +9,9 @@
 #   * If no index exists: print a one-line hint to stderr so the user runs the
 #     initial `ast-index rebuild` themselves; we deliberately don't start
 #     a multi-minute rebuild on session start.
+#   * If an index exists and no watcher runs: start `ast-index watch` in the
+#     background. It catches what edit hooks cannot — git and other shell
+#     commands, formatters, edits in an IDE. Opt out with AST_INDEX_HOOK_WATCH=0.
 #   * Bypassable via AST_INDEX_HOOK_SKIP_SESSION_START=1 for opt-out.
 
 set -u
@@ -38,6 +41,15 @@ if [ -f "$db_path" ]; then
     echo "ast-index: project index refresh queued; first index read will wait for it." >&2
   else
     echo "ast-index: could not queue refresh; see the diagnostic above." >&2
+  fi
+  if [ "${AST_INDEX_HOOK_WATCH:-1}" != "0" ]; then
+    # Detached from the session: the watcher outlives it and serves every session of the project.
+    if command -v setsid >/dev/null 2>&1; then
+      (cd "$project_dir" && setsid nohup ast-index watch >/dev/null 2>&1 &)
+    else
+      (cd "$project_dir" && nohup ast-index watch >/dev/null 2>&1 &)
+    fi
+    echo "ast-index: started the project watcher (AST_INDEX_HOOK_WATCH=0 to skip)." >&2
   fi
 else
   echo "ast-index: no index for $project_dir — run 'ast-index rebuild' to enable structural search." >&2

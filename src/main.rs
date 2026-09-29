@@ -1420,7 +1420,7 @@ fn cmd_install_claude_plugin() -> Result<()> {
             "plugin",
             "marketplace",
             "add",
-            "defendend/Claude-ast-index-search",
+            "ZardoZAntony/Claude-ast-index-search",
         ])
         .status();
 
@@ -1440,7 +1440,7 @@ fn cmd_install_claude_plugin() -> Result<()> {
 
     println!("Installing ast-index plugin...");
     let status = Command::new("claude")
-        .args(["plugin", "install", "ast-index"])
+        .args(["plugin", "install", "ast-index@ast-index-php"])
         .status();
 
     match status {

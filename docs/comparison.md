@@ -1,16 +1,14 @@
 # ast-index and CodeGraph
 
 This is a neutral, source-backed feature comparison, not a performance
-benchmark. The table describes the pinned snapshots below. Planned changes in
-the current ast-index worktree are called out separately and are not presented
-as v3.50.0 release facts.
+benchmark. The table describes the pinned snapshots below.
 
 ## Snapshot
 
 Checked on **2026-09-01**:
 
 - **ast-index 3.50.0**, tag `v3.50.0`, commit
-  [`e499dcc6`](https://github.com/defendend/Claude-ast-index-search/tree/e499dcc6fcc90dfceafb629fbf5289824a40cccb),
+  [`e499dcc6`](https://github.com/ZardoZAntony/Claude-ast-index-search/tree/e499dcc6fcc90dfceafb629fbf5289824a40cccb),
   committed 2026-07-31.
 - **CodeGraph 1.6.0** (`package.json` version on `main`), commit
   [`b9ca4b79`](https://github.com/colbymchenry/codegraph/tree/b9ca4b7981116909900368cc1686a1074cd4d4c1),
@@ -35,13 +33,6 @@ long-lived tooling decision.
 | Installation | Homebrew, npm, Winget, release archives, or source build. The main CLI is a native binary; the MCP server is a separate workspace binary. The reviewed v3.50.0 release did not provide crates.io installation. | Standalone OS installer scripts or npm. Official docs say standalone bundles include their runtime; `codegraph install` then configures supported agents. |
 | License | MIT. | MIT. |
 
-## Planned ast-index distribution change
-
-The current worktree prepares crates.io metadata, trusted-publishing release
-automation, and post-publication `cargo install` smoke checks. That work is
-pending its first crates.io release. It is intentionally excluded from the
-v3.50.0 facts in the table above.
-
 ## How to choose
 
 Consider **ast-index** when you want a native CLI with many explicit,
@@ -62,11 +53,11 @@ document makes no relative performance claim.
 
 ### ast-index
 
-- [README and CLI overview](https://github.com/defendend/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/README.md)
-- [Parser and language dispatch](https://github.com/defendend/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/src/parsers/mod.rs)
-- [Index lifecycle commands](https://github.com/defendend/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/src/commands/management.rs)
-- [MCP tool descriptors](https://github.com/defendend/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/crates/ast-index-mcp/src/main.rs)
-- [MIT license](https://github.com/defendend/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/LICENSE)
+- [README and CLI overview](https://github.com/ZardoZAntony/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/README.md)
+- [Parser and language dispatch](https://github.com/ZardoZAntony/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/src/parsers/mod.rs)
+- [Index lifecycle commands](https://github.com/ZardoZAntony/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/src/commands/management.rs)
+- [MCP tool descriptors](https://github.com/ZardoZAntony/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/crates/ast-index-mcp/src/main.rs)
+- [MIT license](https://github.com/ZardoZAntony/Claude-ast-index-search/blob/e499dcc6fcc90dfceafb629fbf5289824a40cccb/LICENSE)
 
 ### CodeGraph
 

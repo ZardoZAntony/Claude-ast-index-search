@@ -1,9 +1,10 @@
 //! Watch mode — automatically update index on file changes
 
+use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use colored::Colorize;
@@ -107,49 +108,39 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 
     let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
     debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
+    let mut filter = ChangeFilter::new(root);
 
     loop {
         match rx.recv() {
             Ok(Ok(events)) => {
                 let changed: Vec<_> = events
                     .iter()
-                    .filter(|e| {
-                        let path = &e.path;
-                        // Only process supported source files
-                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                            if !parsers::is_supported_extension(ext) {
-                                return false;
-                            }
-                        } else {
-                            return false;
-                        }
-                        // Skip excluded directories
-                        !path.components().any(|c| {
-                            let s = c.as_os_str().to_str().unwrap_or("");
-                            matches!(
-                                s,
-                                "build"
-                                    | "node_modules"
-                                    | ".gradle"
-                                    | ".git"
-                                    | "target"
-                                    | ".idea"
-                                    | "__pycache__"
-                                    | ".dart_tool"
-                            )
-                        })
-                    })
+                    .filter(|e| filter.is_relevant(&e.path))
                     .collect();
 
                 if changed.is_empty() {
                     continue;
                 }
 
+                filter.since = SystemTime::now();
                 let start = Instant::now();
                 let file_count = changed.len();
+                let shown: Vec<String> = changed
+                    .iter()
+                    .take(3)
+                    .map(|e| {
+                        let path = e.path.strip_prefix(root).unwrap_or(&e.path);
+                        format!("{} ({:?})", path.display(), e.kind)
+                    })
+                    .collect();
                 eprintln!(
                     "{}",
-                    format!("Detected {} changed file(s), updating...", file_count).yellow()
+                    format!(
+                        "Detected {} changed file(s): {}; updating...",
+                        file_count,
+                        shown.join(", ")
+                    )
+                    .yellow()
                 );
 
                 match update_index(root) {
@@ -190,6 +181,129 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Which watcher events call for an update: changes to files the indexer would index.
+///
+/// The watcher also reports reads — the update's own walk opens directories such as
+/// `components/auth.mts/`, and a running site reads ignored files — so an event counts only for
+/// a file (not a directory) modified since the last update began, or removed, that passes the
+/// same rules as indexing: a supported extension, not in a skipped directory, hidden only where
+/// `include_hidden` allows, not gitignored, not excluded by the config.
+const MTIME_MARGIN: Duration = Duration::from_secs(2);
+
+struct ChangeFilter {
+    root: PathBuf,
+    hidden: indexer::HiddenPolicy,
+    exclude: Option<ignore::gitignore::Gitignore>,
+    /// `.gitignore` of each directory seen so far (`None` when it has none).
+    gitignores: HashMap<PathBuf, Option<ignore::gitignore::Gitignore>>,
+    since: SystemTime,
+}
+
+impl ChangeFilter {
+    fn new(root: &Path) -> Self {
+        let exclude = indexer::load_config_quiet(root)
+            .and_then(|c| c.exclude)
+            .filter(|patterns| !patterns.is_empty())
+            .and_then(|patterns| {
+                let mut gb = ignore::gitignore::GitignoreBuilder::new(root);
+                for p in &patterns {
+                    gb.add_line(None, p).ok();
+                }
+                gb.build().ok()
+            });
+        Self {
+            root: root.to_path_buf(),
+            hidden: indexer::HiddenPolicy::for_root(root),
+            exclude,
+            gitignores: HashMap::new(),
+            since: SystemTime::now(),
+        }
+    }
+
+    fn is_relevant(&mut self, path: &Path) -> bool {
+        let supported = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(parsers::is_supported_extension);
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let skipped_dir = relative.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|name| indexer::EXCLUDED_DIRS.contains(&name))
+        });
+        if !supported || skipped_dir || !self.hidden.allows_path(&self.root, path) {
+            return false;
+        }
+        if self
+            .exclude
+            .as_ref()
+            .is_some_and(|m| m.matched_path_or_any_parents(path, false).is_ignore())
+            || self.is_gitignored(path)
+        {
+            return false;
+        }
+        match std::fs::metadata(path) {
+            // File times are coarser than the clock: a margin keeps an edit made right as an
+            // update began; at worst it costs one more update.
+            Ok(meta) => {
+                meta.is_file()
+                    && meta
+                        .modified()
+                        .is_ok_and(|t| t + MTIME_MARGIN >= self.since)
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// The deepest `.gitignore` with a verdict on `path` decides, then `.git/info/exclude`.
+    fn is_gitignored(&mut self, path: &Path) -> bool {
+        let mut dirs: Vec<PathBuf> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(&self.root))
+            .map(Path::to_path_buf)
+            .collect();
+        dirs.reverse();
+        let mut ignored = self
+            .gitignore_at(&self.root.join(".git/info"), "exclude")
+            .is_some_and(|g| g.matched_path_or_any_parents(path, false).is_ignore());
+        for dir in dirs {
+            let Some(gitignore) = self.gitignore_at(&dir, ".gitignore") else {
+                continue;
+            };
+            match gitignore.matched_path_or_any_parents(path, false) {
+                ignore::Match::Ignore(_) => ignored = true,
+                ignore::Match::Whitelist(_) => ignored = false,
+                ignore::Match::None => {}
+            }
+        }
+        ignored
+    }
+
+    fn gitignore_at(&mut self, dir: &Path, name: &str) -> Option<&ignore::gitignore::Gitignore> {
+        let root = self.root.clone();
+        self.gitignores
+            .entry(dir.join(name))
+            .or_insert_with(|| {
+                let file = dir.join(name);
+                file.is_file().then(|| {
+                    // Patterns in `.git/info/exclude` are relative to the project root.
+                    let base = if name == "exclude" {
+                        root.as_path()
+                    } else {
+                        dir
+                    };
+                    let mut gb = ignore::gitignore::GitignoreBuilder::new(base);
+                    gb.add(&file);
+                    gb.build().ok()
+                })?
+            })
+            .as_ref()
+    }
+}
+
 fn update_index(root: &Path) -> Result<(usize, usize)> {
     // Watch is long-lived, so take the common mutation lock only for one
     // coalesced update batch. Readers remain concurrent through SQLite WAL.
@@ -227,4 +341,53 @@ fn update_index(root: &Path) -> Result<(usize, usize)> {
     )?;
     let _ = changed; // suppress unused
     Ok((updated, deleted))
+}
+
+#[cfg(test)]
+mod change_filter_tests {
+    use super::*;
+
+    #[test]
+    fn only_indexable_modified_files_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "<?php\n").unwrap();
+            path
+        };
+        write(".gitignore");
+        std::fs::write(root.join(".gitignore"), "/bitrix\n").unwrap();
+        std::fs::create_dir_all(root.join("local/components/auth.mts")).unwrap();
+        let old = write("src/Old.php");
+        let past = SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        let mut filter = ChangeFilter::new(root);
+        let fresh = write("src/New.php");
+        let ignored = write("bitrix/cache/Page.php");
+        let hidden = write(".idea/Hidden.php");
+
+        assert!(filter.is_relevant(&fresh));
+        assert!(
+            !filter.is_relevant(&old),
+            "not modified since the filter started"
+        );
+        assert!(!filter.is_relevant(&ignored), "gitignored");
+        assert!(!filter.is_relevant(&hidden), "hidden");
+        assert!(
+            !filter.is_relevant(&root.join("local/components/auth.mts")),
+            "a directory"
+        );
+        assert!(
+            filter.is_relevant(&root.join("src/Removed.php")),
+            "a removed file"
+        );
+    }
 }

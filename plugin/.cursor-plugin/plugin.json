@@ -4,10 +4,10 @@
   "version": "3.55.0",
   "description": "Fast structural code search for multi-language projects using the ast-index CLI.",
   "author": {
-    "name": "defendend"
+    "name": "ZardoZAntony"
   },
-  "homepage": "https://github.com/defendend/Claude-ast-index-search",
-  "repository": "https://github.com/defendend/Claude-ast-index-search",
+  "homepage": "https://github.com/ZardoZAntony/Claude-ast-index-search",
+  "repository": "https://github.com/ZardoZAntony/Claude-ast-index-search",
   "license": "MIT",
   "keywords": [
     "code-search",

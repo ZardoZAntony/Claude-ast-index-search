@@ -5,26 +5,14 @@ no external runtime dependencies.
 
 ## Install
 
-### macOS / Linux (Homebrew)
+Build the binary with a Rust toolchain:
 
 ```bash
-brew tap defendend/ast-index
-brew install ast-index
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
-### Cargo (pending first crates.io release)
-
-After the first ast-index version is published on crates.io:
-
-```bash
-cargo install ast-index --locked
-```
-
-Until that rollout, use Homebrew or a release archive.
-
-### Manual
-
-Download binary from [GitHub Releases](https://github.com/defendend/Claude-ast-index-search/releases) and add to PATH.
+Or build from a clone with `cargo build --release` and put `target/release/ast-index` on your
+`PATH`.
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Benchmark: Python vs Rust kotlin-index
-# Запуск: cd /Users/defendend/go-client-android && bash /tmp/kotlin-index-rs/benchmark.sh
+# Запуск: cd /path/to/android-project && bash /tmp/kotlin-index-rs/benchmark.sh
 
 echo "=== kotlin-index Benchmark ==="
 echo "Project: $(pwd)"

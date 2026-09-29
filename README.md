@@ -60,11 +60,47 @@ Cost per task is −36 % on average.
 ² By default `rg` skips the hidden `.tests/` directory, so both `rg` runs missed the tests that import the class.<br>
 ³ One `rg` run found 2 of 5 anonymous implementations.</sub>
 
-**Install** (requires Rust):
+## Install
 
-```bash
-cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
-```
+1. Build the binary (requires Rust):
+
+   ```bash
+   cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
+   ```
+
+2. Add the Claude Code plugin — the skill with command recipes and the hooks that keep the index
+   fresh:
+
+   ```bash
+   claude plugin marketplace add ZardoZAntony/Claude-ast-index-search
+   claude plugin install ast-index@ast-index-php
+   ```
+
+   Or run `/initialize` in the project: it enables the plugin in `.claude/settings.json`, writes
+   agent rules to `.claude/rules/ast-index.md` and builds the index.
+
+3. Put `.ast-index.yaml` in the project root (example below) and build the index once:
+   `ast-index rebuild`.
+
+### Keeping the index fresh
+
+An index that misses a change gives a confident wrong answer, so every way files change needs
+to reach it:
+
+| Files change through | Kept fresh by |
+|---|---|
+| Anything between sessions | plugin hook at session start: an incremental update; the first query waits for it |
+| Claude's Edit/Write | plugin hook after each edit |
+| Shell commands (`git switch/pull/merge/rebase/stash`, `sed -i`, formatters, generators), your IDE | `ast-index watch`, which the session-start hook starts in the background once per project (`AST_INDEX_HOOK_WATCH=0` to opt out); `ast-index watch-status` tells whether it runs |
+
+There is no hook on every shell command on purpose: queries wait for a queued update, so an
+update after each command would delay the next query by seconds. The watcher reacts only to
+files the index covers (it honours `.gitignore`, `exclude` and hidden-path rules) and costs no
+CPU while nothing changes. On Linux it needs an inotify watch per directory; for large trees
+raise `fs.inotify.max_user_watches`. Without the plugin (other agents, CI), run
+`ast-index update` after changing files, or keep `ast-index watch` running.
+
+### Configuration
 
 Example `.ast-index.yaml` for Bitrix, in the project root. Paths are gitignore-style patterns:
 

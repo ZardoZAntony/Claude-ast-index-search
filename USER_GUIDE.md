@@ -10,59 +10,14 @@ repository.
 
 ## Installation
 
-Install a ready-made binary with one of the public distribution channels below.
-
-### Homebrew (macOS / Linux)
+Build the binary with a Rust toolchain:
 
 ```bash
-brew tap defendend/ast-index
-brew install ast-index
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
 ```
 
-You can also use the one-line tap form:
-
-```bash
-brew install defendend/ast-index/ast-index
-```
-
-### npm
-
-Install globally:
-
-```bash
-npm install -g @ast-index/cli
-```
-
-Or run without a global install:
-
-```bash
-npx @ast-index/cli rebuild
-npx @ast-index/cli search MyClass
-```
-
-### Winget (Windows)
-
-```powershell
-winget install --id defendend.ast-index
-```
-
-### Cargo (pending first crates.io release)
-
-This channel becomes available with the first ast-index release on crates.io.
-After that rollout, install with a Rust toolchain:
-
-```bash
-cargo install ast-index --locked
-```
-
-Before the first crates.io release, use one of the binary channels above or
-build from source.
-
-### GitHub Releases
-
-Download the archive for your platform from
-[GitHub Releases](https://github.com/defendend/Claude-ast-index-search/releases),
-unpack it, and put the `ast-index` binary somewhere on your `PATH`.
+Or build from a clone with `cargo build --release` and put `target/release/ast-index` on your
+`PATH`.
 
 ### Verify Installation
 
