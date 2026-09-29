@@ -1167,10 +1167,12 @@ enum PendingUpdateFile {
 /// Parse a single file without DB access (thread-safe)
 fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
+    // Nanoseconds, not seconds: `update` re-parses only when mtime or size differ, so with
+    // second precision an equal-size edit made within the second of the last indexing was lost.
     let mtime = metadata
         .modified()?
         .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_secs() as i64;
+        .as_nanos() as i64;
     let size = metadata.len() as i64;
     let root_path = db::normalize_root_for_storage(root);
 
@@ -1408,7 +1410,7 @@ pub fn build_files_fingerprint(module_files: &[PathBuf]) -> String {
                 .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs() as i64);
+                .map_or(0, |d| d.as_nanos() as i64);
             (path.to_string_lossy().to_string(), mtime, metadata.map_or(0, |m| m.len()))
         })
         .collect();
@@ -2356,7 +2358,7 @@ pub fn update_directory_incremental(
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
+                        .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0);
                     (mtime, metadata.len() as i64)
                 })
@@ -2386,7 +2388,7 @@ pub fn update_directory_incremental(
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
+                    .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
                 (mtime, metadata.len() as i64)
             })
@@ -4822,7 +4824,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
     let mtime = metadata
         .modified()?
         .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_secs() as i64;
+        .as_nanos() as i64;
     let size = metadata.len() as i64;
 
     if (size as u64) > max_file_size_bytes() {
