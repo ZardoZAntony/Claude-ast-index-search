@@ -25,12 +25,34 @@ them. On top of that, new commands answer typical refactoring questions in one c
 
 Details: [PHP commands reference](plugin/skills/ast-index/references/php-commands.md).
 
-**Effect** (measured on a real project, Sonnet agents, 2 runs per variant — indicative, not exact):
-- one command instead of grepping: a complete answer in 0.02–0.2 s and 0.4–6k tokens;
-- working in the main session without subagents, compared with `rg`:
-  - context −39 %, tokens spent on the search itself −42 %, cost −36 %;
-  - dead-code search 671 → 26 s;
-  - complete answers 10/10 vs 7/10 (by default `rg` skips the hidden `.tests/` directory and missed tests).
+**Effect** (measured on a ~10k-file PHP project; Sonnet, 2 runs per variant — indicative, not exact).
+
+One command gives a complete answer:
+
+| Task | Command | Time | Answer size |
+|---|---|---|---|
+| Rename a class | `impact <FQN>` | 0.17 s | ~1.9k tokens |
+| Move a class | `move-plan <FQN> <namespace>` | 0.17 s | ~0.9k tokens |
+| Dead classes in a module | `unused-symbols --module … --export-only` | 0.02 s | ~0.4k tokens |
+| Duplicate classes | `duplicates` | 0.04 s | ~5.8k tokens |
+| Method signature change | `callers 'Type::method'` | 0.06 s | ~2.5k tokens |
+
+Working in the main session without subagents, this fork vs `rg` only:
+
+| Task | Context growth | Search tokens | Time | Complete answers, `rg` → fork |
+|---|---|---|---|---|
+| Rename a class | −7 % | −7 % | −13 % | 2/2 → 2/2 |
+| Move a class | −20 % | −20 % | +123 %¹ | 0/2 → 2/2² |
+| Dead classes in a module | −60 % | −59 % | −96 % (671 → 26 s) | 2/2 → 2/2 |
+| Duplicate classes | −52 % | −56 % | −44 % | 2/2 → 2/2 |
+| Method signature change | −25 % | −26 % | −25 % | 1/2 → 2/2³ |
+| **Average** | **−39 %** | **−42 %** | **−79 %** | **7/10 → 10/10** |
+
+Cost per task is −36 % on average.
+
+<sub>¹ One fork run took 107 s; without it the fork was faster (20 s vs 28 s).<br>
+² By default `rg` skips the hidden `.tests/` directory, so both `rg` runs missed the tests that import the class.<br>
+³ One `rg` run found 2 of 5 anonymous implementations.</sub>
 
 **Install** (requires Rust):
 
