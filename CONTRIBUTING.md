@@ -93,11 +93,12 @@ impl LanguageParser for MyLangParser {
 ## Testing
 
 ```bash
-# Run all tests
-cargo test
+# Run all tests (~15 s): optimized build without LTO, fresh index cache under target/
+scripts/test.sh
 
-# Run tests for a specific parser
-cargo test parsers::treesitter::typescript
+# Run one test file or one parser's tests
+scripts/test.sh --test php_refactor_cli_tests
+scripts/test.sh parsers::treesitter::typescript
 
 # Run clippy
 cargo clippy -- -D warnings

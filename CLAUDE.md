@@ -49,7 +49,7 @@ scripts/bump.sh        # version bump — never edit versions by hand
 ```bash
 cargo build --release              # root binary only (default members)
 cargo build --release --workspace  # root + MCP
-cargo test --release --workspace   # full suite, ~600 tests
+scripts/test.sh                    # full suite, ~1150 tests, ~15 s
 ./target/release/ast-index search Foo
 ```
 

@@ -1,0 +1,6 @@
+# Tests and `cargo run` keep their indexes under target/, not in the user's cache: every test
+# project left an index there, and opening a new project scans all cached indexes for an old
+# one to migrate — with thousands of leftovers each test took seconds. scripts/test.sh wipes
+# this directory before a run.
+[env]
+AST_INDEX_CACHE_DIR = { value = "target/test-cache", relative = true }
