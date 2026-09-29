@@ -64,19 +64,19 @@ jobs:
         if: matrix.name != 'windows-x86_64'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czvf ../../../ast-index-${{ env.RELEASE_TAG }}-${{ matrix.name }}.tar.gz ast-index
+          tar -czvf ../../../ast-index-${{ matrix.name }}.tar.gz ast-index
 
       - name: Package (windows)
         if: matrix.name == 'windows-x86_64'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/ast-index.exe" -DestinationPath "ast-index-${{ env.RELEASE_TAG }}-${{ matrix.name }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/ast-index.exe" -DestinationPath "ast-index-${{ matrix.name }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ast-index-${{ matrix.name }}
-          path: ast-index-${{ env.RELEASE_TAG }}-${{ matrix.name }}.*
+          path: ast-index-${{ matrix.name }}.*
 
   release:
     name: Create Release

@@ -8,7 +8,7 @@ default-members = ["."]
 
 [package]
 name = "ast-index"
-version = "3.55.0"
+version = "3.55.1-php.1"
 edition = "2021"
 description = "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, Scala, PHP, Perl, Python, Go, C++, and Protocol Buffers projects"
 license = "MIT"
@@ -130,3 +130,12 @@ harness = false
 lto = true
 codegen-units = 1
 strip = true
+
+# Test runs: optimized like release but without LTO and with incremental builds. A full LTO link
+# of every test binary made `cargo test --release` take minutes after any change; unoptimized
+# tests run slowly instead. Use: cargo test --profile test-opt --workspace
+[profile.test-opt]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

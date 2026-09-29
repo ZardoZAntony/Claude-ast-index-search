@@ -10,7 +10,15 @@ repository.
 
 ## Installation
 
-Build the binary with a Rust toolchain:
+On Linux x86_64 with glibc 2.39 or newer (Ubuntu 24.04+, WSL included), download the release
+build:
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/ZardoZAntony/Claude-ast-index-search/releases/latest/download/ast-index-linux-x86_64.tar.gz | tar -xz -C ~/.local/bin
+```
+
+Elsewhere, build the binary with a Rust toolchain:
 
 ```bash
 cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index

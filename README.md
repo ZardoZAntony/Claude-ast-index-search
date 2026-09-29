@@ -62,7 +62,18 @@ Cost per task is −36 % on average.
 
 ## Install
 
-1. Build the binary (requires Rust):
+1. Get the binary.
+
+   Linux x86_64 with glibc 2.39 or newer (Ubuntu 24.04+, WSL included; check with
+   `ldd --version`) — download the release build into a directory on `PATH`:
+
+   ```bash
+   mkdir -p ~/.local/bin
+   curl -fsSL https://github.com/ZardoZAntony/Claude-ast-index-search/releases/latest/download/ast-index-linux-x86_64.tar.gz | tar -xz -C ~/.local/bin
+   ast-index version
+   ```
+
+   The same command updates it. Elsewhere, build it (requires Rust):
 
    ```bash
    cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
