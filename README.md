@@ -1,3 +1,54 @@
+# ast-index — a fork for PHP projects
+
+A fork of [defendend/Claude-ast-index-search](https://github.com/defendend/Claude-ast-index-search) v3.55.0,
+tuned for a large PHP/Bitrix codebase (~10k files).
+
+**Why.** On PHP, upstream's index was not reliable enough for refactoring:
+- it did not see classes in PHPDoc (`@var ItemDto[]`, `@return`, `@throws`);
+- it mixed up classes that share a short name across namespaces;
+- it skipped the hidden paths where Bitrix keeps code (`.default/`, `.settings.php`, `.tests/`);
+- it silently lost edits made within the same second as the last indexing.
+
+Agents still had to re-check every result with `rg`, so the index only added cost.
+
+**What this fork does.** PHP class references are resolved to fully qualified names (FQN), the way PHP resolves
+them. On top of that, new commands answer typical refactoring questions in one call.
+
+| Before | After |
+|---|---|
+| References by short name: five different `OrderDto` classes look like one | FQN resolution via `namespace`/`use` (aliases, group use), PHPDoc, FQN strings, attributes; `usages`/`implementations` accept an FQN |
+| Rename, move, dead code, duplicates, signature change take dozens of greps | `impact <FQN>`, `move-plan <FQN> <namespace>`, `unused-symbols --module … --export-only`, `duplicates`, `callers 'Type::method'` (infers receiver types) |
+| PHPDoc is not indexed | PHPDoc tag types are references, just like code |
+| Hidden paths are always skipped | `include_hidden` config; the config can live outside the repo in `.git/ast-index.yaml` (shared by all worktrees) |
+| Same-second edits are lost; non-UTF-8 files and directories like `auth.mts/` are re-parsed on every `update` | Nanosecond mtimes; lossy decoding of non-UTF-8 sources; `update` walks files only |
+| Minified JS/CSS clutters search | Detected and not parsed |
+
+Details: [PHP commands reference](plugin/skills/ast-index/references/php-commands.md).
+
+**Effect** (measured on a real project, Sonnet agents, 2 runs per variant — indicative, not exact):
+- one command instead of grepping: a complete answer in 0.02–0.2 s and 0.4–6k tokens;
+- working in the main session without subagents, compared with `rg`:
+  - context −39 %, tokens spent on the search itself −42 %, cost −36 %;
+  - dead-code search 671 → 26 s;
+  - complete answers 10/10 vs 7/10 (by default `rg` skips the hidden `.tests/` directory and missed tests).
+
+**Install** (requires Rust):
+
+```bash
+cargo install --locked --git https://github.com/ZardoZAntony/Claude-ast-index-search ast-index
+```
+
+Example config for Bitrix (`.git/ast-index.yaml`, never committed):
+
+```yaml
+include_hidden: [.default, .settings.php, .tests]
+exclude: ["*.css", "*.scss", "*.less", orm_annotation.php, orm_annotations.php, vendor/]
+```
+
+Upstream documentation follows.
+
+---
+
 # ast-index v3.55.0
 
 Structural, AST-aware code navigation CLI for large, multi-language
