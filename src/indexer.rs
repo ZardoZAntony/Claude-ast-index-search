@@ -2443,9 +2443,12 @@ pub fn update_directory_incremental(
         let walker = builder.build();
 
         for entry in walker.filter_map(|e| e.ok()) {
-            if entry.file_type().is_some_and(|t| t.is_file())
-                && entry.file_name().to_str().is_some_and(is_module_file)
-            {
+            // Only files: a directory named like a source (`auth.mts/`, a Bitrix component) would
+            // fail to parse, never reach the DB, and look "new" to every later update.
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            if entry.file_name().to_str().is_some_and(is_module_file) {
                 module_files.push(entry.path().to_path_buf());
             }
             let is_supported = entry
