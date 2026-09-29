@@ -264,3 +264,30 @@ fn typed_callers_follow_receiver_types() {
     );
     assert_eq!(v["declarations"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn unused_symbols_export_only_applies_to_module_scan() {
+    let (tmp, cache) = project();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "unused-symbols",
+            "--module",
+            "src/",
+            "--export-only",
+            "--limit",
+            "500",
+        ],
+    );
+    let lowercase: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .filter(|n| n.starts_with(|c: char| c.is_ascii_lowercase()))
+        .collect();
+    assert!(lowercase.is_empty(), "{lowercase:?}");
+}

@@ -15,7 +15,7 @@ case-insensitively, as in PHP.
 | Move a class to another namespace | `ast-index move-plan 'App\Order\OrderDto' 'App\Order\Dto'` |
 | Usages of one class (not its namesakes) | `ast-index usages 'App\Order\OrderDto'` |
 | Callers of a method through a type and its subtypes | `ast-index callers 'CacheInvalidatorInterface::invalidate'` |
-| Dead classes in a directory | `ast-index unused-symbols --module src/Order/` |
+| Dead classes in a directory | `ast-index unused-symbols --module src/Order/ --export-only` |
 | Copy-pasted classes | `ast-index duplicates --path src/` |
 
 - **`impact`** lists the definition and every reference with its kind (`import`, `type`,

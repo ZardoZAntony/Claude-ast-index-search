@@ -40,7 +40,18 @@ pub fn cmd_unused_symbols(
 
     // Build query based on filters
     let (sql, filter_param) = if let Some(mod_path) = module_path.as_deref() {
-        (
+        // `--export-only` narrows a module scan too; it used to be ignored with `--module`.
+        let sql = if export_only {
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE f.path LIKE ?1
+              AND s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct')
+              AND s.name GLOB '[A-Z]*'
+            ORDER BY f.path, s.line
+            "#
+        } else {
             r#"
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
@@ -48,9 +59,9 @@ pub fn cmd_unused_symbols(
             WHERE f.path LIKE ?1
               AND s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct')
             ORDER BY f.path, s.line
-            "#,
-            Some(format!("{}%", mod_path)),
-        )
+            "#
+        };
+        (sql, Some(format!("{}%", mod_path)))
     } else if export_only {
         (
             r#"
