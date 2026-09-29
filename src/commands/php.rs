@@ -767,7 +767,12 @@ pub fn cmd_duplicates(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut groups: HashMap<String, Vec<(String, String, i64, PathBuf)>> = HashMap::new();
+    // The PHP parser records a class once per implemented interface; keep one entry per class.
+    let mut seen = HashSet::new();
     for (name, fqn, line, path, root_path) in rows {
+        if !seen.insert((path.clone(), line)) {
+            continue;
+        }
         let (shown, abs) = locate(root, root_path.as_deref().unwrap_or(""), &path);
         groups
             .entry(name.to_ascii_lowercase())
@@ -969,6 +974,62 @@ fn dice(a: &HashMap<String, usize>, b: &HashMap<String, usize>) -> f64 {
         .map(|(k, n)| (*n).min(*b.get(k).unwrap_or(&0)))
         .sum();
     2.0 * common as f64 / total as f64
+}
+
+// ---------------------------------------------------------------------------
+// implementations <FQN>
+// ---------------------------------------------------------------------------
+
+/// Classes that extend or implement the type, transitively, checked by FQN.
+pub fn cmd_implementations_fqn(root: &Path, fqn: &str, limit: usize, format: &str) -> Result<()> {
+    let _lease = db::acquire_project_lease(root)?;
+    let conn = open(root)?;
+    let roots = type_fqns(&conn, &normalize_fqn(fqn))?;
+    if roots.is_empty() {
+        bail!("type {fqn} is not defined in the index");
+    }
+    let root_lower: HashSet<String> = roots.iter().map(|r| r.to_ascii_lowercase()).collect();
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for sub in with_subtypes(&conn, &roots)? {
+        if root_lower.contains(&sub.to_ascii_lowercase()) {
+            continue;
+        }
+        for d in definitions(&conn, root, &sub)? {
+            if seen.insert((d.path.clone(), d.line)) {
+                items.push(
+                    serde_json::json!({"fqn": sub, "kind": d.kind, "path": d.path, "line": d.line}),
+                );
+            }
+        }
+    }
+    let total = items.len();
+    items.truncate(limit);
+    if format == "json" {
+        return print_json(&serde_json::json!({
+            "items": items,
+            "pagination": {"total": total, "returned": items.len(), "truncated": total > items.len(), "limit": limit},
+        }));
+    }
+    println!(
+        "{}",
+        format!(
+            "Implementations of {} (showing {} of {total}):",
+            roots.join(", "),
+            items.len()
+        )
+        .bold()
+    );
+    for i in &items {
+        println!(
+            "  {} [{}]: {}:{}",
+            i["fqn"].as_str().unwrap_or(""),
+            i["kind"].as_str().unwrap_or(""),
+            i["path"].as_str().unwrap_or("").cyan(),
+            i["line"]
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

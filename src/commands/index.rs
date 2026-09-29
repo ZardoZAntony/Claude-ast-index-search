@@ -497,6 +497,10 @@ pub fn cmd_implementations(
     format: &str,
     scope: &SearchScope,
 ) -> Result<()> {
+    // A fully qualified PHP name: subtypes whose `extends`/`implements` resolve to it.
+    if parent.contains('\\') {
+        return super::php::cmd_implementations_fqn(root, parent, limit, format);
+    }
     if !db::db_exists(root) {
         println!(
             "{}",

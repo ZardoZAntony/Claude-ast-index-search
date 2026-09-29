@@ -291,3 +291,25 @@ fn unused_symbols_export_only_applies_to_module_scan() {
         .collect();
     assert!(lowercase.is_empty(), "{lowercase:?}");
 }
+
+#[test]
+fn implementations_accept_fqn() {
+    let (tmp, cache) = project();
+    let v = run(
+        tmp.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "implementations",
+            "App\\Cache\\InvalidatorInterface",
+        ],
+    );
+    let fqns: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["fqn"].as_str().unwrap())
+        .collect();
+    assert_eq!(fqns, vec!["App\\Cache\\OrderInvalidator"]);
+}
