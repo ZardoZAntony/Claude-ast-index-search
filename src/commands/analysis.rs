@@ -141,6 +141,15 @@ pub fn cmd_unused_symbols(
     // PHP classes referenced only where a DI config registers them, never requested.
     let mut di_only: Vec<&db::SearchResult> = Vec::new();
 
+    // JS/TS/Vue: only exports can be unused across files — checked below through the module graph.
+    let symbols: Vec<db::SearchResult> = symbols
+        .into_iter()
+        .filter(|sym| {
+            !super::js::JS_EXTENSIONS
+                .iter()
+                .any(|ext| sym.path.ends_with(&format!(".{ext}")))
+        })
+        .collect();
     for sym in &symbols {
         let is_php = sym.path.ends_with(".php") || sym.path.ends_with(".phtml");
         // Magic methods (`__construct`, `__invoke`, …) are called by the runtime.
@@ -262,6 +271,16 @@ pub fn cmd_unused_symbols(
         }
     }
 
+    let skip_js = |path: &str, name: &str| -> bool {
+        (!name.is_empty() && ignore_names.iter().any(|p| wildcard_match(p, name)))
+            || ignore.as_ref().is_some_and(|m| {
+                m.matched_path_or_any_parents(root.join(path), false)
+                    .is_ignore()
+            })
+    };
+    let (js_unused, js_unreferenced) =
+        super::js::unused_exports(&conn, root, module_path.as_deref(), &skip_js)?;
+
     if format == "json" {
         #[derive(serde::Serialize)]
         struct Row<'a> {
@@ -281,6 +300,27 @@ pub fn cmd_unused_symbols(
                 reason: Some("registered in DI only"),
             }))
             .collect();
+        let mut rows: Vec<serde_json::Value> = rows
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?;
+        for e in &js_unused {
+            let reason = match (e.tests_only, e.used_locally) {
+                (true, _) => "export only tests import",
+                (false, true) => "export nobody imports, used in its file",
+                (false, false) => "export nobody imports",
+            };
+            rows.push(serde_json::json!({
+                "name": e.name, "kind": format!("export {}", e.kind), "path": e.path, "line": e.line,
+                "reason": reason,
+            }));
+        }
+        for path in &js_unreferenced {
+            rows.push(serde_json::json!({
+                "name": path, "kind": "module", "path": path, "line": 1,
+                "reason": "module nothing references (entry point or dead)",
+            }));
+        }
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
@@ -316,6 +356,42 @@ pub fn cmd_unused_symbols(
         for s in &di_only {
             println!("  {} [{}]: {}:{}", s.name.yellow(), s.kind, s.path, s.line);
         }
+    }
+    let (js_tests_only, js_nobody): (Vec<_>, Vec<_>) = js_unused.iter().partition(|e| e.tests_only);
+    if !js_nobody.is_empty() {
+        println!(
+            "{}",
+            format!("JS/TS exports nobody imports ({}):", js_nobody.len()).bold()
+        );
+        for e in &js_nobody {
+            let note = if e.used_locally { "  (used in its file: drop `export`)" } else { "" };
+            println!("  {} [export {}]: {}:{}{}", e.name.yellow(), e.kind, e.path, e.line, note);
+        }
+    }
+    if !js_tests_only.is_empty() {
+        println!(
+            "{}",
+            format!("JS/TS exports only tests import ({}):", js_tests_only.len()).bold()
+        );
+        for e in &js_tests_only {
+            println!("  {} [export {}]: {}:{}", e.name.yellow(), e.kind, e.path, e.line);
+        }
+    }
+    if !js_unreferenced.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "JS/TS/Vue modules nothing references — entry points or dead ({}):",
+                js_unreferenced.len()
+            )
+            .bold()
+        );
+        for path in &js_unreferenced {
+            println!("  {path}");
+        }
+    }
+    if !js_unused.is_empty() || !js_unreferenced.is_empty() {
+        println!("{} {}", "coverage (JS/TS):".dimmed(), super::js::UNUSED_COVERAGE);
     }
 
     Ok(())

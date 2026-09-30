@@ -546,19 +546,20 @@ enum Commands {
         #[arg(long)]
         module: Option<String>,
     },
-    /// Everything a change to a PHP class touches, by fully qualified name
+    /// Everything a change touches: a PHP class by FQN, a JS/TS export ('src/x.js#name') or module ('src/x.js')
     Impact {
-        /// Fully qualified class name, e.g. 'App\\Order\\OrderService'
+        /// PHP class FQN ('App\\Order\\OrderService'), JS/TS 'path#export' or module path; a short name works
+        /// when one JS/TS module exports it
         fqn: String,
         /// List every reference line even when there are many (text output)
         #[arg(long)]
         full: bool,
     },
-    /// Edits needed to move a PHP class to another namespace
+    /// Edits needed to move a PHP class to another namespace, or a JS/TS/Vue file to another path
     MovePlan {
-        /// Fully qualified class name to move
+        /// PHP class FQN, or the path of a JS/TS/Vue module file
         fqn: String,
-        /// Target namespace
+        /// Target namespace (PHP) or new file path (JS/TS; a directory keeps the file name)
         namespace: String,
     },
     /// Same-named PHP classes whose bodies are near copies
@@ -1338,9 +1339,21 @@ fn main() -> Result<()> {
             limit,
         } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
         Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
-        Commands::Impact { fqn, full } => commands::php::cmd_impact(&root, &fqn, full, format),
+        Commands::Impact { fqn, full } => {
+            if commands::js::is_js_target(&fqn) {
+                commands::js::cmd_js_impact(&root, &fqn, full, format)
+            } else if let Some(done) = commands::js::short_name_impact(&root, &fqn, full, format) {
+                done
+            } else {
+                commands::php::cmd_impact(&root, &fqn, full, format)
+            }
+        }
         Commands::MovePlan { fqn, namespace } => {
-            commands::php::cmd_move_plan(&root, &fqn, &namespace, format)
+            if commands::js::is_js_target(&fqn) {
+                commands::js::cmd_js_move_plan(&root, &fqn, &namespace, format)
+            } else {
+                commands::php::cmd_move_plan(&root, &fqn, &namespace, format)
+            }
         }
         Commands::Duplicates {
             path,

@@ -797,6 +797,10 @@ pub fn cmd_usages(
     if symbol.contains('\\') {
         return super::php::cmd_usages_fqn(root, symbol, limit, format);
     }
+    // A JS/TS export (`path#name`) or module path: resolved imports, not every same-named identifier.
+    if super::js::is_js_target(symbol) {
+        return super::js::cmd_js_usages(root, symbol, limit, format);
+    }
 
     // Try to use index first
     let _cache_lease = db::acquire_project_lease(root)?;
@@ -845,6 +849,7 @@ pub fn cmd_usages(
             }
             print_truncation_notice(page.pagination);
             super::php::print_namesakes_notice(&conn, symbol);
+            super::js::print_exporters_notice(root, symbol);
 
             return Ok(());
         }

@@ -226,6 +226,9 @@ pub struct ProjectConfig {
     /// Path fragments of deliberate copies (`/Contracts/` for DTO contracts mirrored in modules):
     /// `duplicates` tags pairs with such a path and lists them last.
     pub duplicate_mirrors: Option<Vec<String>>,
+    /// Module specifier prefixes → directories (project-relative), for aliases a bundler or test runner
+    /// config adds beyond tsconfig/jsconfig `paths` (`"@frontend-ui/": "local/frontend/src/ui/"`).
+    pub js_aliases: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root.
@@ -1242,6 +1245,8 @@ struct ParsedFile {
     /// Fully qualified class name and kind of use per reference (PHP); empty when the language
     /// has none.
     ref_fqns: Vec<Option<(String, &'static str)>>,
+    /// Imports, exports and uses of imported names (JS/TS/Vue).
+    js_module: Option<parsers::treesitter::js_modules::JsModule>,
 }
 
 /// File scheduled by incremental update.
@@ -1328,6 +1333,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
             qualified_names: HashMap::new(),
             refs: vec![],
             ref_fqns: vec![],
+            js_module: None,
         });
     }
 
@@ -1351,6 +1357,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 qualified_names: HashMap::new(),
                 refs: vec![],
                 ref_fqns: vec![],
+                js_module: None,
             });
         }
     };
@@ -1361,6 +1368,12 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     if file_type == parsers::FileType::Cpp {
         qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
     }
+
+    let js_module = match file_type {
+        parsers::FileType::TypeScript => Some(parsers::treesitter::js_modules::extract(&content, false)),
+        parsers::FileType::Vue => Some(parsers::treesitter::js_modules::extract(&content, true)),
+        _ => None,
+    };
 
     let mut ref_fqns = Vec::new();
     if file_type == parsers::FileType::Php {
@@ -1414,6 +1427,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         qualified_names,
         refs,
         ref_fqns,
+        js_module,
     })
 }
 
@@ -2301,6 +2315,16 @@ fn write_batch_to_db(
         let mut ref_stmt = tx.prepare_cached(
             "INSERT INTO refs (file_id, name, line, context, fqn, ref_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
+        let mut js_import_stmt = tx.prepare_cached(
+            "INSERT INTO js_imports (file_id, line, name_line, kind, spec, imported, local)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        let mut js_export_stmt = tx.prepare_cached(
+            "INSERT INTO js_exports (file_id, line, name, local, decl_line, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut js_use_stmt = tx.prepare_cached(
+            "INSERT INTO js_uses (file_id, local, member, line) VALUES (?1, ?2, ?3, ?4)",
+        )?;
 
         for pf in batch {
             let ParsedFile {
@@ -2312,6 +2336,7 @@ fn write_batch_to_db(
                 qualified_names,
                 refs,
                 ref_fqns,
+                js_module,
             } = pf;
 
             file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
@@ -2354,6 +2379,33 @@ fn write_batch_to_db(
                     fqn,
                     kind
                 ])?;
+            }
+
+            if let Some(module) = js_module {
+                for i in module.imports {
+                    js_import_stmt.execute(rusqlite::params![
+                        file_id,
+                        i.line as i64,
+                        i.name_line as i64,
+                        i.kind,
+                        i.spec,
+                        i.imported,
+                        i.local
+                    ])?;
+                }
+                for e in module.exports {
+                    js_export_stmt.execute(rusqlite::params![
+                        file_id,
+                        e.line as i64,
+                        e.name,
+                        e.local,
+                        e.decl_line.map(|l| l as i64),
+                        e.kind
+                    ])?;
+                }
+                for u in module.uses {
+                    js_use_stmt.execute(rusqlite::params![file_id, u.local, u.member, u.line as i64])?;
+                }
             }
 
             *total_count += 1;
@@ -4998,6 +5050,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
             qualified_names: HashMap::new(),
             refs: vec![],
             ref_fqns: vec![],
+            js_module: None,
         });
     }
 
@@ -5013,6 +5066,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         qualified_names: HashMap::new(),
         refs,
         ref_fqns: vec![],
+        js_module: None,
     })
 }
 

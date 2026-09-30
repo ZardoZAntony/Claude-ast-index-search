@@ -4225,6 +4225,12 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    conn.execute_batch(CREATE_JS_MODULE_TABLES_SQL)?;
+    conn.execute(CREATE_METADATA_SQL, [])?;
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('js_modules_version', ?1)",
+        [JS_MODULES_VERSION],
+    )?;
     Ok(())
 }
 
@@ -4346,6 +4352,50 @@ const CREATE_QUALIFIED_NAME_INDEX_SQL: &str = r#"
 /// Class references by fully qualified name (PHP); PHP class names are case-insensitive.
 const CREATE_REFS_FQN_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_refs_fqn ON refs(fqn COLLATE NOCASE) WHERE fqn IS NOT NULL";
+/// ES-module facts of JS/TS/Vue files (`parsers::treesitter::js_modules`). Specifiers are kept as written and
+/// resolved at query time, so a moved or added file never leaves stale targets behind.
+const CREATE_JS_MODULE_TABLES_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS js_imports (
+        id INTEGER PRIMARY KEY,
+        file_id INTEGER NOT NULL,
+        line INTEGER NOT NULL,
+        name_line INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        spec TEXT NOT NULL,
+        imported TEXT,
+        local TEXT,
+        FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS js_exports (
+        id INTEGER PRIMARY KEY,
+        file_id INTEGER NOT NULL,
+        line INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        local TEXT,
+        decl_line INTEGER,
+        kind TEXT NOT NULL,
+        FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS js_uses (
+        id INTEGER PRIMARY KEY,
+        file_id INTEGER NOT NULL,
+        local TEXT NOT NULL,
+        member TEXT,
+        line INTEGER NOT NULL,
+        FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_js_imports_file ON js_imports(file_id);
+    CREATE INDEX IF NOT EXISTS idx_js_exports_file ON js_exports(file_id);
+    CREATE INDEX IF NOT EXISTS idx_js_exports_name ON js_exports(name);
+    CREATE INDEX IF NOT EXISTS idx_js_uses_file ON js_uses(file_id, local);
+"#;
+/// Version of what `js_modules` extracts: a change re-parses JS/TS/Vue files once on the next update.
+const JS_MODULES_VERSION: &str = "2";
+
+/// Files whose module facts `js_modules` extracts.
+pub const JS_MODULE_PATH_SQL: &str = "(path LIKE '%.js' OR path LIKE '%.jsx' OR path LIKE '%.mjs' \
+     OR path LIKE '%.cjs' OR path LIKE '%.ts' OR path LIKE '%.tsx' OR path LIKE '%.mts' OR path LIKE '%.cts' \
+     OR path LIKE '%.vue')";
 const CREATE_REFS_NAME_FILE_LINE_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_refs_name_file_line ON refs(name, file_id, line)";
 const DEFAULT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -4516,6 +4566,18 @@ fn inspect_open_migrations(
     let symbols_current = !symbols_exists || column_exists(conn, "symbols", "qualified_name")?;
     let refs_current = !table_exists(conn, "refs")?
         || (column_exists(conn, "refs", "fqn")? && column_exists(conn, "refs", "ref_kind")?);
+    let js_modules_current = !files_exists
+        || (table_exists(conn, "js_imports")?
+            && metadata_exists
+            && conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'js_modules_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .as_deref()
+                == Some(JS_MODULES_VERSION));
 
     let (stored_root, has_legacy_extra_roots) = if metadata_exists {
         let stored_root = conn
@@ -4560,6 +4622,7 @@ fn inspect_open_migrations(
             || !files_uniqueness_current
             || !symbols_current
             || !refs_current
+            || !js_modules_current
             || stored_root.as_deref() != Some(normalized_root)
             || has_legacy_extra_roots,
         optional_indexes,
@@ -4663,6 +4726,28 @@ fn apply_open_migrations_transaction(
         }
         tx.execute(CREATE_REFS_FQN_INDEX_SQL, [])
             .context("failed to create idx_refs_fqn")?;
+    }
+
+    if table_exists(&tx, "files")? {
+        let version: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'js_modules_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !table_exists(&tx, "js_imports")? || version.as_deref() != Some(JS_MODULES_VERSION) {
+            tx.execute_batch(CREATE_JS_MODULE_TABLES_SQL)
+                .context("failed to create js module tables")?;
+            // Files indexed before these module facts: the next update re-parses them once.
+            tx.execute(&format!("UPDATE files SET mtime = 0 WHERE {JS_MODULE_PATH_SQL}"), [])
+                .context("failed to schedule re-parse of JS/TS/Vue files")?;
+            tx.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('js_modules_version', ?1)",
+                [JS_MODULES_VERSION],
+            )
+            .context("failed to record js_modules_version")?;
+        }
     }
 
     tx.execute("DROP INDEX IF EXISTS idx_files_root_path_path", [])
@@ -6396,6 +6481,9 @@ pub fn clear_db(conn: &Connection) -> Result<()> {
         DELETE FROM resources;
         DELETE FROM xml_usages;
         DELETE FROM transitive_deps;
+        DELETE FROM js_uses;
+        DELETE FROM js_exports;
+        DELETE FROM js_imports;
         DELETE FROM refs;
         DELETE FROM inheritance;
         DELETE FROM module_deps;

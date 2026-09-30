@@ -17,6 +17,7 @@ pub mod explore;
 pub mod files;
 pub mod grep;
 pub mod index;
+pub mod js;
 pub mod ios;
 pub mod management;
 pub mod modules;

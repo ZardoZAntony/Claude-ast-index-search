@@ -15,6 +15,7 @@ pub mod gdscript;
 pub mod go;
 pub mod groovy;
 pub mod java;
+pub mod js_modules;
 pub mod kotlin;
 pub mod less;
 pub mod lua;
