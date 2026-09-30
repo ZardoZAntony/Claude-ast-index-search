@@ -68,7 +68,8 @@ def main() -> None:
         "PHP: `ast-index usages '<FQN>'`, `ast-index impact '<FQN>'`, `ast-index callers 'Type::method'` give "
         "the complete answer in one call (namespaces, imports, PHPDoc, tests). JS/TS: `ast-index impact "
         "'<file>#<name>'` or `ast-index impact <name>` (imports resolved by path, re-exports, Vue templates, "
-        "tests). rg stays right for text that is not code and excluded files."
+        "tests). rg stays right when one literal string answers (a static call of a legacy class, a class name to "
+        "locate), for text that is not code and excluded files."
     )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}},
                      ensure_ascii=False))

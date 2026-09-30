@@ -49,7 +49,8 @@ A bare specifier (`vue`, `@vue/test-utils`) is a package.
 ## Still use rg for
 
 Specifiers built at run time (``import(`./${name}.js`)``), CommonJS `module.exports`, files excluded from the
-index, and plain text.
+index, plain text, and a unique literal you only need to locate. For renames, moves, importers and dead exports
+the index is the complete answer: in a measured rename of a component rg missed two tests that imported it.
 
 ## Other commands
 

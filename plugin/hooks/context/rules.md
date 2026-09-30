@@ -13,6 +13,9 @@ from the project root — one call gives the complete answer, its `coverage` lin
   `ast-index move-plan '<file>' '<new path or dir/>'`; dead JS exports and files → `unused-symbols --module <dir>/`
 - structure of a large file (any language) → `ast-index outline <file>`; framework/vendor code listed under
   `external:` (Bitrix core, Symfony…) → `ast-index class <Name>` for its file, then `outline`, not grep
-rg stays right for text that is not code, commented-out code, dynamic names and specifiers, excluded files.
+The index wins when the answer spans files (relations, hidden tests, namesakes). Use rg directly when one literal
+string answers — a static call of a legacy class (`CSaleOrder::Update`), a class name to locate — and for text,
+SQL, config values, commented-out code, dynamic names and specifiers, excluded files; for "how does X work" in a
+file you know, read it (`outline` for line numbers).
 Do not guess an FQN: `ast-index class <ShortName>` shows it, and a wrong FQN answers with the classes of that
 short name. FQN arguments in single quotes; in loops `while IFS= read -r`. More: skill `ast-index`.

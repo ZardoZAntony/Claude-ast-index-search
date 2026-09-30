@@ -71,9 +71,12 @@ them out unless `--external`.
 
 ## When to use grep instead
 
+- One literal string answers: a static call of a legacy class (`rg 'CSaleOrder::Update'` — exact and short; `callers`
+  adds calls it cannot type), a class name you only need to locate (`class` is no faster).
 - Text that is not PHP code or config: templates in other languages, docs, JS.
 - Dynamically built class names (`$class = $prefix . 'Handler'`) and method names.
-- Receivers the inference cannot follow (factory return types, array elements).
+- Receivers the inference cannot follow (factory return types, array elements) — `callers` lists them with a
+  summary by receiver; decide by hand.
 - Files excluded from the index (`.ast-index.yaml` `exclude`, gitignored directories not listed under `external`).
 
 ## Project config

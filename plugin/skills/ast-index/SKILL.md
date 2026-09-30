@@ -89,11 +89,25 @@ their definitions and declarations, `implementations` follows inheritance throug
 in. `implementations` prints how many external subclasses it hid. Do not grep `bitrix/` or `vendor/` for a class:
 `ast-index class <Name>` gives the file, `outline` its methods with lines.
 
-## Still use rg for
+## Index or rg — what the measurements say
 
-Text that is not code (docs, messages, templates in other languages), commented-out code, dynamically built
-class or method names (`$prefix . 'Handler'`) and module specifiers (``import(`./${name}.js`)``), CommonJS
-`module.exports`, files excluded from the index (`vendor/`, styles, generated files).
+The index wins when the answer spans files: relations a text search cannot see, hidden directories, namesakes.
+Where one literal string finds the answer, `rg` is as fast and often shorter. Measured on a PHP/Bitrix project with
+a Vue frontend (Sonnet, the same task with and without the index):
+
+| Question | Take | Measured |
+|---|---|---|
+| Rename, move, change the API of a PHP class | `impact`, `move-plan` | complete answers 10/10 vs 7/10 with rg — rg skips hidden `.tests/` |
+| Change a method signature | `callers 'Type::method'` | finds subtypes and anonymous implementations rg missed |
+| Dead classes, dead JS exports, copies | `unused-symbols`, `duplicates` | ×26 and ×4.5 faster, 59–96 % fewer tokens |
+| Subclasses through intermediate classes, framework core included | `implementations '<FQN>'` | ×2.5, 40 % fewer tokens — `extends Base` in rg catches every `Base` |
+| Rename or move a JS/TS/Vue export or file, who imports a module | `impact 'file#name'`, `move-plan` | 33/33 files vs 31/33 — rg missed tests |
+| Locate a class, read a method in a file you know | `class`, `outline`, or just open the file | same as rg |
+| A unique literal: a static call of a legacy class (`CSaleOrder::Update`), a class name | `rg` | ~130 tokens vs ~720 from `callers` at the same speed |
+| "How does X work" in one file | read it; `outline` for line numbers | nothing to gain |
+| Text, messages, SQL, config values, commented-out code | `rg` | not in the index |
+| Dynamically built names (`$prefix . 'Handler'`, ``import(`./${x}.js`)``), CommonJS `module.exports` | `rg` | not resolvable statically |
+| Files excluded from the index (`vendor/`, styles, generated files) | `rg` | not indexed |
 
 ## Index and config
 

@@ -8,7 +8,7 @@ JavaScript, TypeScript and Vue only. References and `initialize-*` commands for 
 (Kotlin/Java, Swift/ObjC, Dart, Rust, Ruby, C#, Go, Python, Perl, C++, Proto, WSDL…) were removed from it. The
 indexer itself still parses every language upstream supports; the upstream README documents those commands.
 
-**Why.** On PHP, upstream's index was not reliable enough for refactoring:
+**Why.** Upstream's index was not reliable enough for refactoring. On PHP:
 - it did not see classes in PHPDoc (`@var ItemDto[]`, `@return`, `@throws`);
 - it mixed up classes that share a short name across namespaces;
 - its shared name filter, built for Kotlin/Java, dropped PHP classes and methods such as
@@ -16,6 +16,10 @@ indexer itself still parses every language upstream supports; the upstream READM
   lower-case class names, snake_case calls, or methods called from their own class;
 - it skipped the hidden paths where Bitrix keeps code (`.default/`, `.settings.php`, `.tests/`);
 - it silently lost edits made within the same second as the last indexing.
+
+On JavaScript, TypeScript and Vue it matched references by short name only: an import of another export of the
+same module passed for a use, `export const` values and `export … from` were not symbols, and nothing followed a
+module path.
 
 Agents still had to re-check every result with `rg`, so the index only added cost.
 
@@ -35,9 +39,7 @@ them. On top of that, new commands answer typical refactoring questions in one c
 
 Details: [PHP commands reference](plugin/skills/ast-index/references/php-commands.md).
 
-**JavaScript, TypeScript, Vue.** Upstream matched JS/TS references by short name only: an import of another
-export of the same module passed for a use, `export const` values and `export … from` were not symbols, and
-nothing followed a module path. The fork indexes ES-module facts — imports with their names, exports,
+**JavaScript, TypeScript, Vue.** The fork indexes ES-module facts — imports with their names, exports,
 re-exports, `import()`, `require()`, `vi.mock`/`jest.mock`, `import.meta.glob`, JSDoc `import()` types, and
 uses of imported names in code, TS types and Vue templates (PascalCase and kebab-case tags). Specifiers are
 resolved at query time like bundlers do: relative paths, `paths` of the nearest tsconfig/jsconfig (with
@@ -62,63 +64,50 @@ leave them out unless `--external`.
 (only in projects that have an index); a note is added when a `grep`/`rg` search looks for a code symbol (never a
 permission decision). Nothing is written to `CLAUDE.md` or `.claude/rules/`.
 
-**Effect on PHP** (measured on a ~10k-file PHP project; Sonnet, 2 runs per variant — indicative, not exact).
+**Effect.** Sonnet in the main session, the same task before and after: before — `rg` only (PHP) or the plugin
+off (JS/TS), after — the fork with its plugin. "Tokens saved" — what the searches returned into the context.
+Indicative, not exact.
 
-One command answers the question (measured before the lexer and naming fixes; `callers` lists
-calls it could not infer for a manual check):
+PHP, ~10k files, 2 runs per variant; before/after — complete answers:
 
-| Task | Command | Time | Answer size |
-|---|---|---|---|
-| Rename a class | `impact <FQN>` | 0.17 s | ~1.9k tokens |
-| Move a class | `move-plan <FQN> <namespace>` | 0.17 s | ~0.9k tokens |
-| Dead classes in a module | `unused-symbols --module … --export-only` | 0.02 s | ~0.4k tokens |
-| Duplicate classes | `duplicates` | 0.04 s | ~5.8k tokens |
-| Method signature change | `callers 'Type::method'` | 0.06 s | ~2.5k tokens |
-
-Working in the main session without subagents, this fork vs `rg` only:
-
-| Task | Context growth | Search tokens | Time | Complete answers, `rg` → fork |
+| Task | Before | After | Faster | Tokens saved |
 |---|---|---|---|---|
-| Rename a class | −7 % | −7 % | −13 % | 2/2 → 2/2 |
-| Move a class | −20 % | −20 % | +123 %¹ | 0/2 → 2/2² |
-| Dead classes in a module | −60 % | −59 % | −96 % (671 → 26 s) | 2/2 → 2/2 |
-| Duplicate classes | −52 % | −56 % | −44 % | 2/2 → 2/2 |
-| Method signature change | −25 % | −26 % | −25 % | 1/2 → 2/2³ |
-| **Average** | **−39 %** | **−42 %** | **−79 %** | **7/10 → 10/10** |
+| Rename a class | 2/2 | 2/2 | ×1.1 | 7 % |
+| Move a class | 0/2¹ | 2/2 | ×0.4² | 20 % |
+| Dead classes in a module | 2/2 | 2/2 | ×26 | 59 % |
+| Duplicate classes | 2/2 | 2/2 | ×1.8 | 56 % |
+| Method signature change | 1/2³ | 2/2 | ×1.3 | 26 % |
+| **Total** | **7/10** | **10/10** | **×4.8** | **42 %** |
 
-Cost per task is −36 % on average.
+Bitrix core as `external:` (D7 `lib` and legacy `classes`), plugin off → on, 2 runs per variant:
 
-<sub>¹ One fork run took 107 s; without it the fork was faster (20 s vs 28 s).<br>
-² By default `rg` skips the hidden `.tests/` directory, so both `rg` runs missed the tests that import the class.<br>
-³ One `rg` run found 2 of 5 anonymous implementations.</sub>
-
-**Effect on JavaScript, TypeScript, Vue** (a Vue/JS frontend of 1336 files and 4464 imports). Answers were
-checked against a reference resolver written for the purpose; before — the same command on upstream's index.
-
-| Task | Command | Time | Before | After |
+| Task | Before | After | Faster | Tokens saved |
 |---|---|---|---|---|
-| Rename an exported function | `impact 'file#name'` | 0.03 s | 2 of 5 places (`usages <name>`) | 4 of 4 places + the name line of a multi-line import |
-| Who imports a component | `impact 'file'` | 0.03 s | 104 short-name lines, namesakes and template tags mixed | 33 of 33 imports |
-| Dead exports in a directory | `unused-symbols --module …` | 0.03 s | 0 of 8 found; template handlers reported as dead | 8 of 8; whole frontend 137 = 137 |
-| Move a module | `move-plan file dir/` | 0.03 s | — | 11 of 11 specifiers rewritten in their own style |
+| Where a legacy method is defined, and its parent class | 2/2 | 2/2 | ×1.0 | ≈ 0⁴ |
+| Our calls to a legacy core method | 2/2 | 2/2 | ×0.9 | −450 %⁵ |
+| Core subclasses through intermediate classes | 2/2 | 2/2 | ×2.5 | 40 % |
 
-11 of 2704 project imports do not resolve: 5 point to missing files, 6 go through a test-runner alias — listed in
-`js_aliases`, they resolve too.
+JS/TS/Vue, 1336 files, 1 run per variant:
 
-**Does the agent use it** (Sonnet, tasks worded in Russian without mentioning the index; 1 run per variant):
+| Task | Before | After | Faster | Tokens saved |
+|---|---|---|---|---|
+| Rename a component and its file | 31/33 files | 33/33 | ×1.2 | −14 %⁶ |
+| Dead exports in a directory | 8/8 | 8/8 | ×4.5 | 96 % |
+| Move a module | 11/11 edits | 11/11 | ×1.3 | 40 % |
 
-| Task | Plugin off | Plugin on |
-|---|---|---|
-| PHP: remove a DTO field | hooks off, skill on: grep | `class`, then `usages <FQN>`: $0.23 |
-| PHP: change a method signature | hooks off, skill on: the skill loaded by itself, `callers` | `class`, then `callers`: $0.20 |
-| JS: rename a composable | hooks off, skill on: grep | `usages` + `rg` on the module path: $0.15 |
-| JS: rename a component and its file | 31 of 33 files (two tests missed), $0.29 | 33 of 33, $0.30 |
-| JS: dead exports in a directory | 8 of 8, $0.28 | 8 of 8, $0.14 |
-| JS: move a module | 11 of 11, $0.16 | 11 of 11, $0.17 |
-| Bitrix core: how `HttpClient::download()` works | $0.18 | $0.19 — the core path is guessable, grep in one file is enough |
+<sub>¹ By default `rg` skips the hidden `.tests/` directory and missed the tests that import the class.<br>
+² One fork run took 107 s; without it ×1.4.<br>
+³ One `rg` run found 2 of 5 anonymous implementations.<br>
+⁴ Both answers under 250 tokens: a class name is a literal string, `rg` finds it at once.<br>
+⁵ ~130 → ~720 tokens: `rg` on the literal `CSaleOrder::Update` is exact for a static call; `callers` adds the
+calls whose receiver it cannot infer (summarised by receiver, first 10 shown).<br>
+⁶ The index answer is longer: `impact` lists all 74 uses of the component in templates.</sub>
 
-Without the session-start rules the skill description alone was picked up in 1 of 3 PHP/JS tasks. Suggesting
-same-named classes for a guessed namespace cut the PHP sessions from $0.35/$0.33 to $0.23/$0.20.
+The index wins where the answer spans files — subclasses through intermediate classes, every importer of a module,
+dead code; where one literal string finds the answer, `rg` is as good. The commands answer in 0.02–0.2 s. JS/TS
+answers were checked against a reference resolver: 33 of 33 importers of a component, 137 = 137 dead exports over
+the frontend, 11 of 11 move edits; upstream's `usages` found 2 of 5 places of a rename. Without the session-start
+rules the skill description alone was picked up in 1 of 3 tasks, with them in 3 of 3.
 
 ## Install
 
@@ -211,10 +200,12 @@ unused_ignore_names:
 # mirrored in modules): tagged [mirror] and listed last.
 duplicate_mirrors:
   - /Contracts/
+
 # JS/TS: specifier prefixes a bundler or test runner adds beyond tsconfig/jsconfig `paths`
 # (vite/vitest `resolve.alias`), mapped to project-relative directories.
 js_aliases:
   "@frontend-ui/": local/frontend/src/ui/
+
 # Framework and vendor code, indexed past .gitignore for definitions only: class/symbol/outline/hierarchy
 # and definitions in impact/callers find it; search, usages, unused-symbols, duplicates leave it out
 # unless --external.
