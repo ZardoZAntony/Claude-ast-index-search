@@ -1,13 +1,13 @@
 {
-  "description": "Keep the ast-index search index in sync with file edits and session events, and nudge symbol searches toward ast-index.",
+  "description": "Keep the ast-index fresh, give the agent its usage rules in indexed projects, and point symbol searches in grep/rg to the index.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Grep",
+        "matcher": "Grep|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/grep-reminder.sh",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/search-reminder.sh\"",
             "timeout": 5
           }
         ]
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/post-edit-update.sh",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/post-edit-update.sh\"",
             "timeout": 20
           }
         ]
@@ -31,7 +31,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start-refresh.sh",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start-context.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start-refresh.sh\"",
             "timeout": 90,
             "statusMessage": "Queuing the ast-index project refresh...",
             "async": true

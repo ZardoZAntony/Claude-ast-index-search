@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "ast-index-php",
-  "description": "Plugins for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, PHP, Python, Go, Perl, Proto, WSDL, and C++ development",
+  "description": "ast-index for PHP, JavaScript, TypeScript and Vue projects",
   "owner": {
     "name": "ZardoZAntony"
   },
   "plugins": [
     {
       "name": "ast-index",
-      "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, PHP, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
+      "description": "Structural code index for PHP, JavaScript, TypeScript and Vue: usages, callers, refactoring impact, move plans, dead code and duplicates in one call",
       "author": {
         "name": "ZardoZAntony"
       },

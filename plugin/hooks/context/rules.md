@@ -1,8 +1,3 @@
----
-description: Use ast-index for structural search and refactoring impact in PHP, JS/TS and Vue before grep/rg.
-alwaysApply: true
----
-
 ast-index: this project has a structural code index (PHP, JS/TS, Vue). Before grep/rg for these tasks, run it
 from the project root — one call gives the complete answer, its `coverage` line says what was checked:
 - rename a PHP class or change its API → `ast-index impact '<FQN>'`

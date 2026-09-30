@@ -60,12 +60,21 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   their references cannot be told apart.
 - **`usages <ShortName>`** notes when several classes share the name; pass the FQN instead.
 
+## Framework and vendor code
+
+List the directories of code the project uses but does not own under `external:` in `.ast-index.yaml` (they may be
+gitignored): `bitrix/modules/main/lib`, `local/vendor/symfony`… Their classes are found by `class`/`symbol`/`file`,
+`outline` shows their methods, `hierarchy` and `implementations` follow inheritance through them (external
+subclasses are hidden with a count), `impact` and `callers 'Type::method'` show their definitions and declarations.
+Only symbols and inheritance are stored for them — `search`, `usages`, `unused-symbols`, `duplicates` and grep leave
+them out unless `--external`.
+
 ## When to use grep instead
 
 - Text that is not PHP code or config: templates in other languages, docs, JS.
 - Dynamically built class names (`$class = $prefix . 'Handler'`) and method names.
 - Receivers the inference cannot follow (factory return types, array elements).
-- Files excluded from the index (`.ast-index.yaml` `exclude`, gitignored directories).
+- Files excluded from the index (`.ast-index.yaml` `exclude`, gitignored directories not listed under `external`).
 
 ## Project config
 

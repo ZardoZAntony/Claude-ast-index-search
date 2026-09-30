@@ -1,7 +1,12 @@
-# ast-index — a fork for PHP projects
+# ast-index — a fork for PHP and JS/TS projects
 
 A fork of [defendend/Claude-ast-index-search](https://github.com/defendend/Claude-ast-index-search) v3.55.0,
-tuned for a large PHP/Bitrix codebase (~10k files).
+tuned for a large PHP/Bitrix codebase (~10k files) with a JS/Vue frontend (~1.3k files).
+
+**Scope of the plugin.** The Claude Code plugin — skill, command references, `/initialize`, hooks — covers PHP,
+JavaScript, TypeScript and Vue only. References and `initialize-*` commands for the other upstream languages
+(Kotlin/Java, Swift/ObjC, Dart, Rust, Ruby, C#, Go, Python, Perl, C++, Proto, WSDL…) were removed from it. The
+indexer itself still parses every language upstream supports; the upstream README documents those commands.
 
 **Why.** On PHP, upstream's index was not reliable enough for refactoring:
 - it did not see classes in PHPDoc (`@var ItemDto[]`, `@return`, `@throws`);
@@ -30,7 +35,34 @@ them. On top of that, new commands answer typical refactoring questions in one c
 
 Details: [PHP commands reference](plugin/skills/ast-index/references/php-commands.md).
 
-**Effect** (measured on a ~10k-file PHP project; Sonnet, 2 runs per variant — indicative, not exact).
+**JavaScript, TypeScript, Vue.** Upstream matched JS/TS references by short name only: an import of another
+export of the same module passed for a use, `export const` values and `export … from` were not symbols, and
+nothing followed a module path. The fork indexes ES-module facts — imports with their names, exports,
+re-exports, `import()`, `require()`, `vi.mock`/`jest.mock`, `import.meta.glob`, JSDoc `import()` types, and
+uses of imported names in code, TS types and Vue templates (PascalCase and kebab-case tags). Specifiers are
+resolved at query time like bundlers do: relative paths, `paths` of the nearest tsconfig/jsconfig (with
+`baseUrl`, `extends`, `references`), `js_aliases` from `.ast-index.yaml`, extensions, `index.*`.
+
+| Task | Command |
+|---|---|
+| Rename an export or change its signature | `impact 'src/x.js#name'` (`#default` for a default export; a short name works when one module exports it) |
+| Who imports a module | `impact 'src/x.js'` |
+| Move a file | `move-plan 'src/x.js' 'src/y/'` — specifiers per file in the style each was written |
+| Dead exports and files | `unused-symbols --module src/` |
+
+Details: [JS/TS reference](plugin/skills/ast-index/references/typescript-commands.md).
+
+**Framework and vendor code.** Directories listed under `external:` in `.ast-index.yaml` (Bitrix core
+`bitrix/modules/*/lib`, `vendor/symfony`…) are indexed past `.gitignore` for their definitions only: `class`,
+`symbol`, `file`, `outline`, `hierarchy` find them, `impact`/`callers` show their definitions and declarations,
+`implementations` follows inheritance through them. `search`, `usages`, `unused-symbols`, `duplicates` and grep
+leave them out unless `--external`.
+
+**The agent picks the index by itself.** At session start the plugin puts a short list of rules into the context
+(only in projects that have an index); a note is added when a `grep`/`rg` search looks for a code symbol (never a
+permission decision). Nothing is written to `CLAUDE.md` or `.claude/rules/`.
+
+**Effect on PHP** (measured on a ~10k-file PHP project; Sonnet, 2 runs per variant — indicative, not exact).
 
 One command answers the question (measured before the lexer and naming fixes; `callers` lists
 calls it could not infer for a manual check):
@@ -60,6 +92,34 @@ Cost per task is −36 % on average.
 ² By default `rg` skips the hidden `.tests/` directory, so both `rg` runs missed the tests that import the class.<br>
 ³ One `rg` run found 2 of 5 anonymous implementations.</sub>
 
+**Effect on JavaScript, TypeScript, Vue** (a Vue/JS frontend of 1336 files and 4464 imports). Answers were
+checked against a reference resolver written for the purpose; before — the same command on upstream's index.
+
+| Task | Command | Time | Before | After |
+|---|---|---|---|---|
+| Rename an exported function | `impact 'file#name'` | 0.03 s | 2 of 5 places (`usages <name>`) | 4 of 4 places + the name line of a multi-line import |
+| Who imports a component | `impact 'file'` | 0.03 s | 104 short-name lines, namesakes and template tags mixed | 33 of 33 imports |
+| Dead exports in a directory | `unused-symbols --module …` | 0.03 s | 0 of 8 found; template handlers reported as dead | 8 of 8; whole frontend 137 = 137 |
+| Move a module | `move-plan file dir/` | 0.03 s | — | 11 of 11 specifiers rewritten in their own style |
+
+11 of 2704 project imports do not resolve: 5 point to missing files, 6 go through a test-runner alias — listed in
+`js_aliases`, they resolve too.
+
+**Does the agent use it** (Sonnet, tasks worded in Russian without mentioning the index; 1 run per variant):
+
+| Task | Plugin off | Plugin on |
+|---|---|---|
+| PHP: remove a DTO field | hooks off, skill on: grep | `class`, then `usages <FQN>`: $0.23 |
+| PHP: change a method signature | hooks off, skill on: the skill loaded by itself, `callers` | `class`, then `callers`: $0.20 |
+| JS: rename a composable | hooks off, skill on: grep | `usages` + `rg` on the module path: $0.15 |
+| JS: rename a component and its file | 31 of 33 files (two tests missed), $0.29 | 33 of 33, $0.30 |
+| JS: dead exports in a directory | 8 of 8, $0.28 | 8 of 8, $0.14 |
+| JS: move a module | 11 of 11, $0.16 | 11 of 11, $0.17 |
+| Bitrix core: how `HttpClient::download()` works | $0.18 | $0.19 — the core path is guessable, grep in one file is enough |
+
+Without the session-start rules the skill description alone was picked up in 1 of 3 PHP/JS tasks. Suggesting
+same-named classes for a guessed namespace cut the PHP sessions from $0.35/$0.33 to $0.23/$0.20.
+
 ## Install
 
 1. Get the binary.
@@ -87,8 +147,9 @@ Cost per task is −36 % on average.
    claude plugin install ast-index@ast-index-php
    ```
 
-   Or run `/initialize` in the project: it enables the plugin in `.claude/settings.json`, writes
-   agent rules to `.claude/rules/ast-index.md` and builds the index.
+   Or run `/initialize` in the project: it proposes `.ast-index.yaml` (excludes, hidden paths, entry
+   points, `js_aliases`, `external`) and builds the index. The usage rules come from the plugin at
+   session start — nothing is written to `CLAUDE.md` or `.claude/rules/`.
 
 3. Put `.ast-index.yaml` in the project root (example below) and build the index once:
    `ast-index rebuild`.
@@ -101,6 +162,7 @@ to reach it:
 | Files change through | Kept fresh by |
 |---|---|
 | Anything between sessions | plugin hook at session start: an incremental update; the first query waits for it |
+| A new ast-index version that extracts more (JS/TS module facts) | the index migration marks those files, the next update re-parses them once |
 | Claude's Edit/Write | plugin hook after each edit |
 | Shell commands (`git switch/pull/merge/rebase/stash`, `sed -i`, formatters, generators), your IDE | `ast-index watch`, which the session-start hook starts in the background once per project (`AST_INDEX_HOOK_WATCH=0` to opt out); `ast-index watch-status` tells whether it runs |
 
@@ -149,6 +211,16 @@ unused_ignore_names:
 # mirrored in modules): tagged [mirror] and listed last.
 duplicate_mirrors:
   - /Contracts/
+# JS/TS: specifier prefixes a bundler or test runner adds beyond tsconfig/jsconfig `paths`
+# (vite/vitest `resolve.alias`), mapped to project-relative directories.
+js_aliases:
+  "@frontend-ui/": local/frontend/src/ui/
+# Framework and vendor code, indexed past .gitignore for definitions only: class/symbol/outline/hierarchy
+# and definitions in impact/callers find it; search, usages, unused-symbols, duplicates leave it out
+# unless --external.
+external:
+  - bitrix/modules/main/lib
+  - local/vendor/symfony
 ```
 
 The rest of the tool — installation options, all commands, supported languages, IDE plugins — is documented

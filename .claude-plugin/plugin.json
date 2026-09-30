@@ -1,7 +1,7 @@
 {
   "name": "ast-index",
   "version": "3.55.1-php.1",
-  "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, PHP, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
+  "description": "Structural code index for PHP, JavaScript, TypeScript and Vue: usages, callers, refactoring impact, move plans, dead code and duplicates in one call",
   "author": {
     "name": "ZardoZAntony"
   },
