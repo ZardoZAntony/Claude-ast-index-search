@@ -138,7 +138,7 @@ fn cmd_map_summary(
     // Count files per directory
     let mut dir_file_counts: HashMap<String, i64> = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT path FROM files")?;
+        let mut stmt = conn.prepare("SELECT path FROM files WHERE external = 0")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for path in rows.flatten() {
             let dir = dir_prefix(&path, depth);
@@ -154,7 +154,7 @@ fn cmd_map_summary(
             SELECT f.path, s.kind
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.parent_id IS NULL
+            WHERE s.parent_id IS NULL AND f.external = 0
               AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
             "#,
         )?;
@@ -272,7 +272,7 @@ fn cmd_map_detailed(
         SELECT s.name, s.kind, s.line, f.path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.parent_id IS NULL
+        WHERE s.parent_id IS NULL AND f.external = 0
           AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
           AND f.path LIKE ?1
         ORDER BY f.path, s.line
@@ -282,7 +282,7 @@ fn cmd_map_detailed(
         SELECT s.name, s.kind, s.line, f.path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.parent_id IS NULL
+        WHERE s.parent_id IS NULL AND f.external = 0
           AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
         ORDER BY f.path, s.line
         "#
@@ -374,9 +374,9 @@ fn cmd_map_detailed(
     let mut dir_file_counts: HashMap<String, i64> = HashMap::new();
     {
         let fc_sql = if module_filter.is_some() {
-            "SELECT path FROM files WHERE path LIKE ?1"
+            "SELECT path FROM files WHERE external = 0 AND path LIKE ?1"
         } else {
-            "SELECT path FROM files"
+            "SELECT path FROM files WHERE external = 0"
         };
         let mut fc_stmt = conn.prepare(fc_sql)?;
         let file_rows: Vec<String> = if let Some(ref mf) = module_filter {
@@ -693,7 +693,7 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
     // C. Architecture detection from file paths
     let mut arch: Vec<String> = Vec::new();
     {
-        let mut path_stmt = conn.prepare("SELECT path FROM files LIMIT 50000")?;
+        let mut path_stmt = conn.prepare("SELECT path FROM files WHERE external = 0 LIMIT 50000")?;
         let paths: Vec<String> = path_stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())

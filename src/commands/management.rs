@@ -238,6 +238,8 @@ pub fn cmd_rebuild(
             merged_exclude.push(e.clone());
         }
     }
+    // external directories have their own walk after the project one
+    merged_exclude.extend(indexer::external_exclude_lines(root));
     let config_exclude: Option<Vec<String>> = if merged_exclude.is_empty() {
         None
     } else {
@@ -661,6 +663,14 @@ pub fn cmd_rebuild(
                         .dimmed()
                     );
                 }
+            }
+
+            let external_count = indexer::index_external_dirs(&mut conn, root, verbose)?;
+            if external_count > 0 {
+                println!(
+                    "{}",
+                    format!("Indexed {external_count} files of external directories (definitions only)").dimmed()
+                );
             }
 
             // Android-specific: XML layouts and resources
@@ -1215,7 +1225,9 @@ fn run_update_once(root: &Path, verbose: bool) -> Result<()> {
     // pull in files outside the configured scope.
     let config = indexer::load_config(root).unwrap_or_default();
     let config_include = config.include.as_deref();
-    let exclude_matcher = build_exclude_matcher(root, config.exclude.as_deref());
+    let mut update_exclude = config.exclude.clone().unwrap_or_default();
+    update_exclude.extend(indexer::external_exclude_lines(root));
+    let exclude_matcher = build_exclude_matcher(root, Some(&update_exclude));
 
     if verbose {
         if let Some(inc) = config_include {
@@ -1684,6 +1696,12 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
 
     println!("{}", "Index Statistics:".bold());
     println!("  Files:      {}", stats.file_count);
+    let external: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files WHERE external = 1", [], |r| r.get(0))
+        .unwrap_or(0);
+    if external > 0 {
+        println!("  External:   {external} files (definitions only; `external:` in .ast-index.yaml)");
+    }
     println!("  Symbols:    {}", stats.symbol_count);
     println!("  Refs:       {}", stats.refs_count);
     println!("  Modules:    {}", stats.module_count);

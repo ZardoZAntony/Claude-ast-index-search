@@ -53,6 +53,9 @@ struct DefRow {
     kind: String,
     #[serde(skip)]
     file_id: i64,
+    /// In an `external:` directory (framework core, vendor).
+    #[serde(skip)]
+    external: bool,
     #[serde(skip)]
     abs: PathBuf,
 }
@@ -155,12 +158,14 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>> {
-    let mut stmt = conn.prepare(
+    // external code keeps only its `extends`/`implements` lines: shown with --external
+    let mut stmt = conn.prepare(&format!(
         "SELECT f.path, f.root_path, r.line, r.context, r.file_id, r.ref_kind
          FROM refs r JOIN files f ON f.id = r.file_id
-         WHERE r.fqn = ?1 COLLATE NOCASE
+         WHERE r.fqn = ?1 COLLATE NOCASE{}
          ORDER BY f.path, r.line",
-    )?;
+        db::external_filter("f")
+    ))?;
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
     let mapped = stmt.query_map(params![fqn], |row| {
@@ -195,7 +200,7 @@ fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>>
 
 fn definitions(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<DefRow>> {
     let sql = format!(
-        "SELECT f.path, f.root_path, s.line, s.kind, s.file_id
+        "SELECT f.path, f.root_path, s.line, s.kind, s.file_id, f.external
          FROM symbols s JOIN files f ON f.id = s.file_id
          WHERE s.qualified_name = ?1 COLLATE NOCASE AND s.kind IN {CLASS_KINDS}
          ORDER BY f.path"
@@ -209,18 +214,20 @@ fn definitions(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<DefRow>>
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .map(|(path, root_path, line, kind, file_id)| {
+        .map(|(path, root_path, line, kind, file_id, external)| {
             let (shown, abs) = locate(root, root_path.as_deref().unwrap_or(""), &path);
             DefRow {
                 path: shown,
                 line,
                 kind,
                 file_id,
+                external: external != 0,
                 abs,
             }
         })
@@ -863,7 +870,7 @@ pub fn cmd_duplicates(
     let sql = format!(
         "SELECT s.name, s.qualified_name, s.line, f.path, f.root_path
          FROM symbols s JOIN files f ON f.id = s.file_id
-         WHERE s.qualified_name IS NOT NULL AND s.kind IN {CLASS_KINDS}
+         WHERE s.qualified_name IS NOT NULL AND s.kind IN {CLASS_KINDS} AND f.external = 0
            AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')
            AND (?1 IS NULL OR f.path LIKE ?1 || '%')"
     );
@@ -1157,11 +1164,17 @@ pub fn cmd_implementations_fqn(root: &Path, fqn: &str, limit: usize, format: &st
     let root_lower: HashSet<String> = roots.iter().map(|r| r.to_ascii_lowercase()).collect();
     let mut items = Vec::new();
     let mut seen = HashSet::new();
+    // subtypes are followed through external classes; external ones themselves are shown with --external
+    let mut external_hidden = 0;
     for sub in with_subtypes(&conn, &roots)? {
         if root_lower.contains(&sub.to_ascii_lowercase()) {
             continue;
         }
         for d in definitions(&conn, root, &sub)? {
+            if d.external && db::external_hidden() {
+                external_hidden += 1;
+                continue;
+            }
             if seen.insert((d.path.clone(), d.line)) {
                 items.push(
                     serde_json::json!({"fqn": sub, "kind": d.kind, "path": d.path, "line": d.line}),
@@ -1174,6 +1187,7 @@ pub fn cmd_implementations_fqn(root: &Path, fqn: &str, limit: usize, format: &st
     if format == "json" {
         return print_json(&serde_json::json!({
             "items": items,
+            "external_hidden": external_hidden,
             "pagination": {"total": total, "returned": items.len(), "truncated": total > items.len(), "limit": limit},
         }));
     }
@@ -1186,6 +1200,9 @@ pub fn cmd_implementations_fqn(root: &Path, fqn: &str, limit: usize, format: &st
         )
         .bold()
     );
+    if external_hidden > 0 {
+        println!("  {} {external_hidden} more in external code (--external)", "note:".yellow());
+    }
     for i in &items {
         println!(
             "  {} [{}]: {}:{}",

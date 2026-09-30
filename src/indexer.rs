@@ -229,6 +229,11 @@ pub struct ProjectConfig {
     /// Module specifier prefixes → directories (project-relative), for aliases a bundler or test runner
     /// config adds beyond tsconfig/jsconfig `paths` (`"@frontend-ui/": "local/frontend/src/ui/"`).
     pub js_aliases: Option<std::collections::BTreeMap<String, String>>,
+    /// Code the project uses but does not own (framework core, vendor packages), project-relative directories.
+    /// Indexed even when gitignored, for finding definitions (`class`, `symbol`, `outline`, `hierarchy`,
+    /// definitions in `impact`/`callers`); kept out of `search`, `usages`, `unused-symbols`, `duplicates` unless
+    /// `--external`. Only symbols and inheritance are stored for them, not references.
+    pub external: Option<Vec<String>>,
 }
 
 /// Locate the project config: `.ast-index.yaml` or `.ast-index.yml` in the given root.
@@ -1247,6 +1252,8 @@ struct ParsedFile {
     ref_fqns: Vec<Option<(String, &'static str)>>,
     /// Imports, exports and uses of imported names (JS/TS/Vue).
     js_module: Option<parsers::treesitter::js_modules::JsModule>,
+    /// Under an `external:` directory of the project config.
+    external: bool,
 }
 
 /// File scheduled by incremental update.
@@ -1254,6 +1261,7 @@ enum PendingUpdateFile {
     Regular {
         root: PathBuf,
         path: PathBuf,
+        external: bool,
     },
     NodeModulesDts {
         path: PathBuf,
@@ -1302,7 +1310,7 @@ fn is_minified_web_asset(file_type: parsers::FileType, content: &str) -> bool {
 }
 
 /// Parse a single file without DB access (thread-safe)
-fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
+fn parse_file(root: &Path, file_path: &Path, external: bool) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
     // Nanoseconds, not seconds: `update` re-parses only when mtime or size differ, so with
     // second precision an equal-size edit made within the second of the last indexing was lost.
@@ -1334,6 +1342,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
             refs: vec![],
             ref_fqns: vec![],
             js_module: None,
+            external,
         });
     }
 
@@ -1358,6 +1367,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 refs: vec![],
                 ref_fqns: vec![],
                 js_module: None,
+                external,
             });
         }
     };
@@ -1370,16 +1380,28 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     }
 
     let js_module = match file_type {
+        _ if external => None,
         parsers::FileType::TypeScript => Some(parsers::treesitter::js_modules::extract(&content, false)),
         parsers::FileType::Vue => Some(parsers::treesitter::js_modules::extract(&content, true)),
         _ => None,
     };
 
+    let mut refs = refs;
     let mut ref_fqns = Vec::new();
     if file_type == parsers::FileType::Php {
         let names = parsers::php_names::resolve(&content, &symbols, &refs);
         qualified_names = names.qualified;
         ref_fqns = names.refs;
+    }
+    if external {
+        // External code keeps only what resolving its classes' parents needs (`extends`, `implements`,
+        // trait `use` on the declaration lines); its own references would flood usages of framework classes.
+        let kept: Vec<(ParsedRef, Option<(String, &'static str)>)> = refs
+            .into_iter()
+            .zip(ref_fqns.into_iter().chain(std::iter::repeat(None)))
+            .filter(|(_, fqn)| matches!(fqn, Some((_, "inheritance" | "trait-use"))))
+            .collect();
+        (refs, ref_fqns) = kept.into_iter().unzip();
     }
 
     // BSL (1C:Enterprise) — module names are encoded in directory structure,
@@ -1428,6 +1450,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         refs,
         ref_fqns,
         js_module,
+        external,
     })
 }
 
@@ -2233,7 +2256,7 @@ fn index_directory_scoped_with_max_depth(
             chunk
                 .par_iter()
                 .filter_map(|path| {
-                    let result = parse_file(&root_clone, path).ok();
+                    let result = parse_file(&root_clone, path, false).ok();
                     let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 2000 == 0 {
                         eprintln!("Parsed {} / {} files...", c, total);
@@ -2299,10 +2322,10 @@ fn write_batch_to_db(
     {
         let file_sql = match mode {
             WriteMode::FreshRebuild => {
-                "INSERT INTO files (path, root_path, mtime, size) VALUES (?1, ?2, ?3, ?4)"
+                "INSERT INTO files (path, root_path, mtime, size, external) VALUES (?1, ?2, ?3, ?4, ?5)"
             }
             WriteMode::ReplaceExisting => {
-                "INSERT OR REPLACE INTO files (path, root_path, mtime, size) VALUES (?1, ?2, ?3, ?4)"
+                "INSERT OR REPLACE INTO files (path, root_path, mtime, size, external) VALUES (?1, ?2, ?3, ?4, ?5)"
             }
         };
         let mut file_stmt = tx.prepare_cached(file_sql)?;
@@ -2337,9 +2360,10 @@ fn write_batch_to_db(
                 refs,
                 ref_fqns,
                 js_module,
+                external,
             } = pf;
 
-            file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
+            file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size, external as i64])?;
             let file_id = tx.last_insert_rowid();
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
@@ -2416,6 +2440,102 @@ fn write_batch_to_db(
     Ok(())
 }
 
+/// `external:` directories of the project config, project-relative, without surrounding slashes.
+pub fn external_dirs(root: &Path) -> Vec<String> {
+    load_config_quiet(root)
+        .and_then(|c| c.external)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.trim().trim_matches('/').to_string())
+        .filter(|d| !d.is_empty() && !d.split('/').any(|part| part == ".."))
+        .collect()
+}
+
+/// Exclude lines keeping the project walk out of external directories — they are walked on their own.
+pub fn external_exclude_lines(root: &Path) -> Vec<String> {
+    external_dirs(root).into_iter().map(|d| format!("/{d}/")).collect()
+}
+
+fn file_stamp(path: &Path) -> (i64, i64) {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| {
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            (mtime, metadata.len() as i64)
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Source files of the external directories: absolute path and path relative to the project root. The walk
+/// ignores .gitignore and the project's `exclude` (framework cores and vendor are usually both).
+fn collect_external_files(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for dir in external_dirs(root) {
+        let walk_dir = root.join(&dir);
+        if !walk_dir.is_dir() {
+            continue;
+        }
+        let walker = ignore::WalkBuilder::new(&walk_dir)
+            .hidden(true)
+            .git_ignore(false)
+            .git_exclude(false)
+            .git_global(false)
+            .ignore(false)
+            .parents(false)
+            .filter_entry(|entry| !is_excluded_dir(entry))
+            .build();
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let supported = entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(parsers::is_supported_extension);
+            if !supported {
+                continue;
+            }
+            let path = entry.path().to_path_buf();
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+            out.push((path, rel));
+        }
+    }
+    out
+}
+
+/// Index the external directories after a rebuild (the project walk skips them).
+pub fn index_external_dirs(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+    let files = collect_external_files(root);
+    if files.is_empty() {
+        return Ok(0);
+    }
+    if progress {
+        eprintln!("Indexing {} files of external directories...", files.len());
+    }
+    let parsed: Vec<ParsedFile> = files
+        .par_iter()
+        .filter_map(|(path, _)| parse_file(root, path, true).ok())
+        .collect();
+    let mut total = 0;
+    let mut batch = Vec::new();
+    for pf in parsed {
+        batch.push(pf);
+        if batch.len() >= 500 {
+            write_batch_to_db(conn, std::mem::take(&mut batch), &mut total, WriteMode::ReplaceExisting)?;
+        }
+    }
+    if !batch.is_empty() {
+        write_batch_to_db(conn, batch, &mut total, WriteMode::ReplaceExisting)?;
+    }
+    Ok(total)
+}
+
 /// Incremental update: only re-index changed/new files, delete removed files.
 ///
 /// Walks the primary root AND every extra_root registered in metadata. Each
@@ -2445,8 +2565,10 @@ pub fn update_directory_incremental(
 
     // 1. Load existing files from DB with their mtime and size.
     let mut existing_files: HashMap<(String, String), (i64, i64, i64)> = HashMap::new(); // (root_path, path) -> (file_id, mtime, size)
+    // files stored as external: one walked the other way now is re-parsed
+    let mut external_files: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     {
-        let mut stmt = conn.prepare("SELECT id, root_path, path, mtime, size FROM files")?;
+        let mut stmt = conn.prepare("SELECT id, root_path, path, mtime, size, external FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -2454,10 +2576,14 @@ pub fn update_directory_incremental(
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?;
         for row in rows {
-            let (id, root_path, path, mtime, size) = row?;
+            let (id, root_path, path, mtime, size, external) = row?;
+            if external != 0 {
+                external_files.insert((root_path.clone(), path.clone()));
+            }
             existing_files.insert((root_path, path), (id, mtime, size));
         }
     }
@@ -2577,8 +2703,11 @@ pub fn update_directory_incremental(
                 })
                 .unwrap_or((0, 0));
 
-            let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
-                Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
+            let key = (root_key.clone(), rel_path.clone());
+            let need_parse = match existing_files.get(&key) {
+                Some((_, db_mtime, db_size)) => {
+                    file_mtime != *db_mtime || file_size != *db_size || external_files.contains(&key)
+                }
                 None => true,
             };
 
@@ -2586,10 +2715,32 @@ pub fn update_directory_incremental(
                 files_to_parse.push(PendingUpdateFile::Regular {
                     root: anchor.clone(),
                     path: file_path,
+                    external: false,
                 });
             }
             current_paths.insert((root_key, rel_path));
         }
+    }
+
+    // External directories (`external:` in .ast-index.yaml): their own walk past .gitignore and `exclude`.
+    let root_key = db::normalize_root_for_storage(root);
+    for (file_path, rel_path) in collect_external_files(root) {
+        let key = (root_key.clone(), rel_path.clone());
+        let need_parse = match existing_files.get(&key) {
+            Some((_, db_mtime, db_size)) => {
+                let (mtime, size) = file_stamp(&file_path);
+                mtime != *db_mtime || size != *db_size || !external_files.contains(&key)
+            }
+            None => true,
+        };
+        if need_parse {
+            files_to_parse.push(PendingUpdateFile::Regular {
+                root: root.to_path_buf(),
+                path: file_path,
+                external: true,
+            });
+        }
+        current_paths.insert(key);
     }
 
     let root_key = db::normalize_root_for_storage(root);
@@ -2682,7 +2833,11 @@ pub fn update_directory_incremental(
                 .par_iter()
                 .filter_map(|pending| {
                     let result = match pending {
-                        PendingUpdateFile::Regular { root, path } => parse_file(root, path),
+                        PendingUpdateFile::Regular {
+                            root,
+                            path,
+                            external,
+                        } => parse_file(root, path, *external),
                         PendingUpdateFile::NodeModulesDts {
                             path,
                             rel_path,
@@ -5051,6 +5206,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
             refs: vec![],
             ref_fqns: vec![],
             js_module: None,
+            external: false,
         });
     }
 
@@ -5067,6 +5223,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         refs,
         ref_fqns: vec![],
         js_module: None,
+        external: false,
     })
 }
 
@@ -5254,7 +5411,7 @@ no_ignore: true
         let content = "a".repeat(1_100_000);
         fs::write(&large_file, &content).unwrap();
 
-        let result = parse_file(dir.path(), &large_file).unwrap();
+        let result = parse_file(dir.path(), &large_file, false).unwrap();
         assert!(result.symbols.is_empty(), "should skip large files");
         assert!(result.refs.is_empty());
     }
@@ -5265,7 +5422,7 @@ no_ignore: true
         let kt_file = dir.path().join("Test.kt");
         fs::write(&kt_file, "class TestClass {\n    fun doSomething() {}\n}\n").unwrap();
 
-        let result = parse_file(dir.path(), &kt_file).unwrap();
+        let result = parse_file(dir.path(), &kt_file, false).unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "TestClass"));
         assert!(result.symbols.iter().any(|s| s.name == "doSomething"));
     }
@@ -5280,7 +5437,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &swift_file).unwrap();
+        let result = parse_file(dir.path(), &swift_file, false).unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "MyView"));
         assert!(result.symbols.iter().any(|s| s.name == "setup"));
     }
@@ -5295,7 +5452,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &py_file).unwrap();
+        let result = parse_file(dir.path(), &py_file, false).unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "Service"));
         assert!(result.symbols.iter().any(|s| s.name == "process"));
     }

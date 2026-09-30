@@ -130,6 +130,11 @@ struct Cli {
     /// subtrees for this run). Conflicts with `--subtree`.
     #[arg(long, global = true)]
     local: bool,
+
+    /// Include external directories (`external:` in .ast-index.yaml — framework core, vendor packages) in
+    /// search, usages, implementations and the like. class, symbol, file and hierarchy include them anyway.
+    #[arg(long, global = true)]
+    external: bool,
 }
 
 #[derive(Subcommand)]
@@ -952,6 +957,21 @@ fn main() -> Result<()> {
         None
     };
     let dir_prefix_ref = dir_prefix.as_deref();
+
+    // External code: its definitions are found by class/symbol/file/hierarchy, other commands leave it out
+    // unless --external.
+    if cli.external {
+        std::env::set_var("AST_INDEX_EXTERNAL", "1");
+    }
+    if !ast_index::indexer::external_dirs(&root).is_empty() {
+        std::env::set_var("AST_INDEX_HAS_EXTERNAL", "1");
+        if matches!(
+            cli.command,
+            Commands::Class { .. } | Commands::Symbol { .. } | Commands::File { .. } | Commands::Hierarchy { .. }
+        ) {
+            std::env::set_var("AST_INDEX_EXTERNAL", "1");
+        }
+    }
 
     match cli.command {
         // Grep commands

@@ -431,6 +431,12 @@ where
 
     let first = roots.first().map(PathBuf::as_path).unwrap_or(root);
     let hidden = crate::indexer::HiddenPolicy::for_root(root);
+    // external directories are indexed for their definitions only; grep leaves them out unless --external
+    let external: Vec<PathBuf> = if crate::db::external_hidden() {
+        crate::indexer::external_dirs(root).iter().map(|d| root.join(d)).collect()
+    } else {
+        Vec::new()
+    };
     let mut wb = WalkBuilder::new(first);
     for extra in roots.iter().skip(1) {
         wb.add(extra);
@@ -438,7 +444,11 @@ where
     wb.hidden(hidden.skips_all_hidden())
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(move |entry| hidden.allows(entry) && !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| {
+            hidden.allows(entry)
+                && !crate::indexer::is_excluded_dir(entry)
+                && !external.iter().any(|dir| entry.path().starts_with(dir))
+        })
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
@@ -586,11 +596,21 @@ where
     };
 
     let hidden = crate::indexer::HiddenPolicy::for_root(root);
+    // external directories are indexed for their definitions only; grep leaves them out unless --external
+    let external: Vec<PathBuf> = if crate::db::external_hidden() {
+        crate::indexer::external_dirs(root).iter().map(|d| root.join(d)).collect()
+    } else {
+        Vec::new()
+    };
     let mut wb = WalkBuilder::new(root);
     wb.hidden(hidden.skips_all_hidden())
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(move |entry| hidden.allows(entry) && !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| {
+            hidden.allows(entry)
+                && !crate::indexer::is_excluded_dir(entry)
+                && !external.iter().any(|dir| entry.path().starts_with(dir))
+        })
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");

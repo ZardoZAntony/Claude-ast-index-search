@@ -506,7 +506,7 @@ struct Project {
 impl Project {
     fn load(conn: &Connection, root: &Path) -> Result<Self> {
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, path, root_path FROM files WHERE {} ORDER BY path",
+            "SELECT id, path, root_path FROM files WHERE {} AND external = 0 ORDER BY path",
             db::JS_MODULE_PATH_SQL
         ))?;
         let rows = stmt

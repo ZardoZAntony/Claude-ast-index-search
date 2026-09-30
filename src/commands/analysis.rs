@@ -48,7 +48,7 @@ pub fn cmd_unused_symbols(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE f.path LIKE ?1
+            WHERE f.external = 0 AND f.path LIKE ?1
               AND s.kind IN ('class', 'interface', 'trait', 'function', 'object', 'enum', 'protocol', 'struct')
               AND s.name GLOB '[A-Z]*'
             ORDER BY f.path, s.line
@@ -58,7 +58,7 @@ pub fn cmd_unused_symbols(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE f.path LIKE ?1
+            WHERE f.external = 0 AND f.path LIKE ?1
               AND s.kind IN ('class', 'interface', 'trait', 'function', 'object', 'enum', 'protocol', 'struct')
             ORDER BY f.path, s.line
             "#
@@ -70,7 +70,7 @@ pub fn cmd_unused_symbols(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.kind IN ('class', 'interface', 'trait', 'function', 'object', 'enum', 'protocol', 'struct')
+            WHERE f.external = 0 AND s.kind IN ('class', 'interface', 'trait', 'function', 'object', 'enum', 'protocol', 'struct')
               AND s.name GLOB '[A-Z]*'
             ORDER BY f.path, s.line
             "#,
@@ -82,7 +82,7 @@ pub fn cmd_unused_symbols(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.kind IN ('class', 'interface', 'trait', 'function', 'object', 'enum', 'protocol', 'struct')
+            WHERE f.external = 0 AND s.kind IN ('class', 'interface', 'trait', 'function', 'object', 'enum', 'protocol', 'struct')
             ORDER BY f.path, s.line
             "#,
             None,

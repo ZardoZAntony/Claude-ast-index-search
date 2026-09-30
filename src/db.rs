@@ -4073,6 +4073,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
             path TEXT NOT NULL,
             root_path TEXT NOT NULL DEFAULT '',
             mtime INTEGER NOT NULL,
+            external INTEGER NOT NULL DEFAULT 0,
             size INTEGER NOT NULL,
             UNIQUE(root_path, path)
         );
@@ -4566,6 +4567,7 @@ fn inspect_open_migrations(
     let symbols_current = !symbols_exists || column_exists(conn, "symbols", "qualified_name")?;
     let refs_current = !table_exists(conn, "refs")?
         || (column_exists(conn, "refs", "fqn")? && column_exists(conn, "refs", "ref_kind")?);
+    let files_external_current = !files_exists || column_exists(conn, "files", "external")?;
     let js_modules_current = !files_exists
         || (table_exists(conn, "js_imports")?
             && metadata_exists
@@ -4623,6 +4625,7 @@ fn inspect_open_migrations(
             || !symbols_current
             || !refs_current
             || !js_modules_current
+            || !files_external_current
             || stored_root.as_deref() != Some(normalized_root)
             || has_legacy_extra_roots,
         optional_indexes,
@@ -4702,6 +4705,10 @@ fn apply_open_migrations_transaction(
     }
     if rebuild_files {
         rebuild_legacy_files_table(&tx)?;
+    }
+    if table_exists(&tx, "files")? && !column_exists(&tx, "files", "external")? {
+        tx.execute("ALTER TABLE files ADD COLUMN external INTEGER NOT NULL DEFAULT 0", [])
+            .context("failed to add files.external")?;
     }
 
     if table_exists(&tx, "symbols")? {
@@ -5605,7 +5612,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
             )
         };
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&external_where(sql))?;
         return Ok(stmt
             .query_map(params![value, limit as i64], row_to_search_result)?
             .collect::<Result<Vec<_>, _>>()?);
@@ -5613,16 +5620,14 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 
     let escaped_query = escape_fts5_query(query);
 
-    let mut stmt = conn.prepare(
-        r#"
+    let mut stmt = conn.prepare(&external_where(r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
         WHERE symbols_fts MATCH ?1
         LIMIT ?2
-        "#,
-    )?;
+        "#))?;
 
     let results = stmt
         .query_map(params![escaped_query, limit as i64], row_to_search_result)?
@@ -6530,20 +6535,26 @@ pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     // Inner ORDER BY (file_id, line) is free because idx_refs_name_file_line
     // has exactly this sort order. Outer ORDER BY f.path reshuffles the tiny
     // result set (bounded by LIMIT) so output is stable for users.
-    let mut stmt = conn.prepare(
+    // external code keeps only `extends`/`implements` lines; filtered before the LIMIT
+    let external = if external_hidden() {
+        " AND file_id NOT IN (SELECT id FROM files WHERE external = 1)"
+    } else {
+        ""
+    };
+    let mut stmt = conn.prepare(&format!(
         r#"
         SELECT r.name, r.line, r.context, f.path, f.root_path
         FROM (
             SELECT name, file_id, line, context
             FROM refs
-            WHERE name = ?1
+            WHERE name = ?1{external}
             ORDER BY file_id, line
             LIMIT ?2
         ) r
         JOIN files f ON f.id = r.file_id
         ORDER BY f.path, r.line
-        "#,
-    )?;
+        "#
+    ))?;
 
     let results = stmt
         .query_map(params![name, limit as i64], row_to_ref_result)?
@@ -6929,8 +6940,7 @@ pub fn search_symbols_fuzzy(
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
     if query.contains("::") {
-        let mut stmt = conn.prepare(
-            r#"
+        let mut stmt = conn.prepare(&external_where(r#"
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
@@ -6941,8 +6951,7 @@ pub fn search_symbols_fuzzy(
                      ELSE 2 END,
                 length(s.qualified_name)
             LIMIT ?4
-            "#,
-        )?;
+            "#))?;
         let exact = if query.starts_with("::") {
             format!("%{}", query)
         } else {
@@ -6969,8 +6978,7 @@ pub fn search_symbols_fuzzy(
     // Single query: contains match with ranking by relevance
     // exact match (name = query) first, then prefix, then contains — sorted by length
     let contains_pattern = format!("%{}%", query);
-    let mut stmt = conn.prepare(
-        r#"
+    let mut stmt = conn.prepare(&external_where(r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
@@ -6981,8 +6989,7 @@ pub fn search_symbols_fuzzy(
                  ELSE 2 END,
             length(s.name)
         LIMIT ?4
-        "#,
-    )?;
+        "#))?;
     let prefix_pattern = format!("{}%", query);
     let results: Vec<SearchResult> = stmt
         .query_map(
@@ -7002,6 +7009,32 @@ pub struct SearchScope<'a> {
     pub dir_prefix: Option<&'a str>,
 }
 
+/// Whether queries leave out files of `external:` directories: the project has some and neither `--external`
+/// nor a command that looks for definitions asked for them.
+pub fn external_hidden() -> bool {
+    std::env::var_os("AST_INDEX_HAS_EXTERNAL").is_some() && std::env::var_os("AST_INDEX_EXTERNAL").is_none()
+}
+
+/// `sql` with `f.external = 0 AND` after its first `WHERE` when external files are hidden.
+fn external_where(sql: &str) -> String {
+    if !external_hidden() {
+        return sql.to_string();
+    }
+    match sql.find("WHERE ") {
+        Some(at) => format!("{}WHERE f.external = 0 AND {}", &sql[..at], &sql[at + 6..]),
+        None => sql.to_string(),
+    }
+}
+
+/// ` AND <alias>.external = 0` when external files are hidden, else empty.
+pub fn external_filter(alias: &str) -> String {
+    if external_hidden() {
+        format!(" AND {alias}.external = 0")
+    } else {
+        String::new()
+    }
+}
+
 impl<'a> SearchScope<'a> {
     pub fn none() -> Self {
         SearchScope {
@@ -7017,6 +7050,7 @@ impl<'a> SearchScope<'a> {
             && self.dir_prefix.is_none()
             && std::env::var_os("AST_INDEX_LOCAL_SCOPE").is_none()
             && std::env::var_os("AST_INDEX_SUBTREE").is_none()
+            && !external_hidden()
     }
 
     pub fn matches_path(&self, path: &str) -> bool {
@@ -7045,6 +7079,10 @@ impl<'a> SearchScope<'a> {
         if let Some(module) = self.module {
             conditions.push("f.path LIKE ?".to_string());
             params.push(format!("{}%", module));
+        }
+        // an explicit path inside an external directory asks for it
+        if external_hidden() && self.dir_prefix.is_none() && self.in_file.is_none() && self.module.is_none() {
+            conditions.push("f.external = 0".to_string());
         }
         if std::env::var_os("AST_INDEX_LOCAL_SCOPE").is_some() {
             conditions.push(
