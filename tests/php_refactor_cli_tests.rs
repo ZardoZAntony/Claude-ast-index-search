@@ -752,3 +752,42 @@ fn closing_tag_in_a_template_comment_keeps_html_out_of_code() {
     );
     assert_eq!(v["summary"]["references"], 0, "{v}");
 }
+
+fn run_failing(cwd: &Path, cache: &Path, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(cwd)
+        .args(args)
+        .env("AST_INDEX_CACHE_DIR", cache)
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("AST_INDEX_DB_PATH")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{args:?} should fail");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// A guessed namespace gets the classes of the same short name instead of an empty answer.
+#[test]
+fn unknown_fqn_suggests_classes_of_the_same_name() {
+    let (tmp, cache) = project();
+    let root = tmp.path();
+    let expected = ["App\\Mobile\\OrderDto", "App\\Order\\OrderDto"];
+
+    let usages = run(root, cache.path(), &["usages", "App\\Wrong\\OrderDto", "--format", "json"]);
+    assert_eq!(usages["did_you_mean"], serde_json::json!(expected));
+    let text = run_text(root, cache.path(), &["usages", "App\\Wrong\\OrderDto"]);
+    assert!(text.contains("classes named OrderDto: App\\Mobile\\OrderDto, App\\Order\\OrderDto"), "{text}");
+
+    let impact = run(root, cache.path(), &["impact", "App\\Wrong\\OrderDto", "--format", "json"]);
+    assert_eq!(impact["did_you_mean"], serde_json::json!(expected));
+
+    let callers = run_failing(root, cache.path(), &["callers", "App\\Wrong\\OrderInvalidator::invalidate"]);
+    assert!(callers.contains("classes named OrderInvalidator: App\\Cache\\OrderInvalidator"), "{callers}");
+    let moved = run_failing(root, cache.path(), &["move-plan", "App\\Wrong\\Helper", "App\\Util"]);
+    assert!(moved.contains("classes named Helper: App\\Order\\Helper"), "{moved}");
+
+    // a known FQN keeps the plain answer
+    let known = run(root, cache.path(), &["usages", "App\\Order\\OrderDto", "--format", "json"]);
+    assert_eq!(known["did_you_mean"], serde_json::json!([]));
+}

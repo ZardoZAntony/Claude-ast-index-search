@@ -92,6 +92,36 @@ fn namespace_of(fqn: &str) -> &str {
     fqn.rsplit_once('\\').map(|(ns, _)| ns).unwrap_or("")
 }
 
+/// Classes with the short name of an FQN that is not in the index: an agent that guessed the namespace
+/// gets the right FQN instead of an empty answer.
+fn namesakes(conn: &Connection, fqn: &str) -> Vec<String> {
+    let sql = format!(
+        "SELECT DISTINCT qualified_name FROM symbols
+         WHERE name = ?1 COLLATE NOCASE AND qualified_name IS NOT NULL AND kind IN {CLASS_KINDS}
+         ORDER BY qualified_name"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return Vec::new();
+    };
+    stmt.query_map(params![short_name(fqn)], |row| row.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).filter(|q| !q.eq_ignore_ascii_case(fqn)).collect())
+        .unwrap_or_default()
+}
+
+/// "X is not defined in the index", with the classes of the same short name when there are any.
+fn not_defined(conn: &Connection, what: &str, fqn: &str) -> String {
+    let same = namesakes(conn, fqn);
+    if same.is_empty() {
+        format!("{what}{fqn} is not defined in the index")
+    } else {
+        format!(
+            "{what}{fqn} is not defined in the index; classes named {}: {}",
+            short_name(fqn),
+            same.join(", ")
+        )
+    }
+}
+
 /// Path for output (relative to the project root when inside it) and the absolute path.
 fn locate(root: &Path, root_path: &str, path: &str) -> (String, PathBuf) {
     let base = if root_path.is_empty() {
@@ -311,11 +341,14 @@ pub fn cmd_usages_fqn(root: &Path, fqn: &str, limit: usize, format: &str) -> Res
     let refs = refs_by_fqn(&conn, root, &fqn)?;
     let total = refs.len();
     let shown: Vec<&RefRow> = refs.iter().take(limit).collect();
+    let unknown = refs.is_empty() && definitions(&conn, root, &fqn)?.is_empty();
+    let did_you_mean = if unknown { namesakes(&conn, &fqn) } else { Vec::new() };
 
     if format == "json" {
         return print_json(&serde_json::json!({
             "fqn": fqn,
             "items": shown,
+            "did_you_mean": did_you_mean,
             "pagination": {"total": total, "returned": shown.len(), "truncated": total > shown.len(), "limit": limit},
         }));
     }
@@ -323,6 +356,9 @@ pub fn cmd_usages_fqn(root: &Path, fqn: &str, limit: usize, format: &str) -> Res
         "{}",
         format!("Usages of {fqn} (showing {} of {total}):", shown.len()).bold()
     );
+    if unknown {
+        println!("  {}", not_defined(&conn, "", &fqn));
+    }
     for r in &shown {
         println!(
             "  {}:{}  {}",
@@ -390,10 +426,17 @@ pub fn cmd_impact(root: &Path, fqn: &str, full: bool, format: &str) -> Result<()
     let files: HashSet<&str> = refs.iter().map(|r| r.path.as_str()).collect();
     let tests = refs.iter().filter(|r| r.test).count();
 
+    let did_you_mean = if defs.is_empty() && refs.is_empty() {
+        namesakes(&conn, &fqn)
+    } else {
+        Vec::new()
+    };
+
     if format == "json" {
         return print_json(&serde_json::json!({
             "fqn": fqn,
             "definitions": defs,
+            "did_you_mean": did_you_mean,
             "references": refs,
             "summary": {"references": refs.len(), "files": files.len(), "tests": tests, "by_kind": by_kind},
             "config_mentions": config,
@@ -404,6 +447,14 @@ pub fn cmd_impact(root: &Path, fqn: &str, full: bool, format: &str) -> Result<()
     println!("{}", format!("Impact of {fqn}").bold());
     if defs.is_empty() {
         println!("  definition: not found in the index");
+    }
+    if !did_you_mean.is_empty() {
+        println!(
+            "  {} classes named {}: {}",
+            "did you mean:".yellow(),
+            short_name(&fqn),
+            did_you_mean.join(", ")
+        );
     }
     for d in &defs {
         println!("  definition: {}:{} ({})", d.path.cyan(), d.line, d.kind);
@@ -508,7 +559,7 @@ pub fn cmd_move_plan(root: &Path, fqn: &str, new_namespace: &str, format: &str) 
 
     let defs = definitions(&conn, root, &fqn)?;
     let Some(def) = defs.first() else {
-        bail!("{fqn} is not defined in the index");
+        bail!("{}", not_defined(&conn, "", &fqn));
     };
     let mut warnings = Vec::new();
     if defs.len() > 1 {
@@ -1098,9 +1149,10 @@ fn dice(a: &HashMap<String, usize>, b: &HashMap<String, usize>) -> f64 {
 pub fn cmd_implementations_fqn(root: &Path, fqn: &str, limit: usize, format: &str) -> Result<()> {
     let _lease = db::acquire_project_lease(root)?;
     let conn = open(root)?;
-    let roots = type_fqns(&conn, &normalize_fqn(fqn))?;
+    let fqn = normalize_fqn(fqn);
+    let roots = type_fqns(&conn, &fqn)?;
     if roots.is_empty() {
-        bail!("type {fqn} is not defined in the index");
+        bail!("{}", not_defined(&conn, "type ", &fqn));
     }
     let root_lower: HashSet<String> = roots.iter().map(|r| r.to_ascii_lowercase()).collect();
     let mut items = Vec::new();
@@ -1183,7 +1235,7 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
 
     let roots = type_fqns(&conn, &type_part)?;
     if roots.is_empty() {
-        bail!("type {type_part} is not defined in the index");
+        bail!("{}", not_defined(&conn, "type ", &type_part));
     }
     let types = with_subtypes(&conn, &roots)?;
     let types_lower: HashSet<String> = types.iter().map(|t| t.to_ascii_lowercase()).collect();
