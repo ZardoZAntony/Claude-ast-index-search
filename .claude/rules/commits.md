@@ -61,20 +61,19 @@ cut a new patch version — never move the tag.
 
 ## Committing a fix and a release together
 
-**Always two commits.**
+**Always two steps.**
 
 ```bash
-# 1. Write the fix and its README changelog entry.
-git add src/… README.md
+# 1. The fix, committed on its own.
+git add src/…
 git commit -m "Fix X when Y"
 
-# 2. Bump version on a clean tree.
-./scripts/bump.sh 3.38.1          # creates the "Bump to v3.38.1" commit + tag
+# 2. Release on a clean tree.
+scripts/bump.sh 3.55.1-php.3 --notes notes.md   # commit "Bump to v…", tag, push, GitHub release
 ```
 
-The bump script uses `git add -A` internally and commits the version files
-itself; if your fix is still unstaged, it gets silently absorbed into the
-bump commit. Don't let that happen.
+`bump.sh` refuses a dirty tree and stages only the version files, so a fix is never absorbed into the bump
+commit. See `release.md`.
 
 ## Never commit without being asked
 

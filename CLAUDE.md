@@ -70,9 +70,10 @@ PR is welcome but not enforced by CI yet.
 4. **stderr vs stdout.** Query results, help text, JSON payloads → stdout.
    Diagnostics, progress, timings, warnings → stderr. MCP captures stdout
    only; polluting stdout with progress breaks the MCP contract.
-5. **Version bumps go through `./scripts/bump.sh X.Y.Z`.** It updates 12
-   files (Cargo.toml, README title+changelog, 3 plugin JSONs, 6 npm
-   package.jsons, marketplace.json). Hand-edits drift.
+5. **Releases go through `scripts/bump.sh X.Y.Z-php.N`.** It sets the version
+   in Cargo.toml and the plugin manifests, builds and tests, commits, tags,
+   pushes to the branch's upstream and publishes the GitHub release with the
+   Linux x86_64 binary (`.claude/rules/release.md`). Hand-edits drift.
 
 ## Code style (the short version)
 
