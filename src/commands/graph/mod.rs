@@ -478,6 +478,7 @@ pub fn resolved_dependents_of(
                     qualified_name: None,
                     kind: info.kind.clone(),
                     line: info.line,
+                    end_line: None,
                     signature: None,
                     path: info.path.clone(),
                     root_path: info.root_path.clone(),

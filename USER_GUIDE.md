@@ -455,13 +455,16 @@ permissions to your own policy.
 ```bash
 ast-index search "Payment"              # broad search across files and symbols
 ast-index search "Payment" --rank risky # re-rank by history + graph (proven|hotspots|risky|central)
+ast-index search "Payment" --with-content  # include matched symbol bodies
 ast-index file "PaymentView"            # find files by name
 ast-index symbol "PaymentRepository"    # find a symbol
+ast-index symbol "PaymentRepository" --with-content  # include its source body
 ast-index class "BaseController"        # find class-like definitions
 ast-index usages "PaymentRepository"    # find references
 ast-index refs "PaymentRepository"      # definitions + imports + usages
 ast-index callers "processPayment"      # find call sites
-ast-index implementations "Repository"  # find implementations
+ast-index implementations "Repository"                 # find implementations
+ast-index implementations "Repository" --with-content  # include implementation bodies
 ast-index hierarchy "BaseController"    # inheritance tree
 ast-index outline src/main.rs           # file structure
 ast-index imports src/main.rs           # imports/includes
@@ -499,8 +502,11 @@ ast-index --format json search "Payment"
 
 Paginated search commands use JSON schema v2. Single-result-set commands return
 `items` plus `pagination { total, returned, truncated, limit }`; `search` and
-`refs` keep named arrays with per-array pagination metadata. Clients written
-for bare arrays must unwrap `items`, and every client should check `truncated`
+`refs` keep named arrays with per-array pagination metadata. With
+`--with-content`, `symbol` items and `search` symbol entries include bounded,
+line-numbered source bodies read from the current file using indexed line
+ranges. Clients written for bare arrays must unwrap
+`items`, and every client should check `truncated`
 before treating results as complete. Increase `--limit` to request more rows.
 The `changed` command remains on its independent schema v1. `outline --format
 json` reads one file and has no limit, so it uses its own schema v1 as well:

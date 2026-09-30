@@ -225,6 +225,7 @@ fn tool_descriptors() -> Vec<Value> {
                     "fuzzy":        { "type": "boolean", "description": "Enable typo-tolerant fuzzy matching." },
                     "rank":         { "type": "string",  "enum": ["proven", "hotspots", "risky", "central"], "description": "Re-order by Git history and the symbol graph, evidence per result. proven: safest to copy; risky: dangerous to change; hotspots: keeps being changed and fixed; central: what the code leans on. Exact names stay first. Needs `ast-index hotspots --collect` in a shell (not for central) and `graph_build` (not for hotspots); what is missing is reported." },
                     "exclude_tests": { "type": "boolean", "description": "With `rank`: leave test files out of the ranked results (they crowd `hotspots` and `risky`)." },
+                    "with_content": { "type": "boolean", "description": "Include each matched symbol's bounded source body. Default false." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional if the server was started with --root or AST_INDEX_ROOT." },
                     "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
@@ -281,6 +282,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "parent":       { "type": "string",  "description": "Name of the interface, protocol, trait, or abstract class." },
+                    "with_content": { "type": "boolean", "description": "Include each implementation's bounded source body. Default false." },
                     "limit":        { "type": "integer", "description": "Max results (default 50)." },
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
@@ -363,6 +365,7 @@ fn tool_descriptors() -> Vec<Value> {
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "fuzzy":        { "type": "boolean", "description": "Enable typo-tolerant fuzzy matching." },
+                    "with_content": { "type": "boolean", "description": "Include each matched symbol's bounded source body. Default false." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
                     "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text'." }
                 }
@@ -743,6 +746,13 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
                 }
                 argv.push("--exclude-tests".into());
             }
+            if arguments
+                .get("with_content")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                argv.push("--with-content".into());
+            }
         }
         "outline" => {
             argv.push("outline".into());
@@ -763,6 +773,13 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         "implementations" => {
             argv.push("implementations".into());
             argv.push(require_string(arguments, "parent")?);
+            if arguments
+                .get("with_content")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                argv.push("--with-content".into());
+            }
             push_if_num(&mut argv, arguments, "limit", "--limit");
             push_if_str(&mut argv, arguments, "in_file", "--in-file");
             push_if_str(&mut argv, arguments, "module", "--module");
@@ -809,6 +826,13 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
                 .unwrap_or(false)
             {
                 argv.push("--fuzzy".into());
+            }
+            if arguments
+                .get("with_content")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                argv.push("--with-content".into());
             }
         }
         "class" => {
@@ -1116,7 +1140,8 @@ mod tests {
             "search",
             &json!({
                 "query": "Foo", "limit": 100, "kind": "class",
-                "in_file": "src/", "module": "core", "fuzzy": true
+                "in_file": "src/", "module": "core", "fuzzy": true,
+                "with_content": true
             }),
         )
         .unwrap();
@@ -1134,6 +1159,7 @@ mod tests {
                 "--module",
                 "core",
                 "--fuzzy",
+                "--with-content",
                 "--format",
                 "json",
             ]
@@ -1595,7 +1621,11 @@ mod tests {
 
     #[test]
     fn symbol_with_name_first_then_flags() {
-        let argv = build_argv("symbol", &json!({"name": "PathResolver", "kind": "class"})).unwrap();
+        let argv = build_argv(
+            "symbol",
+            &json!({"name": "PathResolver", "kind": "class", "with_content": true}),
+        )
+        .unwrap();
         // name is positional, kind is --type, format=json appended
         assert_eq!(
             argv,
@@ -1604,6 +1634,7 @@ mod tests {
                 "PathResolver",
                 "--type",
                 "class",
+                "--with-content",
                 "--format",
                 "json"
             ]
@@ -1621,6 +1652,27 @@ mod tests {
         // hierarchy is plain-text only
         let argv = build_argv("hierarchy", &json!({"name": "Foo"})).unwrap();
         assert_eq!(argv, vec!["hierarchy", "Foo"]);
+    }
+
+    #[test]
+    fn implementations_forwards_with_content() {
+        let argv = build_argv(
+            "implementations",
+            &json!({"parent": "Processor", "with_content": true, "limit": 5}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "implementations",
+                "Processor",
+                "--with-content",
+                "--limit",
+                "5",
+                "--format",
+                "json"
+            ]
+        );
     }
 
     #[test]

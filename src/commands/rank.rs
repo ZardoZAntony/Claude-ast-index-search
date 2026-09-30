@@ -1573,6 +1573,7 @@ mod tests {
             qualified_name: None,
             kind: "class".to_string(),
             line: 1,
+            end_line: None,
             signature: None,
             path: "app/a.rb".to_string(),
             root_path: None,

@@ -13,6 +13,7 @@ use std::path::Path;
 use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
+use serde::Serialize;
 
 use super::is_test_path;
 use super::rank::{self, PoolSummary, Preset, RankContext, RankSummary, RankedFile, RankedSymbol};
@@ -65,6 +66,63 @@ fn symbol_display_name(symbol: &db::SearchResult) -> &str {
     symbol.display_name()
 }
 
+#[derive(Serialize)]
+struct SymbolWithContent<'a> {
+    #[serde(flatten)]
+    symbol: &'a db::SearchResult,
+    content: Option<&'a str>,
+    truncated: bool,
+    end_line: Option<i64>,
+}
+
+fn read_symbol_contents(
+    root: &Path,
+    symbols: &[db::SearchResult],
+    with_content: bool,
+) -> Vec<Option<super::explore::SourceSnippet>> {
+    if !with_content {
+        return Vec::new();
+    }
+    symbols
+        .iter()
+        .map(|symbol| super::explore::read_symbol_source(root, symbol))
+        .collect()
+}
+
+fn symbols_with_content<'a>(
+    symbols: &'a [db::SearchResult],
+    contents: &'a [Option<super::explore::SourceSnippet>],
+) -> Vec<SymbolWithContent<'a>> {
+    symbols
+        .iter()
+        .zip(contents)
+        .map(|(symbol, content)| SymbolWithContent {
+            symbol,
+            content: content.as_ref().map(|snippet| snippet.content.as_str()),
+            truncated: content.as_ref().is_some_and(|snippet| snippet.truncated),
+            end_line: content
+                .as_ref()
+                .map(|snippet| snippet.end_line)
+                .or(symbol.end_line),
+        })
+        .collect()
+}
+
+fn print_symbol_content(contents: &[Option<super::explore::SourceSnippet>], index: usize) {
+    match contents.get(index).and_then(Option::as_ref) {
+        Some(snippet) => {
+            print!("{}", snippet.content);
+            if snippet.truncated {
+                println!(
+                    "    ... truncated at line {}; symbol ends at line {}",
+                    snippet.displayed_end_line, snippet.end_line
+                );
+            }
+        }
+        None => println!("    (could not read source)"),
+    }
+}
+
 fn auto_pattern_from_name<'a>(
     name: Option<&'a str>,
     pattern: Option<&'a str>,
@@ -94,6 +152,7 @@ pub fn cmd_search(
     fuzzy: bool,
     rank: Option<&str>,
     exclude_tests: bool,
+    with_content: bool,
 ) -> Result<()> {
     let preset = rank.map(Preset::parse).transpose()?;
     let exclude_tests = exclude_tests && preset.is_some();
@@ -318,6 +377,14 @@ pub fn cmd_search(
         let mut ranked_files = rank::rank_files(&conn, &ranking, &resolver, files, &terms, limit)?;
         let mut ranked_symbols =
             rank::rank_symbols(&conn, &ranking, &resolver, symbols, &terms, fuzzy, limit)?;
+        let ranked_contents = if with_content {
+            ranked_symbols
+                .iter()
+                .map(|symbol| super::explore::read_symbol_source(root, &symbol.result))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for file in &mut ranked_files {
             file.path = resolver.resolve_with_root(&file.path, file.root_path.as_deref());
         }
@@ -340,6 +407,8 @@ pub fn cmd_search(
             preset: ranking.preset(),
             files: Page::new(ranked_files, files_total, limit),
             symbols: Page::new(ranked_symbols, symbols_total, limit),
+            symbol_contents: ranked_contents,
+            with_content,
             refs: Page::new(ref_matches, refs_total, limit),
             content_matches,
             content_pagination,
@@ -352,6 +421,7 @@ pub fn cmd_search(
         .map(|file| resolver.resolve_with_root(&file.path, file.root_path.as_deref()))
         .collect();
     let mut symbols: Vec<db::SearchResult> = symbols.into_iter().map(|(_, s)| s).collect();
+    let symbol_contents = read_symbol_contents(root, &symbols, with_content);
     for s in &mut symbols {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
@@ -376,10 +446,15 @@ pub fn cmd_search(
     }
 
     if format == "json" {
+        let symbols = if with_content {
+            serde_json::to_value(symbols_with_content(&symbols_page.items, &symbol_contents))?
+        } else {
+            serde_json::to_value(&symbols_page.items)?
+        };
         let result = serde_json::json!({
             "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
             "files": files_page.items,
-            "symbols": symbols_page.items,
+            "symbols": symbols,
             "references": refs_page.items.iter().map(|(name, count)| {
                 serde_json::json!({"name": name, "usage_count": count})
             }).collect::<Vec<_>>(),
@@ -424,7 +499,7 @@ pub fn cmd_search(
             )
             .cyan()
         );
-        for s in &symbols_page.items {
+        for (index, s) in symbols_page.items.iter().enumerate() {
             println!(
                 "  {} [{}]: {}:{}",
                 symbol_display_name(s).cyan(),
@@ -432,6 +507,9 @@ pub fn cmd_search(
                 s.path,
                 s.line
             );
+            if with_content {
+                print_symbol_content(&symbol_contents, index);
+            }
         }
         print_truncation_notice(symbols_page.pagination);
     }
@@ -480,6 +558,8 @@ struct RankedSearch<'a> {
     preset: Preset,
     files: Page<RankedFile>,
     symbols: Page<RankedSymbol>,
+    symbol_contents: Vec<Option<super::explore::SourceSnippet>>,
+    with_content: bool,
     refs: Page<(String, i64)>,
     content_matches: Vec<(String, usize, String)>,
     content_pagination: Pagination,
@@ -491,11 +571,23 @@ struct RankedSearch<'a> {
 fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
     let content_pagination = report.content_pagination;
     if report.format == "json" {
+        let mut symbols = serde_json::to_value(&report.symbols.items)?;
+        if report.with_content {
+            if let Some(rows) = symbols.as_array_mut() {
+                for (row, snippet) in rows.iter_mut().zip(&report.symbol_contents) {
+                    row["content"] =
+                        serde_json::json!(snippet.as_ref().map(|item| item.content.as_str()));
+                    row["truncated"] =
+                        serde_json::json!(snippet.as_ref().is_some_and(|item| item.truncated));
+                    row["end_line"] = serde_json::json!(snippet.as_ref().map(|item| item.end_line));
+                }
+            }
+        }
         let result = serde_json::json!({
             "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
             "rank": report.summary,
             "files": report.files.items,
-            "symbols": report.symbols.items,
+            "symbols": symbols,
             "references": report.refs.items.iter().map(|(name, count)| {
                 serde_json::json!({"name": name, "usage_count": count})
             }).collect::<Vec<_>>(),
@@ -555,7 +647,7 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
             )
             .cyan()
         );
-        for symbol in &report.symbols.items {
+        for (index, symbol) in report.symbols.items.iter().enumerate() {
             let s = &symbol.result;
             println!(
                 "  {} [{}]: {}:{}",
@@ -568,6 +660,9 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
                 for line in rank::render_dossier(dossier, report.preset) {
                     println!("    {}", line.dimmed());
                 }
+            }
+            if report.with_content {
+                print_symbol_content(&report.symbol_contents, index);
             }
         }
         print_truncation_notice(report.symbols.pagination);
@@ -635,6 +730,7 @@ pub fn cmd_symbol(
     format: &str,
     scope: &SearchScope,
     fuzzy: bool,
+    with_content: bool,
 ) -> Result<()> {
     if !db::db_exists(root) {
         println!(
@@ -677,13 +773,23 @@ pub fn cmd_symbol(
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     symbols.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
+    let contents = read_symbol_contents(root, &symbols, with_content);
     for s in &mut symbols {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
     let page = Page::new(symbols, total, limit);
     if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&page)?);
+        if with_content {
+            let output = serde_json::json!({
+                "schema_version": page.schema_version,
+                "items": symbols_with_content(&page.items, &contents),
+                "pagination": page.pagination,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&page)?);
+        }
         return Ok(());
     }
 
@@ -698,7 +804,7 @@ pub fn cmd_symbol(
         .bold()
     );
 
-    for s in &page.items {
+    for (index, s) in page.items.iter().enumerate() {
         println!(
             "  {} [{}]: {}:{}",
             symbol_display_name(s).cyan(),
@@ -706,7 +812,9 @@ pub fn cmd_symbol(
             s.path,
             s.line
         );
-        if let Some(sig) = &s.signature {
+        if with_content {
+            print_symbol_content(&contents, index);
+        } else if let Some(sig) = &s.signature {
             let truncated: String = sig.chars().take(70).collect();
             println!("    {}", truncated.dimmed());
         }
@@ -850,6 +958,7 @@ pub fn cmd_implementations(
     limit: usize,
     format: &str,
     scope: &SearchScope,
+    with_content: bool,
 ) -> Result<()> {
     if !db::db_exists(root) {
         println!(
@@ -865,13 +974,23 @@ pub fn cmd_implementations(
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     impls.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
+    let contents = read_symbol_contents(root, &impls, with_content);
     for s in &mut impls {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
     let page = Page::new(impls, total, limit);
     if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&page)?);
+        if with_content {
+            let output = serde_json::json!({
+                "schema_version": page.schema_version,
+                "items": symbols_with_content(&page.items, &contents),
+                "pagination": page.pagination,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&page)?);
+        }
         return Ok(());
     }
 
@@ -884,7 +1003,7 @@ pub fn cmd_implementations(
         .bold()
     );
 
-    for s in &page.items {
+    for (index, s) in page.items.iter().enumerate() {
         println!(
             "  {} [{}]: {}:{}",
             symbol_display_name(s).cyan(),
@@ -892,6 +1011,9 @@ pub fn cmd_implementations(
             s.path,
             s.line
         );
+        if with_content {
+            print_symbol_content(&contents, index);
+        }
     }
 
     if page.items.is_empty() {

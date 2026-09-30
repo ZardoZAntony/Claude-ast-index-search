@@ -1496,7 +1496,20 @@ fn write_symbol_line(s: &Value, indent: &str, out: &mut String) {
     let line = s.get("line").and_then(Value::as_i64).unwrap_or(0);
     writeln!(out, "{indent}{name} [{kind}] {path}:{line}").ok();
 
-    if let Some(sig) = s.get("signature").and_then(Value::as_str) {
+    let content = s
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty());
+    if let Some(content) = content {
+        write!(out, "{content}").ok();
+        if !content.ends_with('\n') {
+            writeln!(out).ok();
+        }
+        if s.get("truncated").and_then(Value::as_bool) == Some(true) {
+            let end = s.get("end_line").and_then(Value::as_i64).unwrap_or(0);
+            writeln!(out, "{indent}  ... truncated; symbol ends at line {end}").ok();
+        }
+    } else if let Some(sig) = s.get("signature").and_then(Value::as_str) {
         if !sig.is_empty() {
             writeln!(out, "{indent}  {}", truncate(sig, 80)).ok();
         }
@@ -1567,6 +1580,25 @@ mod tests {
         }"#;
         let out = to_compact("search", json);
         assert_eq!(out, "(no results)");
+    }
+
+    #[test]
+    fn search_renders_requested_symbol_content() {
+        let json = r#"{
+            "files":[],
+            "symbols":[{
+                "name":"ValueBuilder::PushBack",
+                "kind":"function",
+                "path":"value_builder.cpp",
+                "line":267,
+                "content":"  267\tvoid ValueBuilder::PushBack(std::nullptr_t) {\n  268\t}\n"
+            }],
+            "references":[],
+            "content_matches":[]
+        }"#;
+        let out = to_compact("search", json);
+        assert!(out.contains("ValueBuilder::PushBack [function] value_builder.cpp:267"));
+        assert!(out.contains("void ValueBuilder::PushBack(std::nullptr_t)"));
     }
 
     #[test]
@@ -1686,6 +1718,31 @@ mod tests {
         let c = to_compact("class", json);
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    #[test]
+    fn implementations_renders_requested_content() {
+        let json = r#"{
+            "schema_version":2,
+            "items":[{
+                "name":"impl Repository for SqlRepository",
+                "kind":"class",
+                "path":"src/repository.rs",
+                "line":7,
+                "content":"    7\timpl Repository for SqlRepository {\n    8\t    fn save(&self) {}\n    9\t}\n"
+            }],
+            "pagination":{"total":1,"returned":1,"truncated":false,"limit":20}
+        }"#;
+        let out = to_compact("implementations", json);
+        assert!(out.contains("impl Repository for SqlRepository [class] src/repository.rs:7"));
+        assert!(out.contains("fn save(&self) {}"));
+    }
+
+    #[test]
+    fn symbol_marks_truncated_body() {
+        let json = r#"{"items":[{"name":"long_body","kind":"function","path":"src/lib.rs","line":1,"content":"    1\tfn long_body() {\n","truncated":true,"end_line":90}]}"#;
+        let out = to_compact("symbol", json);
+        assert!(out.contains("truncated; symbol ends at line 90"));
     }
 
     // --- find_file ---
