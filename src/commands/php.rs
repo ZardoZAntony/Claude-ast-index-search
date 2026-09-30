@@ -1419,16 +1419,27 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
             true,
         );
     }
+    // a common method name (`Update`, `add`) gathers many calls on unrelated objects: a summary by receiver
+    // lets them be dismissed at a glance, the full list stays in --format json
+    let mut by_receiver: BTreeMap<String, usize> = BTreeMap::new();
+    for c in &unresolved {
+        *by_receiver.entry(receiver_text(&c.context, &method)).or_default() += 1;
+    }
+    let mut by_receiver: Vec<(String, usize)> = by_receiver.into_iter().collect();
+    by_receiver.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let summary: Vec<String> = by_receiver.iter().take(8).map(|(r, n)| format!("{r} ×{n}")).collect();
     print_sites(
         &format!(
-            "receiver not inferred — check by hand: {}",
-            unresolved.len()
+            "receiver not inferred — check by hand: {}{}",
+            unresolved.len(),
+            if summary.is_empty() { String::new() } else { format!("; by receiver: {}", summary.join(", ")) }
         ),
-        &unresolved,
+        &unresolved[..unresolved.len().min(SITES_SHOWN)],
         false,
     );
+    print_more(unresolved.len());
     println!("excluded (other types): {}", excluded.len());
-    for c in &excluded {
+    for c in excluded.iter().take(SITES_SHOWN) {
         println!(
             "  {}:{}  [{}]",
             c.path.cyan(),
@@ -1436,7 +1447,57 @@ pub fn cmd_typed_callers(root: &Path, spec: &str, limit: usize, format: &str) ->
             c.receiver.as_deref().unwrap_or("")
         );
     }
+    print_more(excluded.len());
     Ok(())
+}
+
+/// Lines shown per section of calls that need a manual look; `--format json` lists all.
+const SITES_SHOWN: usize = 10;
+
+fn print_more(total: usize) {
+    if total > SITES_SHOWN {
+        println!("  … {} more (--format json lists all)", total - SITES_SHOWN);
+    }
+}
+
+/// The expression a method is called on in a line of code: `$DB` in `$DB->Update(…)`, `$this->client` in
+/// `$this->client->update(…)`, `self::getDataClass()` in `self::getDataClass()::update(…)`.
+fn receiver_text(context: &str, method: &str) -> String {
+    let lower = context.to_ascii_lowercase();
+    let needle = method.to_ascii_lowercase();
+    let mut at = None;
+    for (i, _) in lower.match_indices(&needle) {
+        let before = &context[..i];
+        if before.ends_with("->") || before.ends_with("::") || before.ends_with("?->") {
+            at = Some(i);
+            break;
+        }
+    }
+    let Some(i) = at else {
+        return "?".to_string();
+    };
+    let before = context[..i].trim_end_matches("->").trim_end_matches('?').trim_end_matches("::");
+    let bytes = before.as_bytes();
+    let mut start = bytes.len();
+    let mut depth = 0i32;
+    while start > 0 {
+        let c = bytes[start - 1];
+        match c {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' if depth > 0 => depth -= 1,
+            _ if depth > 0 => {}
+            b'$' | b'_' | b'\\' | b'>' | b'-' | b':' => {}
+            _ if c.is_ascii_alphanumeric() => {}
+            _ => break,
+        }
+        start -= 1;
+    }
+    let text = before[start..].trim_start_matches(['-', '>', ':']);
+    if text.is_empty() {
+        "?".to_string()
+    } else {
+        truncate(text, 40)
+    }
 }
 
 fn print_sites(title: &str, sites: &[CallSite], with_receiver: bool) {
@@ -1880,5 +1941,20 @@ mod tests {
         let braces = "<?php\nclass A\n{\n    private string $open = '{';\n    public function a(): string { return \"}{$x}\"; } // }\n}\nclass B {}\n";
         assert_eq!(class_body(braces, 2).last().map(String::as_str), Some("}"));
         assert_eq!(class_body(braces, 2).len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod receiver_tests {
+    use super::receiver_text;
+
+    #[test]
+    fn receiver_of_a_call_in_a_line() {
+        assert_eq!(receiver_text("$r = $DB->Update('t', $f);", "Update"), "$DB");
+        assert_eq!(receiver_text("$this->client->update($id);", "Update"), "$this->client");
+        assert_eq!(receiver_text("return self::getDataClass()::update(", "update"), "self::getDataClass()");
+        assert_eq!(receiver_text("$entity_data_class::update($id, $f);", "update"), "$entity_data_class");
+        assert_eq!(receiver_text("$x?->update();", "update"), "$x");
+        assert_eq!(receiver_text("update($x);", "update"), "?");
     }
 }
