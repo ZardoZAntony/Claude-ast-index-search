@@ -845,9 +845,16 @@ pub fn extract_references_for_lang(
     // identifier scan below sees on its own. `Billing` stays a reference to
     // the namespace, and so does the `Invoice` of `class Admin::Invoice <
     // Invoice`, a different class.
+    //
+    // Imports are not declarations: `use crate::models::Widget;` is the first
+    // real use of `Widget` in the file, and treating it as the declaration of
+    // its own last segment dropped every Rust import from `usages`.
     let mut declared_at: HashMap<&str, HashSet<usize>> = HashMap::new();
     let mut qualified_at: HashMap<(usize, &str), Vec<&str>> = HashMap::new();
     for symbol in defined_symbols {
+        if symbol.kind == SymbolKind::Import {
+            continue;
+        }
         declared_at
             .entry(symbol.name.as_str())
             .or_default()

@@ -287,3 +287,10 @@ fn stylesheets_record_no_references() {
         assert!(refs.is_empty(), "{file_type:?}: {refs:?}");
     }
 }
+
+#[test]
+fn rust_use_declarations_are_references_to_the_imported_name() {
+    let content = "use crate::models::Widget;\nuse crate::ui::{Panel, Widget as W};\n\nfn build() -> Widget {\n    Widget::new()\n}\n";
+    assert_eq!(ref_lines(content, FileType::Rust, "Widget"), vec![1, 2, 4, 5]);
+    assert_eq!(ref_lines(content, FileType::Rust, "Panel"), vec![2]);
+}
