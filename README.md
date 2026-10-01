@@ -745,7 +745,9 @@ exclude:
 This release merges the symbol graph, Git hotspots and ranked search work
 contributed in [#72](https://github.com/defendend/Claude-ast-index-search/pull/72)
 (which also carried [#28](https://github.com/defendend/Claude-ast-index-search/pull/28)),
-with follow-up fixes.
+the `--with-content` responses from
+[#73](https://github.com/defendend/Claude-ast-index-search/pull/73), and
+follow-up fixes.
 
 - **`graph` — a symbol dependency graph** — `graph build` resolves indexed
   references into symbol-to-symbol edges and stores them with per-edge
@@ -794,6 +796,14 @@ with follow-up fixes.
   run outlasts common MCP client timeouts, and the tools name it when history is
   missing. Output is compact text: a ranked search prints each file's history
   and each symbol's graph numbers once, about a quarter of the JSON size.
+- **`symbol`, `search` and `implementations` take `--with-content`** — each
+  matched symbol is followed by its line-numbered source body, read from disk
+  at the range the parser recorded (`end_line`), so an agent gets the
+  definition in one call instead of a follow-up `sed`/`rg`. Bodies are capped
+  at 60 lines; a longer one ends with `... truncated at line N; symbol ends at
+  line M`, and JSON items carry `content`, `truncated` and `end_line`. Without
+  the flag the output is unchanged. The MCP `symbol`, `search` and
+  `implementations` tools accept `with_content: true`.
 - **Symbol ranges for every tree-sitter language** — `end_line` used to be
   filled only for Ruby and TypeScript/JavaScript, so `call-tree`,
   `explore --rwr` and `graph` fell back to "the last definition above the
