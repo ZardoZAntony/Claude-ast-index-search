@@ -727,8 +727,120 @@ exclude:
 
 ## Changelog
 
-### Unreleased
+### 3.56.0
 
+This release merges the symbol graph, Git hotspots and ranked search work
+contributed in [#72](https://github.com/defendend/Claude-ast-index-search/pull/72)
+(which also carried [#28](https://github.com/defendend/Claude-ast-index-search/pull/28)),
+with follow-up fixes.
+
+- **`graph` — a symbol dependency graph** — `graph build` resolves indexed
+  references into symbol-to-symbol edges and stores them with per-edge
+  resolution confidence (`local`, `scoped`, `import`, `unique`, `ambiguous`).
+  Queries on top of it: `dependents`, `dependencies`, `impact` (transitive
+  dependents), `path`, `cycles`, `top`, `status` and `metrics` (fan-in, fan-out,
+  PageRank). Ruby references resolve through namespaces, lexical nesting,
+  constant receivers, inheritance and mixins; JavaScript/TypeScript references
+  through the module's own imports. Metrics count resolved edges only and
+  report ambiguous ones separately, so a name defined in hundreds of places
+  does not inflate a symbol's centrality. The graph is opt-in: `rebuild` and
+  `update` never build it, and queries flag a stale graph after the index
+  changes and accept `--refresh`.
+- **`hotspots` — per-file Git history signals** — a new command ranks files by
+  what their history says about them: commit count, churn (absolute and
+  relative to the file's current size), bugfix share, distinct authors, age
+  and time since the last change. Thresholds are percentiles *within the
+  repository being indexed*, not absolute constants, so "high churn" means
+  something in a 300-file library and in a 30 000-file monorepo alike; raw
+  numbers are printed next to every label. Text and `--format json` output,
+  paginated JSON schema v2.
+- **Collection is opt-in** — `rebuild` and `update` never walk the log;
+  `hotspots --collect` does.
+- **`search --rank` — re-rank results by history and structure** — four
+  presets re-order the Files and Symbols sections of a search: `proven` (calm,
+  old, idle and actually used — safe to copy), `hotspots` (the file's hotspot
+  score), `risky` (transitive dependents × hotspot score) and `central`
+  (PageRank). Every result carries its dossier: the score and its terms, raw
+  history and graph numbers with repository percentiles and labels, and the
+  relevance position it came from. Relevance stays in charge: exact name
+  matches stay above partial ones, the pool is the head of the plain order, and
+  the preset only weighs in inside a tier. History is labelled as per-file,
+  third-party code is never scored and goes last, and a preset whose data is
+  missing is not applied — the output names `hotspots --collect` or
+  `graph build` instead of ranking by zeros. Formulas were chosen by
+  backtesting next-year bugfixes on a 40k-file monorepo.
+- **MCP exposes the symbol graph, Git hotspots and ranked search** — seven new
+  tools: `graph_dependents` (direct dependents, or the transitive blast radius
+  with `depth` ≥ 2), `graph_dependencies`, `graph_path`, `graph_metrics` (the
+  most central symbols, or metrics of given ones), `graph_cycles`,
+  `graph_build` and `hotspots`; `search` takes `rank` (`proven`, `hotspots`,
+  `risky`, `central`). Descriptions tell the agent when to reach for each one —
+  before changing a symbol, when choosing which match to copy — and what has to
+  be collected first; graph queries accept `refresh: true` to build a missing or
+  stale graph in place. History collection stays a CLI command, since its first
+  run outlasts common MCP client timeouts, and the tools name it when history is
+  missing. Output is compact text: a ranked search prints each file's history
+  and each symbol's graph numbers once, about a quarter of the JSON size.
+- **Symbol ranges for every tree-sitter language** — `end_line` used to be
+  filled only for Ruby and TypeScript/JavaScript, so `call-tree`,
+  `explore --rwr` and `graph` fell back to "the last definition above the
+  line" everywhere else. Python, Go, Rust, Java, Kotlin, Swift, C#, C/C++, PHP,
+  Scala, Dart, Lua, Elixir, Zig, Objective-C, Groovy, Bash, SQL, R, MATLAB,
+  GDScript, Common Lisp, BSL and Protobuf now store the last line of every
+  definition, with classes, modules and namespaces enclosing their members.
+  The fallback had blamed the wrong definition for 3.6% of references in a Rust
+  codebase, 11% in a Go checkout and 18–42% in C++; module-level code no longer
+  gets an invented caller. Decorators and annotations stay outside the
+  definition they decorate, since they run in the enclosing scope. The graph
+  treats Rust `impl` blocks and Swift/Objective-C extensions as the namespace of
+  the type they extend, so `Type::new(…)` and `Self::helper(…)` resolve. CSS,
+  SCSS, Less and the regex-based parsers still report no ranges. Run
+  `ast-index rebuild` to fill ranges in an existing index.
+- **`outline` prints line ranges and supports `--format json`** —
+  `:12-40 Invoice [class]`, rows in source order, JSON schema v1 with
+  `end_line`.
+- **Tell code from prose by the syntax tree** — names in comments, docstrings
+  and string literals are no longer references in Ruby, Python, JS/TS, C/C++,
+  Objective-C, Go, Rust, Java, C#, PHP, Swift, Scala, Dart, Lua, Groovy,
+  Elixir, Bash, R, Zig and Proto. Interpolated code stays, and so do strings
+  that name code: Ruby constant-path strings and `%w[]` words
+  (`class_name: 'Invoice'`), Python dotted class names (`"pkg.models.User"`),
+  JS `import('./Page')`. References drop 7–51% per project.
+- **`rebuild` is about 40% faster** — signatures looked up their source line
+  by scanning the file from the top for every symbol (quadratic in file
+  length) and copied the whole line before truncating it; Ruby and TypeScript
+  files were parsed twice (symbols, then references); and parse threads sat
+  idle while each chunk was written. Lines are now indexed once per file,
+  signatures capped before copying, each file parsed once, and writing
+  overlaps parsing in the same order, so the index is byte-for-byte the same:
+  9.3 → 5.5 s on a 40k-file monorepo.
+- **`update` finds changes 3–4× faster** — the project root was canonicalized
+  once per file (a thread and a `realpath` each), and files were stat'ed and
+  `node_modules` packages walked one by one; now once per walk and in
+  parallel. A no-op `update` on a 40k-file project: 2.1 → 0.6 s; 20 changed
+  files: 1.8 → 0.4 s.
+- **Minified JavaScript and CSS are left out** — `.js` / `.mjs` / `.cjs` /
+  `.css` files named `*.min.*` or `*-min.*`, or whose first 64 KiB is minifier
+  output (lines of 1000+ bytes on average, 100+ of them outside string
+  literals), are no longer indexed, read by the grep-based commands (`search`
+  contents, `callers`, `call-tree`, `todo`, …) or parsed by `outline` /
+  `imports`, which now say the file was skipped. A one-line stylesheet gave
+  each of its thousands of selectors the whole file as a signature: on a Rails
+  monorepo with a 589 KB `app.min.css`, `outline` of that file took 4.6 GB and
+  `rebuild` peaked at 4–7 GB; now 11 MB and 0.21 GB. `callers` / `call-tree`
+  no longer answer from bundles (`__webpack_require__`). Source with a few long
+  strings, SVG paths or data URIs is unaffected, and TypeScript, JSX, SCSS and
+  `.d.ts` are never judged. `update` drops minified files an older index kept,
+  without a rebuild. `AST_INDEX_SKIP_MINIFIED=0` turns the filter off.
+- **Rust `use` declarations count as references again** — `use
+  crate::models::Widget;` is the first use of `Widget` in a file, not the
+  declaration of its own last segment; `usages` and `refs` list import lines
+  for Rust projects as before. Takes effect on the next `rebuild`.
+- **Build markers inside test fixtures no longer label the project** — a
+  `pom.xml` under `tests/fixtures/` or a `Package.swift` under `src/test/`
+  belongs to the sample project a test indexes; `stats`, `map` and
+  `detect-stacks` ignore markers under `test`, `tests`, `__tests__`,
+  `fixtures`, `__fixtures__`, `test-fixtures` and `testdata` directories.
 - **`implementations` leaves out a namesake from another namespace** — a
   parent written `Legacy::ApplicationService` no longer counts as
   `ApplicationService` when the index defines both classes, and
@@ -766,7 +878,6 @@ exclude:
   keeps the name-matched callers.
 - **Performance table in the skill shows a large repository** — next to a
   small project; `search` on a 40k-file monorepo takes 250–550 ms, not 10.
-
 - **`explore` finds the class a question names** — candidates now also come
   from one bm25 ranking over all query words, from the words run together
   (`pdf to html service` is the `PdfToHtmlService` token the full-text index
@@ -820,13 +931,6 @@ exclude:
   in `db/schema.rb` no longer count as uses of the project's `string` /
   `integer` methods (≈3.7k references and 2.6k ambiguous graph edges fewer on a
   large Rails app); tables and columns stay indexed.
-- **Tell code from prose by the syntax tree** — names in comments, docstrings
-  and string literals are no longer references in Ruby, Python, JS/TS, C/C++,
-  Objective-C, Go, Rust, Java, C#, PHP, Swift, Scala, Dart, Lua, Groovy,
-  Elixir, Bash, R, Zig and Proto. Interpolated code stays, and so do strings
-  that name code: Ruby constant-path strings and `%w[]` words
-  (`class_name: 'Invoice'`), Python dotted class names (`"pkg.models.User"`),
-  JS `import('./Page')`. References drop 7–51% per project.
 - **C/C++ prototypes are declarations** — a header prototype, `static` forward
   declaration, class method declaration or function-pointer field no longer
   counts as a use of the function.
@@ -835,9 +939,6 @@ exclude:
   `rescue_from ... with:`, `alias_method`, `delegate` and `&:name` are
   references; the graph links a model to its callback methods and validated
   columns.
-- **`outline` prints line ranges and supports `--format json`** —
-  `:12-40 Invoice [class]`, rows in source order, JSON schema v1 with
-  `end_line`.
 - **Compact `outline` for schema dumps** — `db/schema.rb` columns fold into a
   count per table (164 KB → 17 KB on a 335-table schema); `--full` lists every
   column.
@@ -896,19 +997,6 @@ exclude:
 - **`callers` checks for definitions cheaply and in parallel** — the "is this
   line a definition?" test ran a capturing regex on one thread for every call
   line; a capture-free pre-check now runs on the search threads.
-- **`update` finds changes 3–4× faster** — the project root was canonicalized
-  once per file (a thread and a `realpath` each), and files were stat'ed and
-  `node_modules` packages walked one by one; now once per walk and in
-  parallel. A no-op `update` on a 40k-file project: 2.1 → 0.6 s; 20 changed
-  files: 1.8 → 0.4 s.
-- **`rebuild` is about 40% faster** — signatures looked up their source line
-  by scanning the file from the top for every symbol (quadratic in file
-  length) and copied the whole line before truncating it; Ruby and TypeScript
-  files were parsed twice (symbols, then references); and parse threads sat
-  idle while each chunk was written. Lines are now indexed once per file,
-  signatures capped before copying, each file parsed once, and writing
-  overlaps parsing in the same order, so the index is byte-for-byte the same:
-  9.3 → 5.5 s on a 40k-file monorepo.
 - **`graph build` 2.5× faster** — references are resolved per file in parallel
   and import matches memoized, with an identical graph: 4.2 → 1.7 s.
 - **`hotspots --collect` reads history 5× faster** — `git log` windows run in
@@ -919,19 +1007,6 @@ exclude:
 - **The MCP server answers tool calls concurrently** — several calls sent at
   once used to wait for each other; responses may now arrive out of order,
   matched by `id` as JSON-RPC allows.
-- **Minified JavaScript and CSS are left out** — `.js` / `.mjs` / `.cjs` /
-  `.css` files named `*.min.*` or `*-min.*`, or whose first 64 KiB is minifier
-  output (lines of 1000+ bytes on average, 100+ of them outside string
-  literals), are no longer indexed, read by the grep-based commands (`search`
-  contents, `callers`, `call-tree`, `todo`, …) or parsed by `outline` /
-  `imports`, which now say the file was skipped. A one-line stylesheet gave
-  each of its thousands of selectors the whole file as a signature: on a Rails
-  monorepo with a 589 KB `app.min.css`, `outline` of that file took 4.6 GB and
-  `rebuild` peaked at 4–7 GB; now 11 MB and 0.21 GB. `callers` / `call-tree`
-  no longer answer from bundles (`__webpack_require__`). Source with a few long
-  strings, SVG paths or data URIs is unaffected, and TypeScript, JSX, SCSS and
-  `.d.ts` are never judged. `update` drops minified files an older index kept,
-  without a rebuild. `AST_INDEX_SKIP_MINIFIED=0` turns the filter off.
 - **`rebuild` keeps the collected Git history** — the per-commit store, the
   per-file signals and the collection cursor are copied into the new index
   instead of being dropped, so `hotspots` reports right after a rebuild and the
@@ -971,21 +1046,6 @@ exclude:
   locking both files itself, so a lock another process holds or is about to
   take is never split across two files. Every command that resolves the index
   gets faster on a cache that had accumulated them.
-- **Symbol ranges for every tree-sitter language** — `end_line` used to be
-  filled only for Ruby and TypeScript/JavaScript, so `call-tree`,
-  `explore --rwr` and `graph` fell back to "the last definition above the
-  line" everywhere else. Python, Go, Rust, Java, Kotlin, Swift, C#, C/C++, PHP,
-  Scala, Dart, Lua, Elixir, Zig, Objective-C, Groovy, Bash, SQL, R, MATLAB,
-  GDScript, Common Lisp, BSL and Protobuf now store the last line of every
-  definition, with classes, modules and namespaces enclosing their members.
-  The fallback had blamed the wrong definition for 3.6% of references in a Rust
-  codebase, 11% in a Go checkout and 18–42% in C++; module-level code no longer
-  gets an invented caller. Decorators and annotations stay outside the
-  definition they decorate, since they run in the enclosing scope. The graph
-  treats Rust `impl` blocks and Swift/Objective-C extensions as the namespace of
-  the type they extend, so `Type::new(…)` and `Self::helper(…)` resolve. CSS,
-  SCSS, Less and the regex-based parsers still report no ranges. Run
-  `ast-index rebuild` to fill ranges in an existing index.
 - **Rails schema tables and columns** — `db/schema.rb` (indexed even when
   gitignored) yields `table` and `column` symbols (`users.email`;
   `search email -t column`, `outline db/schema.rb`). `graph build` matches
@@ -1078,43 +1138,6 @@ exclude:
   `search Job --type class` took about a minute on a 320k-symbol index. The
   full-text match now leads and the kind filters its hits, about a second, with
   the same results.
-- **MCP exposes the symbol graph, Git hotspots and ranked search** — seven new
-  tools: `graph_dependents` (direct dependents, or the transitive blast radius
-  with `depth` ≥ 2), `graph_dependencies`, `graph_path`, `graph_metrics` (the
-  most central symbols, or metrics of given ones), `graph_cycles`,
-  `graph_build` and `hotspots`; `search` takes `rank` (`proven`, `hotspots`,
-  `risky`, `central`). Descriptions tell the agent when to reach for each one —
-  before changing a symbol, when choosing which match to copy — and what has to
-  be collected first; graph queries accept `refresh: true` to build a missing or
-  stale graph in place. History collection stays a CLI command, since its first
-  run outlasts common MCP client timeouts, and the tools name it when history is
-  missing. Output is compact text: a ranked search prints each file's history
-  and each symbol's graph numbers once, about a quarter of the JSON size.
-- **`search --rank` — re-rank results by history and structure** — four
-  presets re-order the Files and Symbols sections of a search: `proven` (calm,
-  old, idle and actually used — safe to copy), `hotspots` (the file's hotspot
-  score), `risky` (transitive dependents × hotspot score) and `central`
-  (PageRank). Every result carries its dossier: the score and its terms, raw
-  history and graph numbers with repository percentiles and labels, and the
-  relevance position it came from. Relevance stays in charge: exact name
-  matches stay above partial ones, the pool is the head of the plain order, and
-  the preset only weighs in inside a tier. History is labelled as per-file,
-  third-party code is never scored and goes last, and a preset whose data is
-  missing is not applied — the output names `hotspots --collect` or
-  `graph build` instead of ranking by zeros. Formulas were chosen by
-  backtesting next-year bugfixes on a 40k-file monorepo.
-- **`graph` — a symbol dependency graph** — `graph build` resolves indexed
-  references into symbol-to-symbol edges and stores them with per-edge
-  resolution confidence (`local`, `scoped`, `import`, `unique`, `ambiguous`).
-  Queries on top of it: `dependents`, `dependencies`, `impact` (transitive
-  dependents), `path`, `cycles`, `top`, `status` and `metrics` (fan-in, fan-out,
-  PageRank). Ruby references resolve through namespaces, lexical nesting,
-  constant receivers, inheritance and mixins; JavaScript/TypeScript references
-  through the module's own imports. Metrics count resolved edges only and
-  report ambiguous ones separately, so a name defined in hundreds of places
-  does not inflate a symbol's centrality. The graph is opt-in: `rebuild` and
-  `update` never build it, and queries flag a stale graph after the index
-  changes and accept `--refresh`.
 - **`call-tree` prints the same tree on every run** — which callers made it
   under `--limit` depended on the files the parallel scan happened to reach
   first and on hash-map iteration order, so repeating a query could print a
@@ -1179,16 +1202,6 @@ exclude:
   now ask the index which symbol's line range encloses the reference and take
   the innermost one. Languages whose parsers report no range keep the previous
   behaviour.
-- **`hotspots` — per-file Git history signals** — a new command ranks files by
-  what their history says about them: commit count, churn (absolute and
-  relative to the file's current size), bugfix share, distinct authors, age
-  and time since the last change. Thresholds are percentiles *within the
-  repository being indexed*, not absolute constants, so "high churn" means
-  something in a 300-file library and in a 30 000-file monorepo alike; raw
-  numbers are printed next to every label. Text and `--format json` output,
-  paginated JSON schema v2.
-- **Collection is opt-in** — `rebuild` and `update` never walk the log;
-  `hotspots --collect` does.
 
 ### 3.55.0
 
