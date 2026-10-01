@@ -80,6 +80,38 @@ fn finalize_rebuild_schema(conn: &rusqlite::Connection, verbose: bool) -> Result
     Ok(())
 }
 
+/// Keep what `hotspots --collect` gathered: the history depends on the
+/// repository, not on the index a full rebuild starts over.
+fn carry_git_history(conn: &rusqlite::Connection, root: &Path, verbose: bool) -> Result<()> {
+    let t = Instant::now();
+    let carry = db::carry_git_history(conn, root, |history| {
+        super::git_signals::history_carry_rejection(root, history)
+    })?;
+    match carry {
+        db::GitHistoryCarry::Absent => {}
+        db::GitHistoryCarry::Kept(history) => println!(
+            "{}",
+            format!(
+                "Kept the collected git history ({} commit(s) analyzed)",
+                history.live_commits
+            )
+            .dimmed()
+        ),
+        db::GitHistoryCarry::Dropped(reason) => println!(
+            "{}",
+            format!(
+                "Collected git history not kept: {reason}. \
+                 Run 'ast-index hotspots --collect' to collect it again."
+            )
+            .yellow()
+        ),
+    }
+    if verbose {
+        eprintln!("[verbose] carry_git_history in {:?}", t.elapsed());
+    }
+    Ok(())
+}
+
 fn restore_rebuild_pragmas(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
     let t = Instant::now();
     db::restore_rebuild_pragmas(conn)?;
@@ -444,6 +476,7 @@ pub fn cmd_rebuild(
         db::open_staged_db(root, staged.db_path())?
     };
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!(
             "[verbose] staged DB opened + schema created in {:?}",
@@ -771,6 +804,7 @@ pub fn cmd_rebuild(
             println!("{}", "Rebuilding symbols index...".cyan());
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
+            db::bump_index_generation(&conn)?;
             let walk = indexer::index_directory_with_config(
                 &mut conn,
                 root,
@@ -835,6 +869,10 @@ pub fn cmd_rebuild(
         _ => {}
     }
 
+    // A seeded generation already holds the live history.
+    if !seed_from_live {
+        carry_git_history(&conn, root, verbose)?;
+    }
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
@@ -914,6 +952,7 @@ fn cmd_rebuild_sub_projects(
     let staged = IndexStaging::create(&live_db, "rebuild")?;
     let mut conn = db::open_staged_db(root, staged.db_path())?;
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!("[verbose] staged DB opened in {:?}", t.elapsed());
     }
@@ -1179,6 +1218,7 @@ fn cmd_rebuild_sub_projects(
             success_count, total_files, module_count, dep_count, trans_count, fail_count
         ).green()
     );
+    carry_git_history(&conn, root, verbose)?;
     if verbose {
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
@@ -1671,9 +1711,11 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     let stats = db::get_stats(&conn)?;
     let db_path = db::get_db_path(root)?;
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let project = db::get_metadata_value(&conn, crate::indexer::PROJECT_LABEL_KEY)?;
 
     if format == "json" {
         let result = serde_json::json!({
+            "project": project,
             "stats": stats,
             "db_size_bytes": db_size,
             "db_path": db_path.display().to_string(),
@@ -1683,6 +1725,9 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     }
 
     println!("{}", "Index Statistics:".bold());
+    if let Some(project) = &project {
+        println!("  Project:    {}", project);
+    }
     println!("  Files:      {}", stats.file_count);
     println!("  Symbols:    {}", stats.symbol_count);
     println!("  Refs:       {}", stats.refs_count);
