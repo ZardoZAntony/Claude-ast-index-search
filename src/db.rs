@@ -6116,7 +6116,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         let (sql, value) = if query.starts_with("::") {
             (
                 r#"
-                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
                 WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6128,7 +6128,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         } else if query.ends_with('*') {
             (
                 r#"
-                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
                 WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6140,7 +6140,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         } else {
             (
                 r#"
-                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
                 WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
@@ -6162,7 +6162,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
@@ -6204,7 +6204,7 @@ pub fn search_symbol_seeds(
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
@@ -6250,7 +6250,7 @@ pub fn search_symbol_seeds_ranked(
     }
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
@@ -6302,8 +6302,8 @@ pub fn search_symbols_in_matching_paths(
     let limit_at = terms.len() + 2;
     let sql = format!(
         r#"
-        SELECT name, qualified_name, kind, line, signature, path, root_path FROM (
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path,
+        SELECT name, qualified_name, kind, line, signature, path, root_path, end_line FROM (
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line,
                    ROW_NUMBER() OVER (
                        PARTITION BY s.file_id
                        ORDER BY CASE WHEN s.kind IN ('class', 'interface', 'object', 'enum', 'package')
@@ -6339,6 +6339,8 @@ pub struct SearchResult {
     pub qualified_name: Option<String>,
     pub kind: String,
     pub line: i64,
+    #[serde(skip_serializing)]
+    pub end_line: Option<i64>,
     pub signature: Option<String>,
     pub path: String,
     #[serde(skip_serializing)]
@@ -6362,6 +6364,7 @@ fn row_to_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchResul
         qualified_name: row.get(1)?,
         kind: row.get(2)?,
         line: row.get(3)?,
+        end_line: row.get(7)?,
         signature: row.get(4)?,
         path: row.get(5)?,
         root_path,
@@ -6417,7 +6420,7 @@ fn find_by_last_segment(
     let (scope_clause, scope_params) = scope.path_condition();
     let (condition, mut values) = last_segment_condition(name);
     let mut sql = format!(
-        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path \
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line \
          FROM symbols s JOIN files f ON s.file_id = f.id WHERE {condition}{scope_clause}"
     );
     values.extend(scope_params);
@@ -6625,7 +6628,7 @@ pub fn find_symbols_by_name(
     if name.starts_with("::") {
         let exact_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
@@ -6634,7 +6637,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6658,7 +6661,7 @@ pub fn find_symbols_by_name(
     if name.contains("::") {
         let exact_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1)) AND s.kind = ?2
@@ -6666,7 +6669,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
@@ -6689,7 +6692,7 @@ pub fn find_symbols_by_name(
 
         let suffix_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
@@ -6698,7 +6701,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6726,7 +6729,7 @@ pub fn find_symbols_by_name(
 
         let prefix_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
@@ -6735,7 +6738,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6759,7 +6762,7 @@ pub fn find_symbols_by_name(
     // Try exact match first
     let exact_query = if kind.is_some() {
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name = ?1 AND s.kind = ?2
@@ -6767,7 +6770,7 @@ pub fn find_symbols_by_name(
         "#
     } else {
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name = ?1
@@ -6798,7 +6801,7 @@ pub fn find_symbols_by_name(
         let pattern = format!("{}%", name);
         let prefix_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.name LIKE ?1 AND s.kind = ?2
@@ -6807,7 +6810,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.name LIKE ?1
@@ -6836,7 +6839,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     if name.starts_with("::") {
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6854,7 +6857,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     if name.contains("::") {
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
@@ -6872,7 +6875,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
 
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6891,7 +6894,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
 
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -6908,7 +6911,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name = ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
@@ -6973,7 +6976,7 @@ pub fn find_class_like_pattern(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE ({} LIKE ?1 ESCAPE '\'{} ) AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
@@ -7053,7 +7056,7 @@ pub fn find_symbols_by_pattern(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE ({} LIKE ?1 ESCAPE '\'{} ){}{}
@@ -7203,7 +7206,7 @@ fn query_implementations(
     use rusqlite::types::Value;
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM inheritance i
         JOIN symbols s ON i.child_id = s.id
         JOIN files f ON s.file_id = f.id
@@ -7499,7 +7502,7 @@ pub fn get_file_symbols(
     path: &str,
 ) -> Result<Vec<SearchResult>> {
     let mut stmt = conn.prepare(concat!(
-        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
          FROM symbols s
          JOIN files f ON s.file_id = f.id
          WHERE f.path = ?1 AND ",
@@ -7636,7 +7639,7 @@ pub fn find_owning_symbol(
 ) -> Result<Option<SearchResult>> {
     let root_path = root_path.unwrap_or("");
     let mut stmt = conn.prepare_cached(concat!(
-        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
          FROM symbols s
          JOIN files f ON s.file_id = f.id
          WHERE f.path = ?1
@@ -7657,7 +7660,7 @@ pub fn find_owning_symbol(
     }
 
     let mut fallback = conn.prepare_cached(concat!(
-        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
          FROM symbols s
          JOIN files f ON s.file_id = f.id
          WHERE f.path = ?1
@@ -7864,7 +7867,7 @@ pub fn count_refs(conn: &Connection) -> Result<i64> {
 pub fn find_imports(conn: &Connection, name: &str, limit: usize) -> Result<Vec<SearchResult>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.kind = 'import' AND s.name = ?1
@@ -7911,7 +7914,7 @@ pub fn find_imports_scoped(
 ) -> Result<Vec<SearchResult>> {
     let (scope_clause, scope_params) = scope.path_condition();
     let sql = format!(
-        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.kind = 'import' AND s.name = ?{scope_clause} LIMIT ?"
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.kind = 'import' AND s.name = ?{scope_clause} LIMIT ?"
     );
     let mut values = vec![name.to_string()];
     values.extend(scope_params);
@@ -7931,7 +7934,7 @@ pub fn find_definitions(conn: &Connection, name: &str, limit: usize) -> Result<V
     let find = |predicate: &str, value: String| -> Result<Vec<SearchResult>> {
         let sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE {predicate} AND s.kind != 'import'
@@ -7980,7 +7983,7 @@ pub fn find_definitions_scoped(
     let find = |predicate: &str, value: String| -> Result<Vec<SearchResult>> {
         let (scope_clause, scope_params) = scope.path_condition();
         let sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE {predicate} AND s.kind != 'import'{scope_clause} ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name) LIMIT ?"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line FROM symbols s JOIN files f ON s.file_id = f.id WHERE {predicate} AND s.kind != 'import'{scope_clause} ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name) LIMIT ?"
         );
         let mut values = vec![value];
         values.extend(scope_params);
@@ -8051,7 +8054,7 @@ pub fn search_symbols_fuzzy(
     if query.contains("::") {
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
@@ -8091,7 +8094,7 @@ pub fn search_symbols_fuzzy(
     let contains_pattern = format!("%{}%", query);
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name LIKE ?1
@@ -8524,7 +8527,7 @@ pub fn search_symbol_terms_scoped_with_ids(
             .collect::<Vec<_>>()
             .join(" OR ");
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}{vendor_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line, s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}{vendor_clause}"
         )
     } else {
         values.push(
@@ -8535,7 +8538,7 @@ pub fn search_symbol_terms_scoped_with_ids(
                 .join(" OR "),
         );
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.id FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}{vendor_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line, s.id FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}{vendor_clause}"
         )
     };
     values.extend(scope_params);
@@ -8587,7 +8590,7 @@ pub fn search_symbol_terms_scoped_with_ids(
     let mut stmt = conn.prepare(&sql)?;
     let results = stmt
         .query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, i64>(7)?, row_to_search_result(row)?))
+            Ok((row.get::<_, i64>(8)?, row_to_search_result(row)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
@@ -8636,7 +8639,7 @@ pub fn search_symbols_for_command(
         };
         sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE {column} LIKE ?{scope_clause}
@@ -8678,7 +8681,7 @@ pub fn search_symbols_for_command(
         };
         sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE {predicate}{scope_clause}
@@ -8700,7 +8703,7 @@ pub fn search_symbols_for_command(
     } else {
         sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols_fts fts
             JOIN symbols s ON fts.rowid = s.id
             JOIN files f ON s.file_id = f.id
@@ -8768,7 +8771,7 @@ pub fn search_symbols_scoped(
 
         let sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE {}{}
@@ -8802,7 +8805,7 @@ pub fn search_symbols_scoped(
     let exact_placeholder = format!("?{}", 2 + scope_params.len());
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
@@ -8858,7 +8861,7 @@ pub fn find_symbols_by_name_scoped(
             name.to_string()
         };
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE {}{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line FROM symbols s JOIN files f ON s.file_id = f.id WHERE {}{}",
             predicate, scope_clause
         );
         if kind.is_some() {
@@ -8890,7 +8893,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -8921,7 +8924,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -8950,7 +8953,7 @@ pub fn find_symbols_by_name_scoped(
     }
 
     let mut sql = format!(
-        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1{}",
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1{}",
         scope_clause
     );
     if kind.is_some() {
@@ -9010,7 +9013,7 @@ pub fn find_class_like_scoped(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE {} AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
@@ -9038,7 +9041,7 @@ pub fn find_class_like_scoped(
     if results.is_empty() && name.contains("::") && !name.starts_with("::") {
         let sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
@@ -9454,6 +9457,7 @@ pub fn find_symbols_under(conn: &Connection, dir: &str, file_suffix: &str) -> Re
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
                 line: row.get(3)?,
+                end_line: None,
                 signature: row.get(4)?,
                 path: row.get(5)?,
                 root_path: None,

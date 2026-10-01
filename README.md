@@ -290,6 +290,8 @@ ast-index search <QUERY>           # Universal structural search
 ast-index search <QUERY> --rank <PRESET>  # Re-rank by history + graph: proven, hotspots, risky, central
 ast-index file <PATTERN>           # Find files
 ast-index symbol <NAME>            # Find symbols
+ast-index symbol <NAME> --with-content # Include matched symbol bodies
+ast-index search <QUERY> --with-content # Include matched symbol bodies
 ast-index class <NAME>             # Find classes/interfaces
 ast-index outline <FILE>           # Symbols in file
 ast-index imports <FILE>           # Imports in file
@@ -297,6 +299,7 @@ ast-index refs <SYMBOL>            # Definitions + imports + usages
 ast-index usages <SYMBOL>          # Symbol usages
 ast-index callers <FUNCTION>       # Function call sites
 ast-index implementations <PARENT> # Find implementations
+ast-index implementations <PARENT> --with-content # Include implementation bodies
 ast-index hierarchy <CLASS>        # Class hierarchy tree
 ast-index changed [--base BRANCH]  # Branch-level changed files (A/M/D/R)
 ast-index hotspots [--collect]     # Rank files by Git history (churn, fixes, authors)
@@ -322,6 +325,16 @@ Limited search commands now report completeness explicitly. `symbol`, `class`,
   }
 }
 ```
+
+For `symbol --with-content` and `implementations --with-content`, each item
+additionally contains `content`, `truncated`, and `end_line`. `content` is a
+line-numbered source body read from disk, capped at 60 lines; `truncated` tells
+whether the range extends past those lines, and `end_line` is the indexed end
+of the symbol. `search --with-content` adds the same fields to its `symbols`
+array, including ranked search. Text output marks truncated bodies. Without
+the flag, response shapes are unchanged. The index stores parser supplied
+start and end lines, not body text. Existing indexes gain ranges as files are
+reindexed; `rebuild` fills them immediately.
 
 `search` and `refs` keep their named result arrays and provide one pagination
 object per array under `pagination`. Consumers migrating from bare arrays must

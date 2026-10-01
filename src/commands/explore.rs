@@ -795,7 +795,7 @@ fn emit_json(
 }
 
 // ---------------------------------------------------------------------------
-// Source extraction (from disk, by coordinates + indentation heuristic)
+// Source extraction from indexed coordinates; old indexes use the heuristic.
 // ---------------------------------------------------------------------------
 
 /// What `explore` shows of a chosen file.
@@ -860,6 +860,17 @@ fn read_outline(conn: &Connection, sym: &SearchResult) -> Option<FileContext> {
 }
 
 fn read_snippet(root: &Path, sym: &SearchResult) -> Option<String> {
+    read_symbol_source(root, sym).map(|snippet| snippet.content)
+}
+
+pub(crate) struct SourceSnippet {
+    pub content: String,
+    pub truncated: bool,
+    pub end_line: i64,
+    pub displayed_end_line: i64,
+}
+
+pub(crate) fn read_symbol_source(root: &Path, sym: &SearchResult) -> Option<SourceSnippet> {
     let abs = abs_path(root, &sym.path, sym.root_path.as_deref());
     let content = fs::read_to_string(&abs).ok()?;
     let lines: Vec<&str> = content.lines().collect();
@@ -874,39 +885,39 @@ fn read_snippet(root: &Path, sym: &SearchResult) -> Option<String> {
     // blocks — the synthetic component symbol sits at line 1, so show an
     // overview window (script + start of template) instead of a misfired
     // brace/indent slice.
-    let end = match ext_of(&sym.path).as_deref() {
-        Some("vue") | Some("svelte") => (start + 30).min(lines.len()),
-        _ => block_end(&lines, start),
-    };
+    let source_end = sym
+        .end_line
+        .filter(|&line| line >= sym.line)
+        .map(|line| line as usize)
+        .unwrap_or_else(|| match ext_of(&sym.path).as_deref() {
+            Some("vue") | Some("svelte") => (start + 30).min(lines.len()),
+            _ => block_end(&lines, start),
+        });
+    let end = source_end
+        .min(start.saturating_add(SNIPPET_CAP_LINES))
+        .min(lines.len());
     let mut out = String::new();
     for (n, line) in lines[start..end].iter().enumerate() {
         out.push_str(&format!("{:>5}\t{}\n", start + n + 1, line));
     }
-    Some(out)
+    Some(SourceSnippet {
+        content: out,
+        truncated: source_end > end,
+        end_line: source_end as i64,
+        displayed_end_line: end as i64,
+    })
 }
 
-/// Determine the end (exclusive) of a block starting at `start`.
-///
-/// Hybrid, language-agnostic: brace-delimited languages (C/C++/C#/Java/JS/TS/
-/// Go/Rust/Swift/Kotlin/PHP) close on `{`/`}` balance — this captures full
-/// method bodies that the pure-indentation heuristic missed (it returned only
-/// the signature when the body opened with a brace). Indentation-delimited
-/// languages (Python/Ruby) fall back to the indent rule. Capped either way.
+/// Fallback for indexes built before parser end lines were stored.
 fn block_end(lines: &[&str], start: usize) -> usize {
     let cap = (start + SNIPPET_CAP_LINES).min(lines.len());
-    // Brace-style if an opening `{` appears on the signature lines — covers
-    // both `fn f() {` and the Allman `fn f()\n{`.
     let probe = (start + 4).min(lines.len());
-    let brace_style = lines[start..probe].iter().any(|l| l.contains('{'));
-    if brace_style {
+    if lines[start..probe].iter().any(|line| line.contains('{')) {
         return brace_block_end(lines, start, cap);
     }
     indent_block_end(lines, start, cap)
 }
 
-/// End of a brace-delimited block: first line where `{`/`}` balance returns to
-/// zero after the opening brace. Ignores `//` line comments; string/`/* */`
-/// edge cases are tolerated (rare in a signature+body window).
 fn brace_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
     let mut depth: i32 = 0;
     let mut opened = false;
@@ -934,9 +945,6 @@ fn brace_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
     j
 }
 
-/// End of an indentation-delimited block: blank lines and any line indented
-/// deeper than the start are included; stop at the first line at/below the
-/// start indent, keeping a lone trailing closer (`}` / `end`).
 fn indent_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
     let base = indent_width(lines[start]);
     let mut j = start + 1;
@@ -947,8 +955,7 @@ fn indent_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
             continue;
         }
         if indent_width(line) <= base {
-            let t = line.trim();
-            if matches!(t, "}" | "end" | ")" | "]" | "};" | "})" | "end;") {
+            if matches!(line.trim(), "}" | "end" | ")" | "]" | "};" | "})" | "end;") {
                 j += 1;
             }
             break;
@@ -956,6 +963,10 @@ fn indent_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
         j += 1;
     }
     j.min(lines.len())
+}
+
+fn indent_width(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
 }
 
 // ---------------------------------------------------------------------------
@@ -983,10 +994,6 @@ fn tokenize(raw: &str) -> Vec<String> {
     } else {
         meaningful
     }
-}
-
-fn indent_width(line: &str) -> usize {
-    line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
 }
 
 fn ext_of(path: &str) -> Option<String> {
@@ -1245,6 +1252,7 @@ mod tests {
             qualified_name: None,
             kind: kind.to_string(),
             line,
+            end_line: None,
             signature: None,
             path: path.to_string(),
             root_path: None,

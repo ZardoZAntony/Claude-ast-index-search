@@ -337,6 +337,9 @@ enum Commands {
     Search {
         /// Search query
         query: String,
+        /// Include each matched symbol's source body
+        #[arg(long)]
+        with_content: bool,
         /// Filter symbols by type: class, interface, function, property
         #[arg(long, short = 't')]
         r#type: Option<String>,
@@ -377,6 +380,9 @@ enum Commands {
     Symbol {
         /// Symbol name (exact match; omit when using --pattern)
         name: Option<String>,
+        /// Include each matched symbol's source body
+        #[arg(long)]
+        with_content: bool,
         /// Glob pattern for symbol name (e.g. "*Mailer", "*Email*Service*")
         #[arg(long, short = 'p')]
         pattern: Option<String>,
@@ -420,6 +426,9 @@ enum Commands {
     Implementations {
         /// Parent class/interface name
         parent: String,
+        /// Include each implementation's source body
+        #[arg(long)]
+        with_content: bool,
         /// Max results
         #[arg(short, long, default_value = "20")]
         limit: usize,
@@ -1325,6 +1334,7 @@ fn main() -> Result<()> {
         // Index commands
         Commands::Search {
             query,
+            with_content,
             r#type,
             limit,
             in_file,
@@ -1348,10 +1358,12 @@ fn main() -> Result<()> {
                 fuzzy,
                 rank.as_deref(),
                 exclude_tests,
+                with_content,
             )
         }
         Commands::Symbol {
             name,
+            with_content,
             pattern,
             r#type,
             limit,
@@ -1373,6 +1385,7 @@ fn main() -> Result<()> {
                 format,
                 &scope,
                 fuzzy,
+                with_content,
             )
         }
         Commands::Class {
@@ -1400,6 +1413,7 @@ fn main() -> Result<()> {
         }
         Commands::Implementations {
             parent,
+            with_content,
             limit,
             in_file,
             module,
@@ -1409,7 +1423,14 @@ fn main() -> Result<()> {
                 module: module.as_deref(),
                 dir_prefix: dir_prefix_ref,
             };
-            commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
+            commands::index::cmd_implementations(
+                &root,
+                &parent,
+                limit,
+                format,
+                &scope,
+                with_content,
+            )
         }
         Commands::Refs {
             symbol,
