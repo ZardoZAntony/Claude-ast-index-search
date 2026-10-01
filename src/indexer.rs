@@ -621,6 +621,27 @@ const STACK_SCAN_MAX_ENTRIES: usize = 20_000;
 const STACK_MARKERS_PER_KIND: usize = 32;
 const STACK_GRADLE_MAX_FILES: usize = 64;
 const STACK_GRADLE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// A build marker under a test or fixture directory describes the sample
+/// project a test indexes, not the repository: `tests/fixtures/java/pom.xml`
+/// made this Rust repository an Android project.
+const STACK_FIXTURE_DIR_SEGMENTS: &[&str] = &[
+    "test",
+    "tests",
+    "__tests__",
+    "fixtures",
+    "__fixtures__",
+    "test-fixtures",
+    "testdata",
+];
+
+fn is_under_fixture_dir(relative: &str) -> bool {
+    let mut segments: Vec<&str> = relative.split('/').collect();
+    segments.pop();
+    segments
+        .iter()
+        .any(|segment| STACK_FIXTURE_DIR_SEGMENTS.contains(segment))
+}
+
 const ROOT_STACK_MARKER_NAMES: &[&str] = &[
     "settings.gradle.kts",
     "settings.gradle",
@@ -766,6 +787,7 @@ fn scan_stack_markers(root: &Path, limits: StackScanLimits) -> StackMarkerScan {
         walked
             .into_iter()
             .map(|(entry, _)| entry)
+            .filter(|entry| !is_under_fixture_dir(&entry.relative))
             .filter(|entry| seen.insert(entry.relative.clone())),
     );
 
@@ -5576,6 +5598,18 @@ no_ignore: true
 
         let empty = TempDir::new().unwrap();
         assert_eq!(project_label(empty.path()), ProjectType::Unknown.as_str());
+    }
+
+    #[test]
+    fn project_label_ignores_build_markers_inside_test_fixtures() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        for fixture in ["tests/fixtures/java/pom.xml", "src/test/ios/Package.swift"] {
+            let path = dir.path().join(fixture);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        assert_eq!(project_label(dir.path()), "Rust");
     }
 
     #[test]
