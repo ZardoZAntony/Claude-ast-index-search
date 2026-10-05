@@ -1,6 +1,6 @@
 {
   "name": "ast-index",
-  "version": "3.55.1-php.2",
+  "version": "3.55.1-php.3",
   "description": "Structural code index for PHP, JavaScript, TypeScript and Vue: usages, callers, refactoring impact, move plans, dead code and duplicates in one call",
   "author": {
     "name": "ZardoZAntony"
