@@ -58,7 +58,9 @@ Details: [JS/TS reference](plugin/skills/ast-index/references/typescript-command
 `bitrix/modules/*/lib`, `vendor/symfony`…) are indexed past `.gitignore` for their definitions only: `class`,
 `symbol`, `file`, `outline`, `hierarchy` find them, `impact`/`callers` show their definitions and declarations,
 `implementations` follows inheritance through them. `search`, `usages`, `unused-symbols`, `duplicates` and grep
-leave them out unless `--external`.
+leave them out unless `--external`. A linked git worktree (`git worktree add`) usually has only the few files of
+such directories the repository keeps, so each is read from the main worktree, unless the linked one holds its own
+installed copy (files git does not track there); paths of those files are printed absolute.
 
 **The agent picks the index by itself.** At session start the plugin puts a short list of rules into the context
 (only in projects that have an index); a note is added when a `grep`/`rg` search looks for a code symbol (never a

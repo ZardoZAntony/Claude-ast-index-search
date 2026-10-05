@@ -287,6 +287,18 @@ impl PathResolver {
     /// just the absolute path. Useful when callers want the path for both
     /// text and JSON output and apply decoration themselves.
     pub fn resolve_with_root_raw(&self, rel: &str, root_path: Option<&str>) -> String {
+        // A root that is neither the project nor an extra root: external code read from the main worktree of a
+        // linked one. Its relative path would point into the project, where the file is not.
+        if let Some(root_path) = root_path.filter(|root_path| {
+            !root_path.is_empty()
+                && *root_path != self.primary_key
+                && !self.extra.iter().any(|(key, _)| key == root_path)
+        }) {
+            let abs = PathBuf::from(root_path).join(rel);
+            if abs.exists() {
+                return abs.to_string_lossy().into_owned();
+            }
+        }
         if self.extra.is_empty() {
             return rel.to_string();
         }

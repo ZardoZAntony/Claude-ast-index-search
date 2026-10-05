@@ -164,3 +164,70 @@ fn update_follows_the_config() {
     assert!(!run_text(root, cache.path(), &["search", "UserTable"]).contains("core/lib/Orm/UserTable.php"));
     assert!(run_text(root, cache.path(), &["class", "UserTable"]).contains("core/lib/Orm/UserTable.php"));
 }
+
+fn git(cwd: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Main worktree with the external core next to its sources, and a linked worktree made by `git worktree add`:
+/// of the core it has only the file the repository keeps.
+fn worktrees() -> (TempDir, TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let main = tmp.path().join("main");
+    write(&main, ".gitignore", "/core/\n");
+    write(&main, ".ast-index.yaml", "external:\n  - core/lib\n");
+    write(&main, "core/lib/Web/HttpClient.php", "<?php\nnamespace Core\\Web;\n\nclass HttpClient {}\n");
+    write(&main, "core/lib/Web/Patched.php", "<?php\nnamespace Core\\Web;\n\nclass Patched {}\n");
+    write(
+        &main,
+        "src/Api/RetryClient.php",
+        "<?php\nnamespace App\\Api;\n\nuse Core\\Web\\HttpClient;\n\nfinal class RetryClient extends HttpClient {}\n",
+    );
+    git(&main, &["init", "-q"]);
+    git(&main, &["add", ".gitignore", ".ast-index.yaml", "src"]);
+    git(&main, &["add", "--force", "core/lib/Web/Patched.php"]);
+    git(&main, &["commit", "-qm", "init"]);
+    let linked = tmp.path().join("linked");
+    git(&main, &["worktree", "add", "-q", "-b", "feature", linked.to_str().unwrap()]);
+    (tmp, cache, main.canonicalize().unwrap(), linked)
+}
+
+#[test]
+fn linked_worktree_reads_external_code_from_the_main_worktree() {
+    let (_tmp, cache, main, linked) = worktrees();
+    run(&linked, cache.path(), &["rebuild"]);
+
+    let main_path = main.join("core/lib/Web/HttpClient.php").display().to_string();
+    let class = run_text(&linked, cache.path(), &["class", "HttpClient"]);
+    assert!(class.contains(&main_path), "{class}");
+    let impact = run(&linked, cache.path(), &["impact", "Core\\Web\\HttpClient", "--format", "json"]);
+    assert_eq!(impact["definitions"][0]["path"], main_path.as_str());
+    let references: Vec<&str> =
+        impact["references"].as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap()).collect();
+    // `use` and `extends` in the worktree's own code, with paths relative to it
+    assert!(!references.is_empty(), "{impact}");
+    assert!(references.iter().all(|path| *path == "src/Api/RetryClient.php"), "{references:?}");
+
+    // an unchanged update keeps the external files of the main worktree instead of deleting them
+    run(&linked, cache.path(), &["update"]);
+    assert!(run_text(&linked, cache.path(), &["class", "HttpClient"]).contains(&main_path));
+}
+
+#[test]
+fn linked_worktree_with_its_own_installed_copy_reads_it() {
+    let (_tmp, cache, main, linked) = worktrees();
+    // dependencies installed in the linked worktree itself: files git does not track
+    write(&linked, "core/lib/Web/HttpClient.php", "<?php\nnamespace Core\\Web;\n\nclass HttpClient {}\n");
+    run(&linked, cache.path(), &["rebuild"]);
+
+    let class = run_text(&linked, cache.path(), &["class", "HttpClient"]);
+    assert!(class.contains("core/lib/Web/HttpClient.php"), "{class}");
+    assert!(!class.contains(&main.display().to_string()), "{class}");
+}

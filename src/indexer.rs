@@ -2451,6 +2451,76 @@ pub fn external_dirs(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Main worktree of a linked git worktree: `.git` there is a file pointing into `<main>/.git/worktrees/<name>`,
+/// whose `commondir` leads back to `<main>/.git`. `None` for a main worktree, a bare repository or no git.
+fn main_worktree_of(root: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(root.join(".git")).ok()?;
+    let gitdir = root.join(content.lines().find_map(|line| line.strip_prefix("gitdir:"))?.trim());
+    let common_dir = fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common_dir = gitdir.join(common_dir.trim()).canonicalize().ok()?;
+    if common_dir.file_name()? != ".git" {
+        return None;
+    }
+    let main = common_dir.parent()?.to_path_buf();
+    (main != root.canonicalize().ok()?).then_some(main)
+}
+
+/// `external:` directories with the root each is read from. Framework cores and vendor packages are not under
+/// version control, so a linked git worktree usually has none of them, or only the few files the repository
+/// keeps. A directory is read from the main worktree, when it is there, unless the linked worktree holds files of
+/// it that git does not track — its own installed copy.
+fn external_bases(root: &Path) -> Vec<(PathBuf, String)> {
+    let dirs = external_dirs(root);
+    let main = main_worktree_of(root);
+    let own_copies = match &main {
+        Some(_) if !dirs.is_empty() => dirs_with_untracked_files(root, &dirs),
+        _ => None,
+    };
+    dirs.into_iter()
+        .map(|dir| {
+            let base = match (&main, &own_copies) {
+                (Some(main), Some(own_copies)) if !own_copies.contains(&dir) && main.join(&dir).is_dir() => {
+                    main.clone()
+                }
+                _ => root.to_path_buf(),
+            };
+            (base, dir)
+        })
+        .collect()
+}
+
+/// Of the given directories, those holding files git does not track (ignored ones included), by one
+/// `git ls-files --others --directory` call. `None` when git cannot answer: the project then reads its own copies.
+fn dirs_with_untracked_files(root: &Path, dirs: &[String]) -> Option<std::collections::HashSet<String>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--others", "--directory", "-z", "--"])
+        .args(dirs)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut found = std::collections::HashSet::new();
+    for entry in output.stdout.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+        let entry = String::from_utf8_lossy(entry);
+        let entry = entry.trim_end_matches('/');
+        // `--directory` names an untracked directory once, at the topmost untracked level: it may be the external
+        // directory, a directory inside it, or one that contains it.
+        for dir in dirs {
+            let inside = entry.strip_prefix(dir.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+            let contains = dir.strip_prefix(entry).is_some_and(|rest| rest.starts_with('/'));
+            if inside || contains {
+                found.insert(dir.clone());
+            }
+        }
+    }
+    Some(found)
+}
+
 /// Exclude lines keeping the project walk out of external directories — they are walked on their own.
 pub fn external_exclude_lines(root: &Path) -> Vec<String> {
     external_dirs(root).into_iter().map(|d| format!("/{d}/")).collect()
@@ -2471,12 +2541,13 @@ fn file_stamp(path: &Path) -> (i64, i64) {
         .unwrap_or((0, 0))
 }
 
-/// Source files of the external directories: absolute path and path relative to the project root. The walk
-/// ignores .gitignore and the project's `exclude` (framework cores and vendor are usually both).
-fn collect_external_files(root: &Path) -> Vec<(PathBuf, String)> {
+/// Source files of the external directories: absolute path, the root it was read from (see [`external_bases`])
+/// and the path relative to that root. The walk ignores .gitignore and the project's `exclude` (framework cores
+/// and vendor are usually both).
+fn collect_external_files(root: &Path) -> Vec<(PathBuf, PathBuf, String)> {
     let mut out = Vec::new();
-    for dir in external_dirs(root) {
-        let walk_dir = root.join(&dir);
+    for (base, dir) in external_bases(root) {
+        let walk_dir = base.join(&dir);
         if !walk_dir.is_dir() {
             continue;
         }
@@ -2502,8 +2573,8 @@ fn collect_external_files(root: &Path) -> Vec<(PathBuf, String)> {
                 continue;
             }
             let path = entry.path().to_path_buf();
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
-            out.push((path, rel));
+            let rel = path.strip_prefix(&base).unwrap_or(&path).to_string_lossy().into_owned();
+            out.push((path, base.clone(), rel));
         }
     }
     out
@@ -2520,7 +2591,7 @@ pub fn index_external_dirs(conn: &mut Connection, root: &Path, progress: bool) -
     }
     let parsed: Vec<ParsedFile> = files
         .par_iter()
-        .filter_map(|(path, _)| parse_file(root, path, true).ok())
+        .filter_map(|(path, base, _)| parse_file(base, path, true).ok())
         .collect();
     let mut total = 0;
     let mut batch = Vec::new();
@@ -2723,9 +2794,13 @@ pub fn update_directory_incremental(
     }
 
     // External directories (`external:` in .ast-index.yaml): their own walk past .gitignore and `exclude`.
-    let root_key = db::normalize_root_for_storage(root);
-    for (file_path, rel_path) in collect_external_files(root) {
-        let key = (root_key.clone(), rel_path.clone());
+    let mut base_keys: HashMap<PathBuf, String> = HashMap::new();
+    for (file_path, base, rel_path) in collect_external_files(root) {
+        let base_key = base_keys
+            .entry(base.clone())
+            .or_insert_with(|| db::normalize_root_for_storage(&base))
+            .clone();
+        let key = (base_key, rel_path.clone());
         let need_parse = match existing_files.get(&key) {
             Some((_, db_mtime, db_size)) => {
                 let (mtime, size) = file_stamp(&file_path);
@@ -2735,7 +2810,7 @@ pub fn update_directory_incremental(
         };
         if need_parse {
             files_to_parse.push(PendingUpdateFile::Regular {
-                root: root.to_path_buf(),
+                root: base,
                 path: file_path,
                 external: true,
             });

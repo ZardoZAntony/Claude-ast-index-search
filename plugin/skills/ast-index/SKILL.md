@@ -87,7 +87,8 @@ indexed for their definitions: `class`, `symbol`, `file`, `outline`, `hierarchy`
 their definitions and declarations, `implementations` follows inheritance through them. `search`, `explore`,
 `usages`, `refs`, `unused-symbols`, `duplicates` and grep-based commands leave them out; `--external` brings them
 in. `implementations` prints how many external subclasses it hid. Do not grep `bitrix/` or `vendor/` for a class:
-`ast-index class <Name>` gives the file, `outline` its methods with lines.
+`ast-index class <Name>` gives the file, `outline` its methods with lines. In a linked git worktree they may be
+read from the main worktree: such paths are absolute — open them as printed.
 
 ## Index or rg — what the measurements say
 
