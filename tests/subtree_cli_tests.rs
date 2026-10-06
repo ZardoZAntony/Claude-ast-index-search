@@ -205,3 +205,158 @@ fn legacy_add_root_still_works_and_auto_names() {
         "auto-name from path basename, got: {stdout}"
     );
 }
+
+fn subtree_names(project: &Path) -> Vec<String> {
+    let list = run(project, &["--format", "json", "subtree", "list"]);
+    assert!(list.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    parsed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn symbol_count(project: &Path, name: &str) -> usize {
+    let out = run(project, &["--format", "json", "symbol", name]);
+    assert!(out.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    parsed["items"].as_array().unwrap().len()
+}
+
+/// Inserts a subtree row the way an older binary left it, bypassing today's checks.
+fn attach_behind_cli(project: &Path, name: &str, path: &Path, original: &str) {
+    let cache = project.parent().unwrap().join("ast-index-test-cache");
+    let db_path = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("index.db"))
+        .find(|path| path.is_file())
+        .expect("index.db under the test cache");
+    let canonical = path.canonicalize().unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO subtrees (name, canonical_path, original_path) VALUES (?1, ?2, ?3)",
+            [name, &*canonical.to_string_lossy(), original],
+        )
+        .unwrap();
+}
+
+#[test]
+fn config_root_naming_the_project_itself_is_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let extra = tmp.path().join("extra");
+    write(&project.join("a.php"), "<?php class Alpha {}\n");
+    write(&extra.join("b.php"), "<?php class Beta {}\n");
+    write(&project.join(".ast-index.yaml"), "roots: [\".\", \"../extra\"]\n");
+
+    rebuild(&project);
+
+    assert_eq!(subtree_names(&project), vec!["extra".to_string()]);
+    assert_eq!(symbol_count(&project, "Alpha"), 1);
+    assert_eq!(symbol_count(&project, "Beta"), 1);
+}
+
+#[test]
+fn subtree_add_of_project_root_is_refused_even_with_force() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    write(&project.join("a.php"), "<?php class Alpha {}\n");
+
+    rebuild(&project);
+
+    for args in [
+        &["subtree", "add", "self", ".", "--force"][..],
+        &["add-root", ".", "--force"][..],
+    ] {
+        let out = run(&project, args);
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("project root itself"), "{args:?}: {stdout}");
+    }
+    assert!(subtree_names(&project).is_empty());
+    rebuild(&project);
+}
+
+#[test]
+fn rebuild_drops_saved_subtree_pointing_at_project_root() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    write(&project.join("a.php"), "<?php class Alpha {}\n");
+
+    rebuild(&project);
+
+    // An index attached to its own root by an older binary (`subtree add . --force`).
+    attach_behind_cli(&project, "self", &project, ".");
+    assert_eq!(subtree_names(&project), vec!["self".to_string()]);
+
+    rebuild(&project);
+
+    assert!(subtree_names(&project).is_empty());
+    assert_eq!(symbol_count(&project, "Alpha"), 1);
+}
+
+#[test]
+fn config_roots_overlapping_the_project_or_each_other_are_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let lib = tmp.path().join("lib");
+    write(&project.join("a.php"), "<?php class Alpha {}\n");
+    write(&project.join("sub/b.php"), "<?php class Beta {}\n");
+    write(&lib.join("c.php"), "<?php class Gamma {}\n");
+    write(&lib.join("core/d.php"), "<?php class Delta {}\n");
+    write(
+        &project.join(".ast-index.yaml"),
+        "roots: [\"sub\", \"..\", \"../lib\", \"../lib/core\"]\n",
+    );
+
+    let out = run(&project, &["rebuild"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for (raw, reason) in [
+        ("sub", "is inside the project root"),
+        ("..", "contains the project root"),
+        ("../lib/core", "overlaps the attached root"),
+    ] {
+        let warning = format!("skipped config root '{raw}': it {reason}");
+        assert!(stderr.contains(&warning), "no '{warning}' in: {stderr}");
+    }
+
+    assert_eq!(subtree_names(&project), vec!["lib".to_string()]);
+    for class in ["Alpha", "Beta", "Gamma", "Delta"] {
+        assert_eq!(symbol_count(&project, class), 1, "{class}");
+    }
+}
+
+#[test]
+fn nested_config_root_saved_by_an_older_binary_is_dropped() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    write(&project.join("sub/b.php"), "<?php class Beta {}\n");
+
+    rebuild(&project);
+    attach_behind_cli(&project, "sub", &project.join("sub"), "sub");
+    write(&project.join(".ast-index.yaml"), "roots: [\"sub\"]\n");
+
+    rebuild(&project);
+
+    assert!(subtree_names(&project).is_empty());
+    assert_eq!(symbol_count(&project, "Beta"), 1);
+}
+
+#[test]
+fn forced_nested_subtree_survives_rebuild() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    write(&project.join("sub/b.php"), "<?php class Beta {}\n");
+
+    rebuild(&project);
+    let forced = run(&project, &["subtree", "add", "inner", "./sub", "--force"]);
+    assert!(forced.status.success());
+
+    rebuild(&project);
+
+    assert_eq!(subtree_names(&project), vec!["inner".to_string()]);
+}

@@ -137,45 +137,82 @@ fn attach_rebuild_subtrees(
     extra_paths: &[String],
     verbose: bool,
 ) -> Result<()> {
-    let mut taken_canonicals: HashSet<String> = HashSet::new();
-    for sub in saved_subtrees {
-        db::insert_subtree(conn, &sub.name, &sub.canonical_path, &sub.original_path)?;
-        taken_canonicals.insert(sub.canonical_path.clone());
-    }
+    // Every root is walked whole, so a root inside another one indexes the same files twice, and the
+    // project root itself attached again fails the rebuild on UNIQUE(root_path, path). Config and
+    // `--path` roots have no --force, so they may overlap neither the project nor each other;
+    // saved subtrees are kept as attached, since `subtree add --force` was an explicit choice.
+    let primary = PathBuf::from(db::normalize_root_for_storage(root));
+    let mut taken: Vec<PathBuf> = saved_subtrees
+        .iter()
+        .map(|sub| PathBuf::from(&sub.canonical_path))
+        .filter(|path| *path != primary)
+        .collect();
 
-    // Append config-supplied roots and CLI `--path` args. Each new path
-    // gets an auto-allocated subtree name (basename, with `-N` suffix on
-    // collision). Paths that already match an existing subtree by their
-    // canonical form are deduplicated.
-    let mut attach_extra = |raw: &str, label: &str| -> Result<()> {
-        let candidate = if std::path::Path::new(raw).is_absolute() {
-            std::path::PathBuf::from(raw)
+    let requested = config_roots
+        .unwrap_or_default()
+        .iter()
+        .map(|raw| (raw, "config root"))
+        .chain(extra_paths.iter().map(|raw| (raw, "--path")));
+    let mut accepted: Vec<(String, &String)> = Vec::new();
+    // A config root attached by an older binary comes back among the saved subtrees.
+    let mut rejected: HashSet<PathBuf> = HashSet::new();
+    for (raw, label) in requested {
+        let candidate = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
         } else {
             root.join(raw)
         };
-        let canonical = db::safe_canonicalize(&candidate)
-            .to_string_lossy()
-            .into_owned();
-        if taken_canonicals.contains(&canonical) {
-            return Ok(());
+        let canonical = db::safe_canonicalize(&candidate);
+        let reason = if canonical == primary {
+            Some("it is the project root itself".to_string())
+        } else if canonical.starts_with(&primary) {
+            Some(
+                "it is inside the project root, which already indexes it \
+                 (hidden directories go to `include_hidden`)"
+                    .to_string(),
+            )
+        } else if primary.starts_with(&canonical) {
+            Some("it contains the project root, which would be indexed twice".to_string())
+        } else if taken.contains(&canonical) {
+            None
+        } else {
+            taken
+                .iter()
+                .find(|other| canonical.starts_with(other) || other.starts_with(&canonical))
+                .map(|other| format!("it overlaps the attached root {}", other.display()))
+        };
+        if let Some(reason) = reason {
+            eprintln!(
+                "{}",
+                format!("Warning: skipped {} '{}': {}.", label, raw, reason).yellow()
+            );
+            rejected.insert(canonical);
+            continue;
         }
-        let preferred = db::default_subtree_name(&canonical);
-        let name = db::allocate_subtree_name(conn, &preferred)?;
-        db::insert_subtree(conn, &name, &canonical, raw)?;
-        taken_canonicals.insert(canonical);
+        if taken.contains(&canonical) {
+            continue;
+        }
         if verbose {
             eprintln!("[verbose] attached {}: {}", label, raw);
         }
-        Ok(())
-    };
-
-    if let Some(config_roots) = config_roots {
-        for cr in config_roots {
-            attach_extra(cr, "config root")?;
-        }
+        accepted.push((canonical.to_string_lossy().into_owned(), raw));
+        taken.push(canonical);
     }
-    for p in extra_paths {
-        attach_extra(p, "--path")?;
+
+    for sub in saved_subtrees {
+        let path = PathBuf::from(&sub.canonical_path);
+        if path == primary || rejected.contains(&path) {
+            if verbose {
+                eprintln!("[verbose] dropped subtree {}: {}", sub.name, sub.canonical_path);
+            }
+            continue;
+        }
+        db::insert_subtree(conn, &sub.name, &sub.canonical_path, &sub.original_path)?;
+    }
+    // Auto-named after the saved ones so that their names win a collision.
+    for (canonical, raw) in accepted {
+        let name = db::allocate_subtree_name(conn, &db::default_subtree_name(&canonical))?;
+        db::insert_subtree(conn, &name, &canonical, raw)?;
     }
     Ok(())
 }
@@ -1757,6 +1794,14 @@ pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(&abs_path));
 
+    // Not even with --force: rebuild would walk the root twice and fail on UNIQUE(root_path, path).
+    if canonical_new == canonical_root {
+        println!(
+            "{}",
+            format!("'{}' is the project root itself; it is always indexed.", abs_path).yellow()
+        );
+        return Ok(());
+    }
     if !force {
         if canonical_new.starts_with(&canonical_root) {
             println!(
@@ -1851,12 +1896,21 @@ fn resolve_subtree_path(path: &str) -> (String, String) {
 
 /// Reject obvious overlaps with the primary project root unless --force.
 fn reject_overlap_with_root(root: &Path, canonical_new: &str, force: bool) -> Result<bool> {
-    if force {
-        return Ok(true);
-    }
     let canonical_root = db::safe_canonicalize(root).to_string_lossy().into_owned();
     let canonical_new_pb = std::path::Path::new(canonical_new);
     let canonical_root_pb = std::path::Path::new(&canonical_root);
+
+    // Not even with --force: rebuild would walk the root twice and fail on UNIQUE(root_path, path).
+    if canonical_new_pb == canonical_root_pb {
+        println!(
+            "{}",
+            format!("'{}' is the project root itself; it is always indexed.", canonical_new).yellow()
+        );
+        return Ok(false);
+    }
+    if force {
+        return Ok(true);
+    }
 
     if canonical_new_pb.starts_with(canonical_root_pb) {
         println!(
