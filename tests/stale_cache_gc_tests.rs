@@ -6,7 +6,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::mpsc;
+use std::sync::{mpsc, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ast_index::db;
@@ -18,6 +18,27 @@ const CHILD_LOCK_PATH: &str = "AST_INDEX_GC_TEST_CHILD_LOCK_PATH";
 const CHILD_PROJECT: &str = "AST_INDEX_GC_TEST_CHILD_PROJECT";
 const CHILD_READY: &str = "AST_INDEX_GC_TEST_CHILD_READY";
 const CHILD_RELEASE: &str = "AST_INDEX_GC_TEST_CHILD_RELEASE";
+
+/// A child process gets a copy of every open descriptor until it execs, flock locks
+/// included: a lock file a sweep has just released can still be held by a child that
+/// another test spawned meanwhile, and the sweep then leaves it behind. Spawns wait
+/// for running sweeps.
+static SPAWN_GUARD: RwLock<()> = RwLock::new(());
+
+fn gc_stale_caches_in(
+    base: &Path,
+    keep: Option<&str>,
+    max_age: Duration,
+    now: SystemTime,
+) -> anyhow::Result<usize> {
+    let _sweep = SPAWN_GUARD.read().unwrap_or_else(PoisonError::into_inner);
+    db::gc_stale_caches_in(base, keep, max_age, now)
+}
+
+fn spawn_guarded(command: &mut Command) -> Child {
+    let _spawn = SPAWN_GUARD.write().unwrap_or_else(PoisonError::into_inner);
+    command.spawn().unwrap()
+}
 
 fn test_now() -> SystemTime {
     // Whole seconds make exact-boundary assertions independent of how a
@@ -125,7 +146,7 @@ fn spawn_test_child(test_name: &str, env: &[(&str, &Path)]) -> Child {
     for (key, value) in env {
         command.env(key, value);
     }
-    command.spawn().unwrap()
+    spawn_guarded(&mut command)
 }
 
 /// Hold a shared flock on `path` from another thread until the returned
@@ -165,7 +186,7 @@ fn deletes_stale_cache_and_keeps_fresh_cache() {
         at_age(now, db::STALE_CACHE_MAX_AGE + Duration::from_secs(1)),
     );
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 1);
     assert!(fresh.is_dir());
@@ -188,7 +209,7 @@ fn keeps_exact_fourteen_day_boundary_and_deletes_one_second_past_it() {
         at_age(now, fourteen_days + Duration::from_secs(1)),
     );
 
-    let removed = db::gc_stale_caches_in(base.path(), None, fourteen_days, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, fourteen_days, now).unwrap();
 
     assert_eq!(removed, 1);
     assert!(boundary.is_dir());
@@ -201,7 +222,7 @@ fn keeps_cache_with_future_activity_timestamp() {
     let now = test_now();
     let future = make_cache(base.path(), "e5", "index.db", now.checked_add(DAY).unwrap());
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 0);
     assert!(future.is_dir());
@@ -216,7 +237,7 @@ fn never_deletes_kept_cache_even_when_stale() {
     let other = make_cache(base.path(), "dead", "index.db", stale_mtime);
 
     let removed =
-        db::gc_stale_caches_in(base.path(), Some("cafe"), db::STALE_CACHE_MAX_AGE, now).unwrap();
+        gc_stale_caches_in(base.path(), Some("cafe"), db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 1);
     assert!(kept.is_dir());
@@ -235,7 +256,7 @@ fn collects_legacy_cache_with_only_stale_main_database() {
     );
     assert_eq!(fs::read_dir(&legacy).unwrap().count(), 1);
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 1);
     assert!(!legacy.exists());
@@ -252,7 +273,7 @@ fn recent_main_sidecar_keeps_cache_with_stale_main_database() {
     let shm_cache = make_cache(base.path(), "a11cf", "index.db", stale_mtime);
     write_activity_file(&shm_cache, "index.db-shm", recent_mtime);
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 0);
     assert!(wal_cache.is_dir());
@@ -271,7 +292,7 @@ fn recent_journal_keeps_stale_live_and_swap_caches() {
     let swap_cache = make_cache(base.path(), "a11d1", "index.db.swap", stale_mtime);
     write_activity_file(&swap_cache, "index.db.swap-journal", recent_mtime);
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 0);
     assert!(live_cache.is_dir());
@@ -291,7 +312,7 @@ fn handles_swap_only_cache_and_swap_sidecar_activity() {
     let active_shm = make_cache(base.path(), "5a20", "index.db.swap", stale_mtime);
     write_activity_file(&active_shm, "index.db.swap-shm", recent_mtime);
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     // A swap without a publication marker has ambiguous ownership. Recovery
     // fails closed, so GC must preserve it indefinitely instead of guessing.
@@ -309,7 +330,7 @@ fn active_publication_marker_is_never_collected_by_age() {
     let publishing = make_cache(base.path(), "5a21", "index.db", stale_mtime);
     write_activity_file(&publishing, "index.db.publish-state-v1", stale_mtime);
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 0);
     assert!(publishing.is_dir());
@@ -336,7 +357,7 @@ fn ignores_invalid_names_foreign_dirs_and_non_directory_entries() {
     let non_file_anchor = base.path().join("dad");
     fs::create_dir_all(non_file_anchor.join("index.db")).unwrap();
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 0);
     for name in invalid_names {
@@ -364,7 +385,7 @@ fn ignores_top_level_symlink_even_when_target_is_a_stale_cache() {
     let link = base.join("abcd");
     symlink(&target, &link).unwrap();
 
-    let removed = db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    let removed = gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     assert_eq!(removed, 0);
     assert!(fs::symlink_metadata(&link)
@@ -391,7 +412,7 @@ fn ignores_cache_whose_index_database_is_a_symlink() {
     let link = cache.join("index.db");
     symlink(&target, &link).unwrap();
 
-    let removed = db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    let removed = gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     assert_eq!(removed, 0);
     assert!(cache.is_dir());
@@ -420,7 +441,7 @@ fn refuses_symlinked_gc_trash_directory() {
         at_age(test_now(), db::STALE_CACHE_MAX_AGE + DAY),
     );
 
-    let removed = db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    let removed = gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     assert_eq!(removed, 0);
     assert!(stale.is_dir());
@@ -448,8 +469,7 @@ fn held_shared_project_lease_defers_collection_until_released() {
         .unwrap();
     fs2::FileExt::lock_shared(&lease).unwrap();
 
-    let while_held =
-        db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let while_held = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
     assert_eq!(while_held, 0);
     assert!(stale.is_dir());
     assert!(leases.join(format!("{key}.lock")).is_file());
@@ -458,7 +478,7 @@ fn held_shared_project_lease_defers_collection_until_released() {
     drop(lease);
 
     let after_release =
-        db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+        gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
     assert_eq!(after_release, 1);
     assert!(!stale.exists());
     assert!(!leases.join(format!("{key}.lock")).exists());
@@ -472,7 +492,7 @@ fn cleans_crash_leftover_tombstone_without_counting_it_as_new_removal() {
     fs::write(tombstone.join("nested").join("index.db"), b"leftover").unwrap();
 
     let removed =
-        db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+        gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     assert_eq!(removed, 0);
     assert!(!tombstone.exists());
@@ -487,7 +507,7 @@ fn leaves_foreign_directory_inside_gc_trash_untouched() {
     fs::write(foreign.join("important.txt"), b"keep").unwrap();
 
     let removed =
-        db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+        gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     assert_eq!(removed, 0);
     assert!(foreign.join("important.txt").is_file());
@@ -498,8 +518,7 @@ fn missing_base_directory_is_a_noop() {
     let temp = TempDir::new().unwrap();
     let missing = temp.path().join("does-not-exist");
 
-    let removed =
-        db::gc_stale_caches_in(&missing, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    let removed = gc_stale_caches_in(&missing, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     assert_eq!(removed, 0);
     assert!(!missing.exists());
@@ -521,7 +540,7 @@ fn collected_cache_loses_its_lease_locks() {
     touch_lock_pair(base.path(), "a1");
     touch_lock_pair(base.path(), "0123456789abcdef");
 
-    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+    let removed = gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 2);
     assert!(fresh.is_dir());
@@ -576,7 +595,7 @@ fn orphaned_lease_locks_are_removed_regardless_of_age() {
     touch_leases(base.path(), &unrelated);
 
     let removed =
-        db::gc_stale_caches_in(base.path(), Some("cafe"), db::STALE_CACHE_MAX_AGE, now).unwrap();
+        gc_stale_caches_in(base.path(), Some("cafe"), db::STALE_CACHE_MAX_AGE, now).unwrap();
 
     assert_eq!(removed, 0);
     assert!(fresh.is_dir());
@@ -643,7 +662,7 @@ fn orphaned_locks_held_by_another_process_or_thread_survive_until_released() {
     let (release_publication, publication) =
         hold_shared_lock_in_thread(leases(&base).join(format!("{publication_key}.publish.lock")));
 
-    let removed = db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    let removed = gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     assert_eq!(removed, 0);
     for key in [process_key, thread_key, publication_key] {
@@ -660,7 +679,7 @@ fn orphaned_locks_held_by_another_process_or_thread_survive_until_released() {
     release_publication.send(()).unwrap();
     publication.join().unwrap();
 
-    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
     for key in [process_key, thread_key, publication_key] {
         for name in lock_pair(key) {
             assert!(!lease_exists(&base, &name), "released {name} survived");
@@ -676,7 +695,7 @@ fn lease_sweep_waits_for_the_cache_layout_lock() {
     let layout = open_lease(base.path(), "layout.lock");
     fs2::FileExt::lock_exclusive(&layout).unwrap();
 
-    db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
     for name in lock_pair("0a") {
         assert!(
             lease_exists(base.path(), &name),
@@ -685,7 +704,7 @@ fn lease_sweep_waits_for_the_cache_layout_lock() {
     }
 
     drop(layout);
-    db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
     for name in lock_pair("0a") {
         assert!(
             !lease_exists(base.path(), &name),
@@ -710,7 +729,7 @@ fn symlinked_leases_directory_is_not_swept() {
     }
     symlink(&outside, leases(&base)).unwrap();
 
-    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     for name in lock_pair("0a") {
         assert!(
@@ -740,7 +759,7 @@ fn symlinked_lease_locks_and_cache_entries_are_left_alone() {
     symlink(&outside, base.join("feed")).unwrap();
     touch_lock_pair(&base, "feed");
 
-    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
 
     for key in ["0a", "0b", "feed"] {
         for name in lock_pair(key) {
@@ -799,18 +818,18 @@ fn concurrent_leased_opens_never_split_a_key_lock_across_inodes() {
     let project = temp.path().join("project");
     fs::create_dir_all(&base).unwrap();
     fs::create_dir_all(&project).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "concurrent_leased_opens_never_split_a_key_lock_across_inodes",
-            "--nocapture",
-        ])
-        .env(CHILD_PROJECT, &project)
-        .env("AST_INDEX_CACHE_DIR", &base)
-        .env_remove("AST_INDEX_DB_PATH")
-        .env_remove("KOTLIN_INDEX_DB_PATH")
-        .spawn()
-        .unwrap();
+    let mut child = spawn_guarded(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "concurrent_leased_opens_never_split_a_key_lock_across_inodes",
+                "--nocapture",
+            ])
+            .env(CHILD_PROJECT, &project)
+            .env("AST_INDEX_CACHE_DIR", &base)
+            .env_remove("AST_INDEX_DB_PATH")
+            .env_remove("KOTLIN_INDEX_DB_PATH"),
+    );
 
     let started = Instant::now();
     let mut sweeps = 0_u64;
@@ -822,14 +841,14 @@ fn concurrent_leased_opens_never_split_a_key_lock_across_inodes() {
             child.kill().unwrap();
             panic!("leased-open child did not finish");
         }
-        db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, SystemTime::now()).unwrap();
+        gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, SystemTime::now()).unwrap();
         sweeps += 1;
         std::thread::sleep(Duration::from_micros(200));
     };
     assert!(status.success(), "leased-open child failed: {status}");
     assert!(sweeps > 0);
 
-    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, SystemTime::now()).unwrap();
+    gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, SystemTime::now()).unwrap();
     let leftover: Vec<String> = fs::read_dir(leases(&base))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
