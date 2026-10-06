@@ -104,6 +104,11 @@ scripts/test.sh parsers::treesitter::typescript
 cargo clippy -- -D warnings
 ```
 
+`.cargo/config.toml` sets `AST_INDEX_CACHE_DIR` to `target/ast-index-cache`
+for everything cargo starts, so tests (and `cargo run`) never touch your own
+index cache. Remove that directory to reset it; an `AST_INDEX_CACHE_DIR`
+exported in your shell takes precedence.
+
 ### Test on Real Projects
 
 After building, test on a real codebase:

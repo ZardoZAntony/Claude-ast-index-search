@@ -602,6 +602,7 @@ mod tests {
             name: "SelfDto".to_string(),
             kind: crate::db::SymbolKind::Class,
             line: 1,
+            end_line: None,
             signature: String::new(),
             parents: vec![],
         }];

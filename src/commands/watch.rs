@@ -12,7 +12,7 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 
 use crate::commands::{self, management::ScopedEnvVar};
-use crate::{db, indexer, parsers};
+use crate::{db, indexer, minified, parsers};
 
 fn open_watch_lock(root: &Path) -> Result<std::fs::File> {
     let lock_path = db::get_db_path(root)?.with_extension("watch.lock");
@@ -233,7 +233,11 @@ impl ChangeFilter {
                 .to_str()
                 .is_some_and(|name| indexer::EXCLUDED_DIRS.contains(&name))
         });
-        if !supported || skipped_dir || !self.hidden.allows_path(&self.root, path) {
+        if !supported
+            || skipped_dir
+            || minified::skip_by_name(path)
+            || !self.hidden.allows_path(&self.root, path)
+        {
             return false;
         }
         if self

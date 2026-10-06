@@ -1,6 +1,6 @@
 # ast-index — a fork for PHP and JS/TS projects
 
-A fork of [defendend/Claude-ast-index-search](https://github.com/defendend/Claude-ast-index-search) v3.55.0,
+A fork of [defendend/Claude-ast-index-search](https://github.com/defendend/Claude-ast-index-search) v3.56.0,
 tuned for a large PHP/Bitrix codebase (~10k files) with a JS/Vue frontend (~1.3k files).
 
 **Scope of the plugin.** The Claude Code plugin — skill, command references, `/initialize`, hooks — covers PHP,
@@ -35,7 +35,6 @@ them. On top of that, new commands answer typical refactoring questions in one c
 | Kotlin/Java naming rules: `Exception`, `Result`, `get()` dropped as noise; `EO_*`/lower-case classes, snake_case and same-class calls, callables `[Foo::class, 'handle']` unseen | PHP reserved words are the only noise; these names are references |
 | Hidden paths are always skipped | `include_hidden` in `.ast-index.yaml` |
 | Same-second edits are lost; non-UTF-8 files and directories like `auth.mts/` are re-parsed on every `update` | Nanosecond mtimes; lossy decoding of non-UTF-8 sources; `update` walks files only |
-| Minified JS/CSS clutters search | Detected and not parsed |
 
 Details: [PHP commands reference](plugin/skills/ast-index/references/php-commands.md).
 

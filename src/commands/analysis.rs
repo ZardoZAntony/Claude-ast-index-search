@@ -97,6 +97,7 @@ pub fn cmd_unused_symbols(
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
                 line: row.get(3)?,
+                end_line: None,
                 signature: row.get(4)?,
                 path: row.get(5)?,
                 root_path: None,
@@ -110,6 +111,7 @@ pub fn cmd_unused_symbols(
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
                 line: row.get(3)?,
+                end_line: None,
                 signature: row.get(4)?,
                 path: row.get(5)?,
                 root_path: None,
@@ -226,9 +228,10 @@ pub fn cmd_unused_symbols(
 
         // Check refs table. PHP names of functions and methods are case-insensitive
         // (`GetList` called as `getList`); the exact lookup uses the index, the other runs only
-        // for what it did not find.
+        // for what it did not find. References are recorded under the last segment of a
+        // qualified name, and Ruby indexes `class Billing::Invoice` under its full name.
         let count = |sql: &str| -> i64 {
-            conn.query_row(sql, params![sym.name], |row| row.get(0))
+            conn.query_row(sql, params![db::last_name_segment(&sym.name)], |row| row.get(0))
                 .unwrap_or(0)
         };
         let ref_count = count("SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1");

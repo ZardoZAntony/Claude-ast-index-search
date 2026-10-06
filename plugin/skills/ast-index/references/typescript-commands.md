@@ -1,8 +1,7 @@
 # JavaScript, TypeScript and Vue
 
 Indexed files: `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`, `.vue` (`<script>`, `<script setup>` and
-the `<template>`). Minified and generated web files (a line longer than 2000 characters) are listed by `file` but
-not parsed.
+the `<template>`). Minified files (`*.min.js`, bundles whose lines run to thousands of characters) are not indexed.
 
 ## Module-precise commands
 

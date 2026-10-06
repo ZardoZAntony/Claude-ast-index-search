@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::{extract_references_for_lang, phpdoc, FileType, ParsedRef, ParsedSymbol};
 
@@ -98,20 +98,30 @@ impl LanguageParser for PhpParser {
         let idx_use_simple_name = idx("use_simple_name");
         let idx_trait_use_qualified = idx("trait_use_qualified");
         let idx_trait_use_name = idx("trait_use_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Namespace
             if let Some(cap) = find_capture(m, idx_namespace_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
+                let end_line = cap
+                    .node
+                    .parent()
+                    .filter(|decl| decl.child_by_field_name("body").is_none())
+                    .map(|decl| statement_namespace_end_line(content, &decl))
+                    .or(end_line);
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -133,8 +143,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -155,8 +166,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -169,8 +181,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Trait,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -183,8 +196,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Enum,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -197,8 +211,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -211,8 +226,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -225,8 +241,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Constant,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -239,8 +256,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -255,8 +273,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Import,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -271,8 +290,9 @@ impl LanguageParser for PhpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Import,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -304,6 +324,21 @@ fn merge_repeated_declarations(symbols: Vec<ParsedSymbol>) -> Vec<ParsedSymbol> 
         }
     }
     merged
+}
+
+/// `namespace A\B;` has no body: it scopes everything up to the next namespace
+/// statement or the end of the file, while the grammar node stops at the `;`.
+fn statement_namespace_end_line(content: &str, decl: &tree_sitter::Node) -> usize {
+    let mut sibling = decl.next_sibling();
+    while let Some(next) = sibling {
+        if next.kind() == "namespace_definition" {
+            return node_line(&next).saturating_sub(1).max(node_line(decl));
+        }
+        sibling = next.next_sibling();
+    }
+    decl.parent()
+        .map(|program| text_end_line(content, &program))
+        .unwrap_or_else(|| text_end_line(content, decl))
 }
 
 /// Find a capture by index in a match

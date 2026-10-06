@@ -1,4 +1,4 @@
-//! Front-end noise: minified bundles are recorded but not parsed.
+//! Front-end noise: minified bundles stay out of the index.
 
 use std::fs;
 use std::path::Path;
@@ -39,7 +39,7 @@ fn file_recorded(conn: &Connection, rel: &str) -> bool {
 }
 
 #[test]
-fn minified_bundle_is_recorded_but_not_parsed() {
+fn minified_bundle_stays_out_of_the_index() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
@@ -64,10 +64,7 @@ fn minified_bundle_is_recorded_but_not_parsed() {
     let mut conn = open_fresh_db(root);
     indexer::index_directory(&mut conn, root, false, false).unwrap();
 
-    assert!(
-        file_recorded(&conn, "bundle.js"),
-        "bundle must stay tracked for update"
-    );
+    assert!(!file_recorded(&conn, "bundle.js"), "minified bundle was indexed");
     assert!(
         !symbol_exists(&conn, "MinifiedEntry"),
         "minified bundle was parsed"

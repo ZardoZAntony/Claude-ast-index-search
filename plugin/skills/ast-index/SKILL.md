@@ -31,7 +31,8 @@ after edits); after a bulk shell change (`git switch`, a code generator) run `as
 | touch an interface or a base class | `ast-index implementations '<FQN>'` |
 | delete "dead" classes or JS exports and files | `ast-index unused-symbols --module <dir>/ --export-only --limit 500` |
 | suspect copy-pasted classes | `ast-index duplicates --path <dir>/` |
-| read a large file | `ast-index outline <file>` |
+| read a large file | `ast-index outline <file>` (definitions with their line ranges) |
+| read one class or method | `ast-index symbol <Name> --with-content` (its source, up to 60 lines) |
 | read framework or vendor code (Bitrix core, Symfony…) | `ast-index class <Name>`, then `ast-index outline <its file>` |
 | look for where a feature lives | `ast-index explore <words>` or `ast-index search <word>` |
 
