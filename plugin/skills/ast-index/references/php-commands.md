@@ -21,6 +21,7 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
 | Move a class to another namespace | `ast-index move-plan 'App\Order\OrderDto' 'App\Order\Dto'` |
 | Usages of one class (not its namesakes) | `ast-index usages 'App\Order\OrderDto'` |
 | Subclasses and implementations, aliases included | `ast-index implementations 'App\Base\Version'` |
+| Direct parents and children of one class | `ast-index hierarchy 'App\Base\Version'` |
 | Callers of a method through a type and its subtypes | `ast-index callers 'CacheInvalidatorInterface::invalidate'` |
 | Dead classes in a directory | `ast-index unused-symbols --module src/Order/ --export-only` |
 | Copy-pasted classes | `ast-index duplicates --path src/` |
@@ -39,6 +40,9 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
 - **`implementations <FQN>`** follows `extends`/`implements` under any alias the parent is
   imported with, transitively. It also works for types outside the index (vendor, framework
   core, generated ORM classes) that code references by FQN.
+- **`hierarchy <FQN>`** shows one level each way: what the class extends and implements, as
+  FQNs, and the classes whose `extends`/`implements` resolves to it. By a short name it mixes in
+  the parents and children of every class of that name.
 - **`callers Type::method`** infers the receiver of each call (`$this`, `self::`,
   `parent::`, `$this->prop` from typed/promoted properties or `@var`, `$var` from typed
   parameters, `@var`, `new`, `get(Foo::class)` within the same function, `(new Foo)->`,

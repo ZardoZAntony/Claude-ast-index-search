@@ -791,3 +791,39 @@ fn unknown_fqn_suggests_classes_of_the_same_name() {
     let known = run(root, cache.path(), &["usages", "App\\Order\\OrderDto", "--format", "json"]);
     assert_eq!(known["did_you_mean"], serde_json::json!([]));
 }
+
+/// `hierarchy <FQN>`: parents resolved through the namespace and `use`, direct children whose
+/// `extends`/`implements` resolves to the FQN — not a namesake's children, not grandchildren.
+#[test]
+fn hierarchy_accepts_fqn_and_leaves_out_namesakes() {
+    let tmp = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    write(root, "src/Contracts/Base.php", "<?php\nnamespace App\\Contracts;\n\ninterface Base {}\n");
+    write(root, "src/Contracts/Updater.php", "<?php\nnamespace App\\Contracts;\n\ninterface Updater extends Base {}\n");
+    write(root, "src/Infra/BitrixUpdater.php", "<?php\nnamespace App\\Infra;\n\nuse App\\Contracts\\Updater;\n\nclass BitrixUpdater implements Updater {}\n");
+    write(root, "src/Infra/DualUpdater.php", "<?php\nnamespace App\\Infra;\n\nfinal class DualUpdater extends BitrixUpdater {}\n");
+    write(root, "src/Other/Updater.php", "<?php\nnamespace App\\Other;\n\ninterface Updater {}\n");
+    write(root, "src/Other/LocalUpdater.php", "<?php\nnamespace App\\Other;\n\nfinal class LocalUpdater implements Updater {}\n");
+    run(root, cache.path(), &["rebuild"]);
+
+    let text = run_text(root, cache.path(), &["hierarchy", "\\App\\Contracts\\Updater"]);
+    assert!(text.contains("Hierarchy for 'App\\Contracts\\Updater':"), "{text}");
+    assert!(text.contains("App\\Contracts\\Base (extends)"), "{text}");
+    assert!(text.contains("Children (1):"), "{text}");
+    assert!(text.contains("App\\Infra\\BitrixUpdater [class]: src/Infra/BitrixUpdater.php"), "{text}");
+    assert!(!text.contains("LocalUpdater") && !text.contains("DualUpdater"), "{text}");
+
+    let child = run_text(root, cache.path(), &["hierarchy", "App\\Infra\\DualUpdater"]);
+    assert!(child.contains("App\\Infra\\BitrixUpdater (extends)"), "{child}");
+
+    let leaf = run_text(root, cache.path(), &["hierarchy", "App\\Contracts\\Base", "--in-file", "Other"]);
+    assert!(leaf.contains("No parents or children found."), "{leaf}");
+
+    let missing = run_text(root, cache.path(), &["hierarchy", "App\\Wrong\\Updater"]);
+    assert!(
+        missing.contains("classes named Updater: App\\Contracts\\Updater, App\\Other\\Updater"),
+        "{missing}"
+    );
+}

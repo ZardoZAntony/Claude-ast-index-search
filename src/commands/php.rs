@@ -1215,6 +1215,76 @@ pub fn cmd_implementations_fqn(root: &Path, fqn: &str, limit: usize, format: &st
     Ok(())
 }
 
+/// `hierarchy` of a fully qualified PHP name: what it extends and implements, resolved through
+/// `use` imports and the namespace, and the classes whose `extends`/`implements` resolves to it.
+/// A namesake in another namespace is neither, unlike the short-name lookup.
+pub fn cmd_hierarchy_fqn(
+    root: &Path,
+    fqn: &str,
+    limit: usize,
+    scope: &db::SearchScope,
+) -> Result<()> {
+    let _lease = db::acquire_project_lease(root)?;
+    let conn = open(root)?;
+    let fqn = normalize_fqn(fqn);
+    let Some(target) = type_fqns(&conn, &fqn)?.into_iter().next() else {
+        println!("{}", not_defined(&conn, "Class ", &fqn).red());
+        return Ok(());
+    };
+    println!("{}", format!("Hierarchy for '{target}':").bold());
+
+    let mut parents: Vec<(String, String)> = Vec::new();
+    for (resolved, written, kind) in direct_parents(&conn, &target)? {
+        let parent = resolved.unwrap_or(written);
+        if !parents
+            .iter()
+            .any(|(p, k)| p.eq_ignore_ascii_case(&parent) && *k == kind)
+        {
+            parents.push((parent, kind));
+        }
+    }
+    if !parents.is_empty() {
+        println!("\n  {}", "Parents:".cyan());
+        for (parent, kind) in &parents {
+            println!("    {parent} ({kind})");
+        }
+    }
+
+    let mut children = Vec::new();
+    for child in direct_subtypes(&conn, &target)? {
+        for d in definitions(&conn, root, &child)? {
+            if !(d.external && db::external_hidden()) && scope.matches_path(&d.path) {
+                children.push((child.clone(), d));
+            }
+        }
+    }
+    children.sort_by(|(_, a), (_, b)| (&a.path, a.line).cmp(&(&b.path, b.line)));
+    let total = children.len();
+    children.truncate(limit);
+    if parents.is_empty() && children.is_empty() {
+        println!("  No parents or children found.");
+    }
+    if !children.is_empty() {
+        let header = if total > children.len() {
+            format!("Children ({} of {total} shown):", children.len())
+        } else {
+            format!("Children ({total}):")
+        };
+        println!("\n  {}", header.cyan());
+        for (child, d) in &children {
+            println!("    {child} [{}]: {}", d.kind, d.path);
+        }
+        if total > children.len() {
+            println!(
+                "\n  {} use {} to see all (e.g. --limit {total})",
+                "Truncated.".yellow(),
+                "--limit <N>".yellow()
+            );
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // callers Type::method
 // ---------------------------------------------------------------------------
@@ -1575,69 +1645,92 @@ fn resolve_parent(
     (decl_line..=decl_line + 10).find_map(|l| fqn_at(conn, file_id, l, short_name(parent_name)))
 }
 
-/// The types plus every class/interface that extends or implements one of them, transitively.
-/// A child counts only if its `extends`/`implements` name resolves to the parent's FQN, under
-/// any alias the parent is imported with.
-fn with_subtypes(conn: &Connection, roots: &[String]) -> Result<Vec<String>> {
-    let mut all: Vec<String> = roots.to_vec();
-    let mut seen: HashSet<String> = roots.iter().map(|r| r.to_ascii_lowercase()).collect();
-    let mut queue: Vec<String> = roots.to_vec();
+/// Every class/interface whose `extends`/`implements` name resolves to `parent`, under any alias
+/// `parent` is imported with.
+fn direct_subtypes(conn: &Connection, parent: &str) -> Result<Vec<String>> {
     let sql = format!(
         "SELECT s.qualified_name, s.file_id, s.line, i.parent_name FROM inheritance i
          JOIN symbols s ON s.id = i.child_id
          WHERE (i.parent_name = ?1 COLLATE NOCASE OR i.parent_name LIKE '%\\' || ?1)
            AND s.qualified_name IS NOT NULL AND s.kind IN {CLASS_KINDS}"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut out: Vec<String> = Vec::new();
+    for name in local_names(conn, parent)? {
+        let children = stmt
+            .query_map(params![name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (child, file_id, line, parent_name) in children {
+            let resolves = resolve_parent(conn, file_id, line, &parent_name)
+                .is_some_and(|p| p.eq_ignore_ascii_case(parent));
+            if resolves && !out.iter().any(|c| c.eq_ignore_ascii_case(&child)) {
+                out.push(child);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The types plus every class/interface that extends or implements one of them, transitively
+/// (see [`direct_subtypes`]).
+fn with_subtypes(conn: &Connection, roots: &[String]) -> Result<Vec<String>> {
+    let mut all: Vec<String> = roots.to_vec();
+    let mut seen: HashSet<String> = roots.iter().map(|r| r.to_ascii_lowercase()).collect();
+    let mut queue: Vec<String> = roots.to_vec();
     while let Some(parent) = queue.pop() {
-        for name in local_names(conn, &parent)? {
-            let children = stmt
-                .query_map(params![name], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            for (child, file_id, line, parent_name) in children {
-                let resolves = resolve_parent(conn, file_id, line, &parent_name)
-                    .is_some_and(|p| p.eq_ignore_ascii_case(&parent));
-                if resolves && seen.insert(child.to_ascii_lowercase()) {
-                    all.push(child.clone());
-                    queue.push(child);
-                }
+        for child in direct_subtypes(conn, &parent)? {
+            if seen.insert(child.to_ascii_lowercase()) {
+                all.push(child.clone());
+                queue.push(child);
             }
         }
     }
     Ok(all)
 }
 
-/// Every class/interface the types extend or implement, transitively (not the types
-/// themselves). Parents outside the index are kept by the name they resolve to.
-fn supertypes(conn: &Connection, types: &[String]) -> Result<Vec<String>> {
+/// What the type extends or implements: the FQN each name resolves to (`None` when the index
+/// did not record it), the name as written, and `extends`/`implements`.
+fn direct_parents(conn: &Connection, child: &str) -> Result<Vec<(Option<String>, String, String)>> {
     let sql = format!(
-        "SELECT s.file_id, s.line, i.parent_name FROM symbols s
+        "SELECT s.file_id, s.line, i.parent_name, i.kind FROM symbols s
          JOIN inheritance i ON i.child_id = s.id
          WHERE s.qualified_name = ?1 COLLATE NOCASE AND s.kind IN {CLASS_KINDS}"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(params![child], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(file_id, line, name, kind)| {
+            (resolve_parent(conn, file_id, line, &name), name, kind)
+        })
+        .collect())
+}
+
+/// Every class/interface the types extend or implement, transitively (not the types
+/// themselves). Parents outside the index are kept by the name they resolve to.
+fn supertypes(conn: &Connection, types: &[String]) -> Result<Vec<String>> {
     let mut seen: HashSet<String> = types.iter().map(|t| t.to_ascii_lowercase()).collect();
     let mut out = Vec::new();
     let mut queue: Vec<String> = types.to_vec();
     while let Some(child) = queue.pop() {
-        let parents = stmt
-            .query_map(params![child], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (file_id, line, parent_name) in parents {
-            if let Some(parent) = resolve_parent(conn, file_id, line, &parent_name) {
+        for (parent, _, _) in direct_parents(conn, &child)? {
+            if let Some(parent) = parent {
                 if seen.insert(parent.to_ascii_lowercase()) {
                     out.push(parent.clone());
                     queue.push(parent);

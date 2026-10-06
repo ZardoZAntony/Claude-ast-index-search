@@ -1161,6 +1161,10 @@ pub fn cmd_refs(
 
 /// Show class hierarchy (parents and children)
 pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope) -> Result<()> {
+    // A fully qualified PHP name: parents and children resolved by FQN.
+    if name.contains('\\') {
+        return super::php::cmd_hierarchy_fqn(root, name, limit, scope);
+    }
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -1240,6 +1244,9 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     children.retain(|c| resolver.matches_filter(c.root_path.as_deref()));
     for c in &mut children {
         c.path = resolver.resolve_with_root(&c.path, c.root_path.as_deref());
+    }
+    if parents.is_empty() && children.is_empty() {
+        println!("  No parents or children found.");
     }
     if !children.is_empty() {
         let header = if scope.is_empty() && total > children.len() {
