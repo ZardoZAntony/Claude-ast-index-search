@@ -1578,3 +1578,35 @@ mod tests {
         assert!(!is_js_target("OrderDto"));
     }
 }
+
+/// A JS/TS/Vue module of the index with its imports: (local name, imported name — a name,
+/// `default` or `*` — and the module it resolves to, by index in the returned list).
+pub(super) struct ModuleImports {
+    pub(super) path: String,
+    pub(super) abs: PathBuf,
+    pub(super) imports: Vec<(Option<String>, Option<String>, Option<usize>)>,
+}
+
+pub(super) fn modules_with_imports(conn: &Connection, root: &Path) -> Result<Vec<ModuleImports>> {
+    let project = Project::load(conn, root)?;
+    let mut out: Vec<ModuleImports> = project
+        .set
+        .modules
+        .iter()
+        .map(|m| ModuleImports {
+            path: m.shown.clone(),
+            abs: m.abs.clone(),
+            imports: Vec::new(),
+        })
+        .collect();
+    for (i, import) in project.imports.iter().enumerate() {
+        let target = match project.targets.get(i) {
+            Some(Target::Module(t)) => Some(*t),
+            _ => None,
+        };
+        out[import.file]
+            .imports
+            .push((import.local.clone(), import.imported.clone(), target));
+    }
+    Ok(out)
+}

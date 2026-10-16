@@ -16,6 +16,7 @@ or without extension, or a directory with `index.*`). A module is named by its p
 | Move or rename a file | `ast-index move-plan 'src/ui/Popup.vue' 'src/ui/popup/'` |
 | Dead exports and files nothing references | `ast-index unused-symbols --module src/` |
 | Short name, when you do not know the module | `ast-index impact formatPrice` — answers if one module exports it, else lists them |
+| Backend calls of the frontend and the keys they send and read | `ast-index http-calls [--path src/pages/cart]` |
 
 - `impact 'path#name'` lists the definition (and the declaration line for `export { a as b }` and
   `export default x`) and every reference with its kind: `import` (the line of the imported name), `use` (the
@@ -36,6 +37,19 @@ or without extension, or a directory with `index.*`). A module is named by its p
   go to `unused_ignore` in `.ast-index.yaml`. The `coverage (JS/TS):` line says this — no need to re-check with rg.
 - Specifiers that did not resolve but end with the module's name are listed under `unresolved:` — check those
   by hand.
+- `http-calls` — backend calls of JS/TS/Vue modules and of inline `<script>` blocks of PHP templates (PHP
+  islands shown as `{php:$expr}`): `fetch`, `axios` and `axios.create()` instances, project wrappers (a function
+  that forwards a parameter as the address, imported too — `request.get(url)`), jQuery `$.ajax/post/get`,
+  `BX.ajax`, `BX.ajax.runComponentAction` (component, action, mode), `BX.ajax.runAction`, and `ajax.php?c=…&action=…`
+  addresses. The address folds literals, template strings, concatenation and constants (imported ones too); the
+  rest is `{expression}` — `/api/v1/basket/items/{basketItemId}` matches the route's `{basketItemId}`. `params` —
+  keys sent (object literals, `JSON.stringify`, `FormData.append`); `reads` — paths read from the answer
+  (`.then`, `await`, destructuring, a variable `.then`-ed later, success callbacks, one level into a local helper
+  such as `getPayload(response)`); `response_keys` — the same without the client's envelope (axios `data`, the
+  `data` of a Bitrix action result). Addresses outside recognised calls are under `literals`. `globals` — data a
+  template hands to scripts through `window.X = …` (object or array, PHP value, `JSON.parse`): writes with keys
+  when the array is visible in the template, and reads (`window.X.key`, a destructuring). `dist/` and minified files
+  are skipped.
 
 ## Resolution
 

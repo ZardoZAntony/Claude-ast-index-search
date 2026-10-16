@@ -21,6 +21,7 @@ pub mod files;
 pub mod git_signals;
 pub mod graph;
 pub mod grep;
+pub mod http_calls;
 pub mod index;
 pub mod instantiations;
 pub mod js;

@@ -17,6 +17,7 @@
 //! - PHP (Laravel, Symfony)
 //! - Dart/Flutter
 
+pub mod js_http;
 pub mod perl;
 pub mod php_api;
 pub mod php_ast;

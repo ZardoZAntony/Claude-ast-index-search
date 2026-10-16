@@ -106,6 +106,7 @@ PHP:
   routes                 Bitrix routes and component actions with prefilters in effect
   new                    Every `new Class(...)` with its arguments as values
   enum                   Enum cases with their values and per-case method results
+  http-calls             Backend calls of the frontend (JS/TS/Vue, inline scripts of templates)
 
 Programmatic Access:
   agrep                  Structural code search via ast-grep
@@ -226,6 +227,15 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "100")]
         limit: usize,
+    },
+    /// Backend calls of the frontend — JS/TS/Vue modules and inline scripts of PHP templates:
+    /// fetch, axios (instances, project wrappers), jQuery, BX.ajax, runComponentAction,
+    /// runAction — with method, address, component action, keys sent and read; plus `window.X`
+    /// globals written by templates and read by scripts
+    HttpCalls {
+        /// Only calls in files under this path
+        #[arg(long)]
+        path: Option<String>,
     },
     /// A PHP enum: cases with their values, and for each `--method` what it returns per case
     /// (`return match ($this) {…}` or a single `return`), constants and arithmetic folded
@@ -1358,6 +1368,9 @@ fn main() -> Result<()> {
             no_tests,
             limit,
         } => commands::instantiations::cmd_new(&root, &fqn, path.as_deref(), no_tests, limit, format),
+        Commands::HttpCalls { path } => {
+            commands::http_calls::cmd_http_calls(&root, path.as_deref(), format)
+        }
         Commands::Enum { fqn, methods } => {
             commands::php_members::cmd_enum(&root, &fqn, &methods, format)
         }
