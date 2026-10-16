@@ -25,6 +25,7 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
 | Callers of a method through a type and its subtypes | `ast-index callers 'CacheInvalidatorInterface::invalidate'` |
 | What a method calls, as a tree with receiver types | `ast-index callees 'App\Event\Bridge::onSaved' --depth 3` |
 | Bitrix event subscriptions and their handlers | `ast-index events [--module local/modules/x] [--event OnSale]` |
+| Bitrix routes and component actions with their prefilters | `ast-index routes [--kind route\|component] [--path local/modules/x]` |
 | Every `new Foo(...)` with its arguments as values | `ast-index new 'App\Dto\Descriptor'` |
 | Enum cases and what `ttl()` returns per case | `ast-index enum 'App\Cache\CacheEnum' --method ttl` |
 | Where one constant or enum case is used | `ast-index usages 'App\Cache\CacheEnum::LIST' [--no-tests]` |
@@ -76,6 +77,19 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   handler with all its events), the handler (`[Foo::class, 'm']`, `['Ns\\Foo', 'm']`,
   `[$this, 'm']`, `'Foo::m'`, a function, a closure) with `handler_at` — the lines of its body,
   inherited ones too. A callback built at run time is `dynamic`, with its source.
+- **`routes`** lists routes of the routing files (`return function (RoutingConfigurator
+  $routes) {…}` — `get`/`post`/…/`any`/`match`, `prefix(…)->group(…)` prefixes joined, `name`,
+  `methods` modifiers) and component actions (`…Action` methods of `components/*/class.php`,
+  mode `class`, and `ajax.php`, mode `ajax`, with `vendor:name` under `local|bitrix/components`).
+  Each entry has the handler (`[Ctrl::class, 'add']` and `'addAction'` both run `addAction`),
+  `handler_at`, the method's `attributes` and the class's (`class_attributes`, parents too) as
+  written, and `prefilters` the way `Controller::buildFilters()` builds them:
+  `configureActions()` `prefilters` replace the defaults — `getDefaultPreFilters()` of the first
+  class up the parents that declares it, `parent::getDefaultPreFilters()` and `array_merge`
+  followed, the core's own defaults when the chain leaves the index or for a component class —
+  a CSRF filter added when POST is allowed without one (`implicit`), then `-prefilters` removed
+  and `+prefilters` appended. Each filter says where it comes from (`from`). Descriptor-based
+  component actions are not methods: read them with `new <Descriptor FQN>`.
 - **`new <FQN>`** lists every `new Foo(...)` with its arguments folded to values — strings,
   numbers, arrays, `Bar::class` as an FQN, class constants and enum cases (`{"case": …}`),
   nested `new` (`{"new": …, "args": […], "named": {…}}`), a variable assigned once before;

@@ -25,6 +25,7 @@ pub mod php_eval;
 pub mod php_events;
 pub mod php_model;
 pub mod php_names;
+pub mod php_routes;
 pub mod phpdoc;
 pub mod typescript;
 pub mod wsdl;

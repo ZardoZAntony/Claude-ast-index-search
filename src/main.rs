@@ -103,6 +103,7 @@ PHP:
   duplicates             Same-named PHP classes whose bodies are near copies
   callees                What a PHP method calls, as a tree with receiver types
   events                 Bitrix event subscriptions with their handlers
+  routes                 Bitrix routes and component actions with prefilters in effect
   new                    Every `new Class(...)` with its arguments as values
   enum                   Enum cases with their values and per-case method results
 
@@ -199,6 +200,17 @@ enum Commands {
         /// Leave out subscriptions written in tests
         #[arg(long)]
         no_tests: bool,
+    },
+    /// Bitrix routes (`routes.php`, `local/routes/*.php`) and component actions (`…Action`
+    /// methods of class.php/ajax.php), each with its handler, the method's attributes and the
+    /// prefilters in effect (`configureActions()` over `getDefaultPreFilters()` up the parents)
+    Routes {
+        /// Only `route` entries or only `component` actions
+        #[arg(long, value_parser = ["route", "component"])]
+        kind: Option<String>,
+        /// Only files under this path
+        #[arg(long)]
+        path: Option<String>,
     },
     /// Every `new Class(...)` of a PHP class, with its arguments folded to values: strings,
     /// numbers, arrays, `Foo::class`, constants, nested `new`, a variable assigned once
@@ -1337,6 +1349,9 @@ fn main() -> Result<()> {
             event,
             no_tests,
         } => commands::bitrix::cmd_events(&root, module.as_deref(), event.as_deref(), no_tests, format),
+        Commands::Routes { kind, path } => {
+            commands::bitrix::cmd_routes(&root, kind.as_deref(), path.as_deref(), format)
+        }
         Commands::New {
             fqn,
             path,
