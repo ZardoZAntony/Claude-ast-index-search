@@ -352,7 +352,7 @@ fn find_capture<'a>(
 
 /// Built-in PHP functions (`scripts/php-builtin-functions.php`): calls to them are noise in the
 /// index, while project functions such as `is_spec()` or `plural_form()` are references.
-static BUILTIN_FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+pub(crate) static BUILTIN_FUNCTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     include_str!("../php_builtin_functions.txt")
         .lines()
         .filter(|l| !l.starts_with('#'))

@@ -20,6 +20,8 @@
 pub mod perl;
 pub mod php_api;
 pub mod php_ast;
+pub mod php_calls;
+pub mod php_model;
 pub mod php_names;
 pub mod phpdoc;
 pub mod typescript;

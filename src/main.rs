@@ -97,6 +97,12 @@ Project Configuration:
   install-claude-plugin  Install Claude Code plugin
   install-codex-mcp      Register ast-index MCP server in Codex
 
+PHP:
+  impact                 Everything a change touches (PHP FQN, JS/TS export or module)
+  move-plan              Edits to move a PHP class or a JS/TS/Vue file
+  duplicates             Same-named PHP classes whose bodies are near copies
+  callees                What a PHP method calls, as a tree with receiver types
+
 Programmatic Access:
   agrep                  Structural code search via ast-grep
   query                  Execute raw SQL against the index DB
@@ -160,6 +166,23 @@ enum Commands {
         /// Filter by file path
         #[arg(long)]
         in_file: Option<String>,
+    },
+    /// What a PHP method calls, as a tree: each call with the type its receiver resolves to
+    /// and the method it lands in
+    Callees {
+        /// 'Type::method' — the type by FQN, or a short name when one class has it
+        spec: String,
+        /// Levels of the tree: 1 lists the method's own calls
+        #[arg(short, long, default_value = "2")]
+        depth: usize,
+        /// Expand the implementations of an interface or abstract method too (they are listed
+        /// either way)
+        #[arg(long)]
+        implementations: bool,
+        /// Do not expand calls into this class, 'Class::method', or namespace prefix ending in a
+        /// backslash; repeatable
+        #[arg(long)]
+        stop: Vec<String>,
     },
     /// Show call hierarchy (callers tree up) for a function
     CallTree {
@@ -1260,6 +1283,12 @@ fn main() -> Result<()> {
             limit,
             in_file,
         } => commands::grep::cmd_callers(&root, &function_name, limit, format, in_file.as_deref()),
+        Commands::Callees {
+            spec,
+            depth,
+            implementations,
+            stop,
+        } => commands::callees::cmd_callees(&root, &spec, depth, implementations, &stop, format),
         Commands::CallTree {
             function_name,
             depth,

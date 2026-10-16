@@ -47,17 +47,17 @@ struct RefRow {
 }
 
 #[derive(Serialize, Clone)]
-struct DefRow {
-    path: String,
-    line: i64,
-    kind: String,
+pub(super) struct DefRow {
+    pub(super) path: String,
+    pub(super) line: i64,
+    pub(super) kind: String,
     #[serde(skip)]
-    file_id: i64,
+    pub(super) file_id: i64,
     /// In an `external:` directory (framework core, vendor).
     #[serde(skip)]
-    external: bool,
+    pub(super) external: bool,
     #[serde(skip)]
-    abs: PathBuf,
+    pub(super) abs: PathBuf,
 }
 
 #[derive(Serialize, Clone)]
@@ -67,7 +67,7 @@ struct ConfigMention {
     text: String,
 }
 
-fn open(root: &Path) -> Result<db::LeasedConnection> {
+pub(super) fn open(root: &Path) -> Result<db::LeasedConnection> {
     if !db::db_exists(root) {
         bail!("Index not found. Run 'ast-index rebuild' first.");
     }
@@ -83,7 +83,7 @@ fn open(root: &Path) -> Result<db::LeasedConnection> {
     Ok(conn)
 }
 
-fn normalize_fqn(fqn: &str) -> String {
+pub(super) fn normalize_fqn(fqn: &str) -> String {
     fqn.trim().trim_start_matches('\\').to_string()
 }
 
@@ -112,7 +112,7 @@ fn namesakes(conn: &Connection, fqn: &str) -> Vec<String> {
 }
 
 /// "X is not defined in the index", with the classes of the same short name when there are any.
-fn not_defined(conn: &Connection, what: &str, fqn: &str) -> String {
+pub(super) fn not_defined(conn: &Connection, what: &str, fqn: &str) -> String {
     let same = namesakes(conn, fqn);
     if same.is_empty() {
         format!("{what}{fqn} is not defined in the index")
@@ -140,7 +140,7 @@ fn locate(root: &Path, root_path: &str, path: &str) -> (String, PathBuf) {
     (shown, abs)
 }
 
-fn is_test_path(path: &str) -> bool {
+pub(super) fn is_test_path(path: &str) -> bool {
     path.starts_with(".tests/")
         || path.starts_with("tests/")
         || path.contains("/tests/")
@@ -198,7 +198,7 @@ fn refs_by_fqn(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<RefRow>>
     Ok(rows)
 }
 
-fn definitions(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<DefRow>> {
+pub(super) fn definitions(conn: &Connection, root: &Path, fqn: &str) -> Result<Vec<DefRow>> {
     let sql = format!(
         "SELECT f.path, f.root_path, s.line, s.kind, s.file_id, f.external
          FROM symbols s JOIN files f ON f.id = s.file_id
@@ -245,7 +245,7 @@ fn fqn_at(conn: &Connection, file_id: i64, line: i64, name: &str) -> Option<Stri
     .ok()
 }
 
-fn read_lossy(path: &Path) -> Option<String> {
+pub(super) fn read_lossy(path: &Path) -> Option<String> {
     fs::read(path)
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -332,7 +332,7 @@ fn fqn_needles(fqn: &str) -> Vec<String> {
     needles
 }
 
-fn print_json<T: Serialize>(value: &T) -> Result<()> {
+pub(super) fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
@@ -1582,7 +1582,7 @@ fn print_sites(title: &str, sites: &[CallSite], with_receiver: bool) {
     }
 }
 
-fn type_fqns(conn: &Connection, type_part: &str) -> Result<Vec<String>> {
+pub(super) fn type_fqns(conn: &Connection, type_part: &str) -> Result<Vec<String>> {
     if type_part.contains('\\') {
         let sql = format!(
             "SELECT DISTINCT qualified_name FROM symbols WHERE qualified_name = ?1 COLLATE NOCASE AND kind IN {CLASS_KINDS}"
@@ -1680,7 +1680,7 @@ fn direct_subtypes(conn: &Connection, parent: &str) -> Result<Vec<String>> {
 
 /// The types plus every class/interface that extends or implements one of them, transitively
 /// (see [`direct_subtypes`]).
-fn with_subtypes(conn: &Connection, roots: &[String]) -> Result<Vec<String>> {
+pub(super) fn with_subtypes(conn: &Connection, roots: &[String]) -> Result<Vec<String>> {
     let mut all: Vec<String> = roots.to_vec();
     let mut seen: HashSet<String> = roots.iter().map(|r| r.to_ascii_lowercase()).collect();
     let mut queue: Vec<String> = roots.to_vec();

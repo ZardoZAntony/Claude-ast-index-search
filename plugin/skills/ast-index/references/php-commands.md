@@ -23,6 +23,7 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
 | Subclasses and implementations, aliases included | `ast-index implementations 'App\Base\Version'` |
 | Direct parents and children of one class | `ast-index hierarchy 'App\Base\Version'` |
 | Callers of a method through a type and its subtypes | `ast-index callers 'CacheInvalidatorInterface::invalidate'` |
+| What a method calls, as a tree with receiver types | `ast-index callees 'App\Event\Bridge::onSaved' --depth 3` |
 | Dead classes in a directory | `ast-index unused-symbols --module src/Order/ --export-only` |
 | Copy-pasted classes | `ast-index duplicates --path src/` |
 | How a branch changed the API of PHP classes | `ast-index changed --symbols --base origin/master [--head <ref>]` |
@@ -52,6 +53,18 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   the type or its subtypes, calls typed as a supertype that declares the method (these may
   dispatch to the type at run time), calls whose receiver could not be inferred (check these
   by hand), and same-named methods of unrelated types (excluded).
+- **`callees Type::method`** is the other direction: the calls the method makes, read from
+  its syntax tree (a call over several lines is one call at the line it starts on), each with
+  the type its receiver resolves to and what stated it (`this`, `self`, `parent`, `class`,
+  `new`, `property` — typed, promoted or `@var`, `param`, `@var`, `instanceof` — inside the
+  `if` or after a guard that returns, `return` — the declared return type of a call on a known
+  type, `template` — `@return T` with `@param class-string<T>`, as in `getHandler(Foo::class)`),
+  where the method is declared (`declared_in` when inherited, `declared_at`), class constants
+  and enum cases passed as arguments (`constants`), `Foo::class` arguments (`classes`). An
+  abstract or interface method lists its `implementations`; `--implementations` expands them
+  too. `--depth N` (default 2) sets the levels; `--stop <Class|Class::method|Ns\>` keeps a
+  branch closed (repeatable); a method met again is marked `expanded_above`. A receiver whose
+  type nothing states is `call: null` with the receiver as written — check those by hand.
 - **`unused-symbols`** checks PHP classes by FQN, so a dead class with a live namesake is
   reported. A reference counts wherever it is: code, PHPDoc, tests, callables
   (`[Foo::class, 'handle']`, `[$this, 'handle']`, `array('Foo', 'handle')`, `'Foo::handle'`). Classes referenced only where a DI config
