@@ -341,11 +341,14 @@ pub(super) fn print_json<T: Serialize>(value: &T) -> Result<()> {
 // usages <FQN>
 // ---------------------------------------------------------------------------
 
-pub fn cmd_usages_fqn(root: &Path, fqn: &str, limit: usize, format: &str) -> Result<()> {
+pub fn cmd_usages_fqn(root: &Path, fqn: &str, limit: usize, no_tests: bool, format: &str) -> Result<()> {
     let _lease = db::acquire_project_lease(root)?;
     let conn = open(root)?;
     let fqn = normalize_fqn(fqn);
-    let refs = refs_by_fqn(&conn, root, &fqn)?;
+    let mut refs = refs_by_fqn(&conn, root, &fqn)?;
+    if no_tests {
+        refs.retain(|r| !r.test);
+    }
     let total = refs.len();
     let shown: Vec<&RefRow> = refs.iter().take(limit).collect();
     let unknown = refs.is_empty() && definitions(&conn, root, &fqn)?.is_empty();

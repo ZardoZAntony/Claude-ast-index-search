@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use colored::Colorize;
 use regex::Regex;
 use serde::Serialize;
@@ -1331,12 +1331,21 @@ pub fn cmd_usages(
     root: &Path,
     symbol: &str,
     limit: usize,
+    no_tests: bool,
     format: &str,
     scope: &SearchScope,
 ) -> Result<()> {
+    // `Class::MEMBER` of a PHP class: a constant or enum case of that very class. Ruby and C++
+    // names are qualified with `::` too and go the general way.
+    if super::php_members::is_php_member_spec(root, symbol)? {
+        return super::php_members::cmd_member_usages(root, symbol, limit, no_tests, format);
+    }
     // A fully qualified PHP name: exact references of that class, not of its namesakes.
     if symbol.contains('\\') {
-        return super::php::cmd_usages_fqn(root, symbol, limit, format);
+        return super::php::cmd_usages_fqn(root, symbol, limit, no_tests, format);
+    }
+    if no_tests {
+        bail!("--no-tests works with a PHP class FQN or 'Class::MEMBER'");
     }
     // A JS/TS export (`path#name`) or module path: resolved imports, not every same-named identifier.
     if super::js::is_js_target(symbol) {

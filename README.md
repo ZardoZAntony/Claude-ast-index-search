@@ -35,6 +35,7 @@ them. On top of that, new commands answer typical refactoring questions in one c
 | Kotlin/Java naming rules: `Exception`, `Result`, `get()` dropped as noise; `EO_*`/lower-case classes, snake_case and same-class calls, callables `[Foo::class, 'handle']` unseen | PHP reserved words are the only noise; these names are references |
 | Following what a method calls means opening every class on the way | `callees 'Type::method' --depth N`: the call tree with receiver types (properties, parameters, `@var`, return types, `class-string` templates, `instanceof` guards), constants passed, implementations of interface methods |
 | Bitrix wiring — event subscriptions, registries of descriptor objects — is read by hand | `events`: module, events (loops unrolled), handler with the lines of its body; `new <FQN>`: every instantiation with its arguments as values |
+| A cache TTL per enum case, or where one case is used, is read from match arms and greps | `enum <FQN> --method ttl`: values per case with constants and arithmetic folded; `usages 'Enum::CASE'` by the enum's FQN |
 | What a branch changed in class APIs takes reading every diff | `changed --symbols --base <ref> [--head <ref>]`: methods and constructor parameters added, removed, changed, from both versions in git, by syntax tree |
 | Hidden paths are always skipped | `include_hidden` in `.ast-index.yaml` |
 | Same-second edits are lost; non-UTF-8 files and directories like `auth.mts/` are re-parsed on every `update` | Nanosecond mtimes; lossy decoding of non-UTF-8 sources; `update` walks files only |

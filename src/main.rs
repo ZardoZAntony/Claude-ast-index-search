@@ -104,6 +104,7 @@ PHP:
   callees                What a PHP method calls, as a tree with receiver types
   events                 Bitrix event subscriptions with their handlers
   new                    Every `new Class(...)` with its arguments as values
+  enum                   Enum cases with their values and per-case method results
 
 Programmatic Access:
   agrep                  Structural code search via ast-grep
@@ -213,6 +214,15 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "100")]
         limit: usize,
+    },
+    /// A PHP enum: cases with their values, and for each `--method` what it returns per case
+    /// (`return match ($this) {…}` or a single `return`), constants and arithmetic folded
+    Enum {
+        /// Enum FQN, or a short name when one class has it
+        fqn: String,
+        /// Method to evaluate per case (`ttl`, `cacheDir`); repeatable
+        #[arg(long = "method")]
+        methods: Vec<String>,
     },
     /// Show call hierarchy (callers tree up) for a function
     CallTree {
@@ -622,13 +632,16 @@ enum Commands {
         #[arg(long)]
         rwr: bool,
     },
-    /// Find usages of a symbol
+    /// Find usages of a symbol; a PHP class by FQN, a constant or enum case as 'Class::MEMBER'
     Usages {
-        /// Symbol name
+        /// Symbol name, PHP class FQN, or 'Class::MEMBER'
         symbol: String,
         /// Max results
         #[arg(short, long, default_value = "50")]
         limit: usize,
+        /// Leave out tests (PHP class FQN and 'Class::MEMBER')
+        #[arg(long)]
+        no_tests: bool,
         /// Filter by file path
         #[arg(long)]
         in_file: Option<String>,
@@ -1330,6 +1343,9 @@ fn main() -> Result<()> {
             no_tests,
             limit,
         } => commands::instantiations::cmd_new(&root, &fqn, path.as_deref(), no_tests, limit, format),
+        Commands::Enum { fqn, methods } => {
+            commands::php_members::cmd_enum(&root, &fqn, &methods, format)
+        }
         Commands::CallTree {
             function_name,
             depth,
@@ -1606,6 +1622,7 @@ fn main() -> Result<()> {
         Commands::Usages {
             symbol,
             limit,
+            no_tests,
             in_file,
             module,
         } => {
@@ -1614,7 +1631,7 @@ fn main() -> Result<()> {
                 module: module.as_deref(),
                 dir_prefix: dir_prefix_ref,
             };
-            commands::index::cmd_usages(&root, &symbol, limit, format, &scope)
+            commands::index::cmd_usages(&root, &symbol, limit, no_tests, format, &scope)
         }
         // Module commands
         Commands::Module { pattern, limit } => {

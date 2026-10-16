@@ -26,6 +26,8 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
 | What a method calls, as a tree with receiver types | `ast-index callees 'App\Event\Bridge::onSaved' --depth 3` |
 | Bitrix event subscriptions and their handlers | `ast-index events [--module local/modules/x] [--event OnSale]` |
 | Every `new Foo(...)` with its arguments as values | `ast-index new 'App\Dto\Descriptor'` |
+| Enum cases and what `ttl()` returns per case | `ast-index enum 'App\Cache\CacheEnum' --method ttl` |
+| Where one constant or enum case is used | `ast-index usages 'App\Cache\CacheEnum::LIST' [--no-tests]` |
 | Dead classes in a directory | `ast-index unused-symbols --module src/Order/ --export-only` |
 | Copy-pasted classes | `ast-index duplicates --path src/` |
 | How a branch changed the API of PHP classes | `ast-index changed --symbols --base origin/master [--head <ref>]` |
@@ -79,6 +81,15 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   nested `new` (`{"new": …, "args": […], "named": {…}}`), a variable assigned once before;
   what does not fold stays `{"expr": "<source>"}`. Registries made of objects — descriptors,
   manifests, subscription lists — read as data.
+- **`enum <FQN>`** lists the cases with their values; each `--method` adds what the method
+  returns per case — for a body `return match ($this) {…}` (several cases per arm, `default`)
+  or a single `return`, with constants (`self::HOUR`, other classes'), arithmetic (`60 * 60`),
+  concatenation and `$this->value` folded, and the line of the arm. What does not fold
+  (`'tag_' . $code`) comes as `expr`.
+- **`usages Class::MEMBER`** finds a constant or an enum case of that class only — a namesake
+  enum in another namespace, imported under an alias, is not mixed in. Uses inside the class
+  itself are tagged `self`, tests `test` (`--no-tests` drops them); PHPDoc mentions
+  (`{@see Class::MEMBER}`) are listed apart. `--no-tests` also works for `usages <FQN>`.
 - **`unused-symbols`** checks PHP classes by FQN, so a dead class with a live namesake is
   reported. A reference counts wherever it is: code, PHPDoc, tests, callables
   (`[Foo::class, 'handle']`, `[$this, 'handle']`, `array('Foo', 'handle')`, `'Foo::handle'`). Classes referenced only where a DI config

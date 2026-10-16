@@ -30,6 +30,7 @@ pub mod modules;
 pub mod perl;
 pub mod php;
 pub mod php_classes;
+pub mod php_members;
 pub mod project_info;
 pub mod rank;
 pub mod test_paths;
