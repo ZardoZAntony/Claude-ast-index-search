@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use super::changed::{ChangeStatus, ChangedFile};
 use crate::parsers::php_api::{
-    self, ClassApi, ConstructorChange, HeaderChange, MethodChange,
+    self, ClassApi, ConstantChange, ConstructorChange, HeaderChange, MethodChange,
 };
 
 #[derive(Serialize)]
@@ -47,6 +47,9 @@ pub(crate) struct ClassEntry {
     pub header: Option<HeaderChange>,
     pub methods: Vec<MethodChange>,
     pub constructor: Option<ConstructorChange>,
+    /// Class constants and enum cases added, removed or given another value.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub constants: Vec<ConstantChange>,
 }
 
 struct Located {
@@ -196,6 +199,7 @@ pub(crate) fn symbol_changes(
             header: diff.header,
             methods: diff.methods,
             constructor: diff.constructor,
+            constants: diff.constants,
         });
     }
     entries.sort_by(|x, y| (&x.path, x.line).cmp(&(&y.path, y.line)));
@@ -325,6 +329,15 @@ pub(crate) fn render_symbols(result: &SymbolsResult, format: &str) -> Result<Str
             if c.params.reordered {
                 out.push_str("        parameters reordered\n");
             }
+        }
+        for c in &entry.constants {
+            let line = match (c.change, &c.before, &c.after) {
+                ("added", _, Some(a)) => format!("+ {} {a}", c.kind),
+                ("removed", Some(b), _) => format!("- {} {b}", c.kind),
+                (_, Some(b), Some(a)) => format!("~ {} {b} -> {a}", c.kind),
+                _ => format!("* {} {}", c.kind, c.name),
+            };
+            out.push_str(&format!("      {line}  :{}\n", c.line));
         }
         for m in &entry.methods {
             let visibility = match m.visibility_before {

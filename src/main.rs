@@ -204,7 +204,9 @@ enum Commands {
     },
     /// Bitrix routes (`routes.php`, `local/routes/*.php`) and component actions (`…Action`
     /// methods of class.php/ajax.php), each with its handler, the method's attributes and the
-    /// prefilters in effect (`configureActions()` over `getDefaultPreFilters()` up the parents)
+    /// prefilters in effect (filter attributes of the method or `configureActions()` over
+    /// `getDefaultPreFilters()` up the parents). Configuration added by `onBuildActions` event
+    /// handlers is not seen
     Routes {
         /// Only `route` entries or only `component` actions
         #[arg(long, value_parser = ["route", "component"])]
@@ -655,6 +657,7 @@ enum Commands {
         rwr: bool,
     },
     /// Find usages of a symbol; a PHP class by FQN, a constant or enum case as 'Class::MEMBER'
+    /// (through the subclasses that inherit it too)
     Usages {
         /// Symbol name, PHP class FQN, or 'Class::MEMBER'
         symbol: String,
@@ -735,7 +738,8 @@ enum Commands {
         head: Option<String>,
         /// PHP classes the branch changed, from both versions in git: public methods added,
         /// removed or changed (signature before and after, `body` when only the body changed),
-        /// the constructor with added, removed and changed parameters, the class header.
+        /// the constructor with added, removed and changed parameters, the class header,
+        /// constants and enum cases added, removed or given another value.
         /// Interfaces and abstract classes list protected methods too; narrowing public to
         /// protected or private is `removed`. Layout, comments, phpDoc and attributes are no
         /// change; class names compare by FQN

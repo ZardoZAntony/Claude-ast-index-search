@@ -56,20 +56,19 @@ pub struct MethodCalls {
 }
 
 /// Calls made by `class_fqn::method` as declared in `content`; `None` when the file does not
-/// declare that method with a body.
+/// declare that method with a body. `this_class` is the class `$this`, `self::` and `static::`
+/// stand for: the declaring class, or for a trait method the class using the trait.
 pub fn method_calls(
     content: &str,
     class_fqn: &str,
     method: &str,
+    this_class: &str,
     classes: &dyn Classes,
 ) -> Result<Option<MethodCalls>> {
     let tree = php_ast::parse(content)?;
     let root = tree.root_node();
     let names = Names::of(root, content);
-    let Some(class_node) = php_ast::class_like_nodes(root).into_iter().find(|n| {
-        php_model::declared_fqn(*n, content, &names)
-            .is_some_and(|fqn| fqn.eq_ignore_ascii_case(class_fqn))
-    }) else {
+    let Some(class_node) = php_model::find_class_node(root, content, &names, class_fqn) else {
         return Ok(None);
     };
     let Some(method_node) = class_node.child_by_field_name("body").and_then(|body| {
@@ -84,12 +83,11 @@ pub fn method_calls(
     let Some(body) = method_node.child_by_field_name("body") else {
         return Ok(None);
     };
-    let this = classes.class(class_fqn);
+    let this = classes.class(this_class);
     let ctx = Ctx {
         src: content,
         names: &names,
-        class: php_model::declared_fqn(class_node, content, &names)
-            .unwrap_or_else(|| class_fqn.to_string()),
+        class: this.as_ref().map(|c| c.fqn.clone()).unwrap_or_else(|| this_class.to_string()),
         parent: this.as_ref().and_then(|c| c.parent.clone()),
         classes,
     };
@@ -257,8 +255,10 @@ impl Ctx<'_> {
                     return None;
                 }
                 let written = self.text(function);
-                let lower = written.to_ascii_lowercase();
-                if !written.contains('\\')
+                // `\count()` is the global built-in written fully qualified.
+                let global = written.strip_prefix('\\').unwrap_or(written);
+                let lower = global.to_ascii_lowercase();
+                if !global.contains('\\')
                     && (super::treesitter::php::BUILTIN_FUNCTIONS.contains(lower.as_str())
                         || LANGUAGE_CONSTRUCTS.contains(&lower.as_str()))
                 {
@@ -759,7 +759,7 @@ final readonly class ChangedHandler
     const DISPATCHER: &str = "<?php\nnamespace Share;\ninterface DispatcherInterface { public function dispatchPreferSync(int $id, $type, array $ctx = []): void; }\n";
 
     fn calls(fixture: &Fixture, content: &str, class: &str, method: &str) -> Vec<CallSite> {
-        method_calls(content, class, method, fixture).unwrap().unwrap().calls
+        method_calls(content, class, method, class, fixture).unwrap().unwrap().calls
     }
 
     #[test]
@@ -877,6 +877,36 @@ class Builder
     }
 
     #[test]
+    fn a_trait_method_reads_this_as_the_class_using_the_trait() {
+        let src = r#"<?php
+namespace App;
+trait Notifies
+{
+    public function notify(): void
+    {
+        $this->send();
+        self::format();
+    }
+}
+final class Mailer
+{
+    use Notifies;
+    public function send(): void {}
+    public static function format(): string { return ''; }
+}
+"#;
+        let fixture = Fixture::of(&[src]);
+        let sites = method_calls(src, "App\\Notifies", "notify", "App\\Mailer", &fixture)
+            .unwrap()
+            .unwrap()
+            .calls;
+        assert_eq!(sites[0].receiver_type.as_deref(), Some("App\\Mailer"));
+        assert_eq!(sites[1].receiver_type.as_deref(), Some("App\\Mailer"));
+        let (declaring, _) = find_method(&fixture, "App\\Mailer", "send").unwrap();
+        assert_eq!(declaring.fqn, "App\\Mailer");
+    }
+
+    #[test]
     fn find_method_walks_traits_parents_and_interfaces() {
         let src = r#"<?php
 namespace App;
@@ -933,7 +963,7 @@ class Svc
 
     #[test]
     fn builtin_functions_are_skipped_project_functions_kept() {
-        let src = "<?php\nclass A { public function f() { count([]); isset($a); plural_form(1); \\App\\helper(); } }\n";
+        let src = "<?php\nclass A { public function f() { count([]); \\sprintf('%s', 1); isset($a); plural_form(1); \\App\\helper(); } }\n";
         let fixture = Fixture::of(&[src]);
         let sites = calls(&fixture, src, "A", "f");
         let names: Vec<&str> = sites.iter().map(|s| s.method.as_str()).collect();

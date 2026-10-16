@@ -11464,6 +11464,136 @@ pub fn get_modules_index_freshness(conn: &Connection) -> Result<Option<(i64, i64
     }
 }
 
+// ---------------------------------------------------------------------------
+// Files for the commands that read PHP and JS structurally
+// ---------------------------------------------------------------------------
+
+/// A file of the index outside `external:` directories: its path relative to its root, and that
+/// root when it is not the project's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedFile {
+    pub path: String,
+    pub root_path: Option<String>,
+}
+
+fn indexed_files(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<IndexedFile>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(params, |row| {
+            Ok(IndexedFile {
+                path: row.get(0)?,
+                root_path: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// PHP files with a reference named one of `names` (case-insensitive: PHP calls are).
+pub fn php_files_with_ref_names(conn: &Connection, names: &[&str]) -> Result<Vec<IndexedFile>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; names.len()].join(", ");
+    let sql = format!(
+        "SELECT DISTINCT f.path, f.root_path FROM refs r JOIN files f ON f.id = r.file_id
+         WHERE r.name COLLATE NOCASE IN ({placeholders}) AND f.external = 0
+           AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')
+         ORDER BY f.path"
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = names.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
+    indexed_files(conn, &sql, &params)
+}
+
+/// Files with a reference resolved to the PHP class `fqn`.
+pub fn files_referencing_fqn(conn: &Connection, fqn: &str) -> Result<Vec<IndexedFile>> {
+    indexed_files(
+        conn,
+        "SELECT DISTINCT f.path, f.root_path FROM refs r JOIN files f ON f.id = r.file_id
+         WHERE r.fqn = ?1 COLLATE NOCASE AND f.external = 0 ORDER BY f.path",
+        &[&fqn],
+    )
+}
+
+/// Files and lines where `new <fqn>` is written.
+pub fn new_sites(conn: &Connection, fqn: &str) -> Result<Vec<(IndexedFile, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.root_path, r.line FROM refs r JOIN files f ON f.id = r.file_id
+         WHERE r.fqn = ?1 COLLATE NOCASE AND r.ref_kind = 'new' AND f.external = 0
+         ORDER BY f.path, r.line",
+    )?;
+    let rows = stmt
+        .query_map(params![fqn], |row| {
+            Ok((
+                IndexedFile {
+                    path: row.get(0)?,
+                    root_path: row.get(1)?,
+                },
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Bitrix component controllers: `class.php` and `ajax.php` under a `components/` directory.
+pub fn component_controller_files(conn: &Connection) -> Result<Vec<IndexedFile>> {
+    indexed_files(
+        conn,
+        "SELECT path, root_path FROM files
+         WHERE external = 0 AND path LIKE '%components/%'
+           AND (path LIKE '%/class.php' OR path LIKE '%/ajax.php')
+         ORDER BY path",
+        &[],
+    )
+}
+
+/// PHP files under a `templates/` directory (site and component templates).
+pub fn php_template_files(conn: &Connection) -> Result<Vec<IndexedFile>> {
+    indexed_files(
+        conn,
+        "SELECT path, root_path FROM files
+         WHERE external = 0 AND path LIKE '%.php'
+           AND (path LIKE '%/templates/%' OR path LIKE 'templates/%')
+         ORDER BY path",
+        &[],
+    )
+}
+
+/// Whether the index has a PHP class, interface, trait or enum with the short name `name`.
+pub fn has_php_class_named(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM symbols s JOIN files f ON f.id = s.file_id
+           WHERE s.name = ?1 COLLATE NOCASE AND s.kind IN ('class', 'interface', 'trait', 'enum')
+             AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml'))",
+        params![name],
+        |row| row.get(0),
+    )?)
+}
+
+/// Path, first and last line of a function declared outside any class.
+pub fn free_function_location(conn: &Connection, name: &str) -> Result<Option<(String, i64, i64)>> {
+    let found = conn.query_row(
+        "SELECT f.path, s.line, s.end_line FROM symbols s JOIN files f ON f.id = s.file_id
+         WHERE s.kind = 'function' AND s.name = ?1 COLLATE NOCASE
+           AND NOT EXISTS (SELECT 1 FROM symbols c WHERE c.file_id = s.file_id
+               AND c.kind IN ('class', 'interface', 'trait', 'enum')
+               AND c.line <= s.line AND COALESCE(c.end_line, c.line) >= s.line)
+         ORDER BY f.path LIMIT 1",
+        params![name],
+        |row| {
+            let line: i64 = row.get(1)?;
+            let end: Option<i64> = row.get(2)?;
+            Ok((row.get::<_, String>(0)?, line, end.unwrap_or(line)))
+        },
+    );
+    match found {
+        Ok(location) => Ok(Some(location)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

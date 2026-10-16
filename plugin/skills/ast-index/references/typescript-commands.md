@@ -39,7 +39,9 @@ or without extension, or a directory with `index.*`). A module is named by its p
   by hand.
 - `http-calls` — backend calls of JS/TS/Vue modules and of inline `<script>` blocks of PHP templates (PHP
   islands shown as `{php:$expr}`): `fetch`, `axios` and `axios.create()` instances, project wrappers (a function
-  that forwards a parameter as the address, imported too — `request.get(url)`), jQuery `$.ajax/post/get`,
+  that forwards a parameter as the address, imported too — `request.get(url)`; one that forwards a parameter as
+  the action of `runComponentAction`, the component from a constant — `runAction('load', data)`), jQuery
+  `$.ajax/post/get`,
   `BX.ajax`, `BX.ajax.runComponentAction` (component, action, mode), `BX.ajax.runAction`, and `ajax.php?c=…&action=…`
   addresses. The address folds literals, template strings, concatenation and constants (imported ones too); the
   rest is `{expression}` — `/api/v1/basket/items/{basketItemId}` matches the route's `{basketItemId}`. `params` —

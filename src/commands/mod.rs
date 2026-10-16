@@ -420,6 +420,20 @@ pub fn display_path(resolver: &PathResolver, root: &Path, path: &Path) -> String
     abs.into_owned()
 }
 
+/// `path` is `prefix` itself or lies under it; no prefix takes every path. A leading `./` and a
+/// trailing `/` of the prefix are ignored.
+pub(crate) fn under_path_prefix(path: &str, prefix: Option<&str>) -> bool {
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    let prefix = prefix.trim_start_matches("./").trim_end_matches('/');
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)

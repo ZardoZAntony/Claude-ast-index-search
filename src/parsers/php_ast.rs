@@ -56,6 +56,7 @@ pub fn named_children(node: Node) -> Vec<Node> {
 
 pub fn has_child_kind(node: Node, kind: &str) -> bool {
     let mut cursor = node.walk();
+    // Bound before returning: the iterator borrows `cursor`, which a tail expression outlives.
     let found = node.children(&mut cursor).any(|child| child.kind() == kind);
     found
 }
@@ -337,9 +338,19 @@ fn collect_tokens(node: Node, src: &str, names: Option<&Names>, out: &mut Vec<St
         }
         return;
     }
+    // `name: value`: a named argument's label sticks to its colon, unlike a ternary's.
+    let label = (node.kind() == "argument")
+        .then(|| node.child_by_field_name("name"))
+        .flatten();
+    if let Some(label) = label {
+        out.push(format!("{}:", text(label, src)));
+    }
     let start = out.len();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if label.is_some() && (Some(child) == label || child.kind() == ":") {
+            continue;
+        }
         collect_tokens(child, src, names, out);
     }
     // `-1`, `!$x`: a unary operator sticks to its operand.

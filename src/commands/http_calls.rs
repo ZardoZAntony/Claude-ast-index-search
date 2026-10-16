@@ -9,11 +9,11 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
-use rusqlite::params;
 use serde::Serialize;
 
 use super::js::{modules_with_imports, ModuleImports};
-use super::php::{print_json, read_lossy};
+use super::php::{locate, print_json, read_lossy};
+use super::under_path_prefix;
 use crate::db;
 use crate::parsers::js_http::{self, HttpCall, Imports, NoImports, ScriptFacts, Wrapper};
 use crate::parsers::php_ast;
@@ -150,19 +150,9 @@ pub fn cmd_http_calls(root: &Path, path_prefix: Option<&str>, format: &str) -> R
             module: Some(i),
         });
     }
-    let mut stmt = conn.prepare(
-        "SELECT path, root_path FROM files WHERE external = 0 AND path LIKE '%.php'
-           AND (path LIKE '%/templates/%' OR path LIKE 'templates/%') ORDER BY path",
-    )?;
-    let templates = stmt
-        .query_map(params![], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (path, root_path) in templates {
-        let base = match root_path.as_deref() {
-            Some(r) if !r.is_empty() => Path::new(r).to_path_buf(),
-            _ => root.to_path_buf(),
-        };
-        let Some(content) = read_lossy(&base.join(&path)) else {
+    for file in db::php_template_files(&conn)? {
+        let (path, abs) = locate(root, file.root_path.as_deref().unwrap_or(""), &file.path);
+        let Some(content) = read_lossy(&abs) else {
             continue;
         };
         if let Some((script, placeholders)) = js_http::template_scripts(&content) {
@@ -194,14 +184,11 @@ pub fn cmd_http_calls(root: &Path, path_prefix: Option<&str>, format: &str) -> R
     }
 
     // Pass 2: calls with imports resolved, reads of the globals.
-    let prefix = path_prefix.map(|p| p.trim_start_matches("./").trim_end_matches('/').to_string());
     let mut calls = Vec::new();
     let mut literals = Vec::new();
     let mut by_global: BTreeMap<String, GlobalEntry> = BTreeMap::new();
     for source in &sources {
-        let in_scope = prefix
-            .as_deref()
-            .is_none_or(|p| source.path == p || source.path.starts_with(&format!("{p}/")));
+        let in_scope = under_path_prefix(&source.path, path_prefix);
         let facts: ScriptFacts = match source.module {
             Some(i) => {
                 let lookup = ModuleLookup {

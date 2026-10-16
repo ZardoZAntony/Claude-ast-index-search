@@ -111,6 +111,44 @@ final class FormController extends Controller
 }
 "#;
 
+const GUARDED_CONTROLLER: &str = r#"<?php
+namespace Shop\Controller;
+
+use Bitrix\Main\Engine\ActionFilter\Attribute\Rule;
+use Bitrix\Main\Engine\ActionFilter\FilterType;
+use Bitrix\Main\Engine\Controller;
+use Shop\Filter\StrictCsrf;
+
+final class GuardedController extends Controller
+{
+    public function configureActions(): array
+    {
+        return [
+            'strict' => ['-prefilters' => [\Bitrix\Main\Engine\ActionFilter\Csrf::class]],
+        ];
+    }
+
+    #[Rule\Prefilters([new StrictCsrf()])]
+    #[Rule\Csrf(type: FilterType::DisablePrefilter)]
+    public function attributedAction(): array
+    {
+        return [];
+    }
+
+    protected function getDefaultPreFilters(): array
+    {
+        return [new StrictCsrf()];
+    }
+
+    public function strictAction(): array
+    {
+        return [];
+    }
+}
+"#;
+
+const STRICT_CSRF: &str = "<?php\nnamespace Shop\\Filter;\n\nuse Bitrix\\Main\\Engine\\ActionFilter\\Csrf;\n\nfinal class StrictCsrf extends Csrf {}\n";
+
 const COMPONENT: &str = r#"<?php
 use Bitrix\Main\Engine\ActionFilter;
 use Bitrix\Main\Engine\Contract\Controllerable;
@@ -146,6 +184,11 @@ fn project() -> (TempDir, TempDir) {
     write(root, "local/modules/shop.basket/lib/Controller/BasketController.php", BASKET_CONTROLLER);
     write(root, "local/modules/shop.basket/lib/Controller/FormController.php", FORM_CONTROLLER);
     write(root, "local/components/shop/users.list/class.php", COMPONENT);
+    write(root, "local/modules/shop.guard/routes.php", "<?php\nuse Bitrix\\Main\\Routing\\RoutingConfigurator;\nuse Shop\\Controller\\GuardedController;\n\nreturn function (RoutingConfigurator $routes) {\n    $routes->post('/api/strict', [GuardedController::class, 'strict']);\n    $routes->post('/api/attributed', [GuardedController::class, 'attributed']);\n};\n");
+    write(root, "local/modules/shop.guard/lib/Controller/GuardedController.php", GUARDED_CONTROLLER);
+    write(root, "local/modules/shop.guard/lib/Filter/StrictCsrf.php", STRICT_CSRF);
+    // The core's Csrf, which StrictCsrf extends, as an indexed class.
+    write(root, "local/modules/shop.guard/lib/core/Csrf.php", "<?php\nnamespace Bitrix\\Main\\Engine\\ActionFilter;\n\nclass Csrf {}\n");
     run(root, cache.path(), &["rebuild"]);
     (tmp, cache)
 }
@@ -169,7 +212,11 @@ fn classes(filters: &Value) -> Vec<String> {
 #[test]
 fn routes_carry_handlers_attributes_and_prefilters_in_effect() {
     let (tmp, cache) = project();
-    let entries = run(tmp.path(), cache.path(), &["routes", "--kind", "route", "--format", "json"]);
+    let entries = run(
+        tmp.path(),
+        cache.path(),
+        &["routes", "--kind", "route", "--path", "local/modules/shop.basket", "--format", "json"],
+    );
     let entries = entries.as_array().unwrap();
     assert_eq!(entries.len(), 2, "the commented route is no route: {entries:#?}");
 
@@ -209,4 +256,27 @@ fn component_actions_use_their_configuration_or_core_defaults() {
     assert_eq!(classes(&filtered["prefilters"]), vec!["HttpMethod", "Csrf*"]);
     let plain = entries.iter().find(|e| e["action"] == "plain").unwrap();
     assert_eq!(classes(&plain["prefilters"]), vec!["Authentication", "HttpMethod", "Csrf"]);
+}
+
+#[test]
+fn filter_attributes_configure_the_action_and_removal_follows_subclasses() {
+    let (tmp, cache) = project();
+    let entries = run(
+        tmp.path(),
+        cache.path(),
+        &["routes", "--kind", "route", "--path", "local/modules/shop.guard", "--format", "json"],
+    );
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let strict = entries.iter().find(|e| e["path"] == "/api/strict").unwrap();
+    // `-prefilters` naming the core's Csrf removes StrictCsrf, which extends it (`is_a()`).
+    assert_eq!(classes(&strict["prefilters"]), Vec::<String>::new());
+    let attributed = entries.iter().find(|e| e["path"] == "/api/attributed").unwrap();
+    // `#[Prefilters([...])]` replaces the defaults, `#[Csrf(type: DisablePrefilter)]` removes
+    // every Csrf — StrictCsrf included.
+    assert_eq!(classes(&attributed["prefilters"]), Vec::<String>::new());
+    assert_eq!(
+        attributed["attributes"],
+        serde_json::json!(["#[Rule\\Prefilters([new StrictCsrf()])]", "#[Rule\\Csrf(type: FilterType::DisablePrefilter)]"])
+    );
 }

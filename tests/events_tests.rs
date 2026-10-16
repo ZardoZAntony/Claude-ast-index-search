@@ -106,6 +106,8 @@ fn project() -> (TempDir, TempDir) {
     write(root, "local/modules/shop.ui/lib/Registry.php", REGISTRY);
     write(root, "local/modules/shop.ui/lib/Dto/Descriptor.php", "<?php\nnamespace Shop\\Ui\\Dto;\n\nfinal class Descriptor\n{\n    public function __construct(public string $name, public string $action, public array $prefilters = []) {}\n}\n");
     write(root, "local/modules/shop.ui/lib/Filter/HttpMethod.php", "<?php\nnamespace Shop\\Ui\\Filter;\n\nfinal class HttpMethod\n{\n    public const POST = 'POST';\n    public function __construct(array $methods) {}\n}\n");
+    write(root, "local/modules/shop.ui/lib/Other.php", "<?php\nnamespace Shop\\Ui;\n\nuse Shop\\Ui\\Dto\\Descriptor;\n\nfinal class Other\n{\n    public function make(): Descriptor\n    {\n        return new Descriptor(name: 'other', action: 'x');\n    }\n}\n");
+    write(root, "tests/EventsTest.php", "<?php\n\nuse Bitrix\\Main\\EventManager;\n\nEventManager::getInstance()->addEventHandler('main', 'OnTestOnly', ['TestHandler', 'run']);\n");
     run(root, cache.path(), &["rebuild"]);
     (tmp, cache)
 }
@@ -113,7 +115,12 @@ fn project() -> (TempDir, TempDir) {
 #[test]
 fn events_unroll_loops_fold_constants_and_locate_handlers() {
     let (tmp, cache) = project();
-    let entries = run(tmp.path(), cache.path(), &["events", "--format", "json"]);
+    let all = run(tmp.path(), cache.path(), &["events", "--format", "json"]);
+    assert!(
+        all.as_array().unwrap().iter().any(|e| e["path"] == "tests/EventsTest.php"),
+        "subscriptions in tests are listed by default"
+    );
+    let entries = run(tmp.path(), cache.path(), &["events", "--no-tests", "--format", "json"]);
     let entries = entries.as_array().unwrap();
     assert_eq!(entries.len(), 2, "{entries:#?}");
 
@@ -155,6 +162,19 @@ fn new_lists_instantiations_with_folded_arguments() {
         tmp.path(),
         cache.path(),
         &["new", "Shop\\Ui\\Dto\\Descriptor", "--format", "json"],
+    );
+    assert_eq!(result["pagination"]["total"], 2);
+    let limited = run(
+        tmp.path(),
+        cache.path(),
+        &["new", "Shop\\Ui\\Dto\\Descriptor", "--limit", "1", "--format", "json"],
+    );
+    assert_eq!(limited["items"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["pagination"]["truncated"], true);
+    let result = run(
+        tmp.path(),
+        cache.path(),
+        &["new", "Shop\\Ui\\Dto\\Descriptor", "--path", "local/modules/shop.ui/lib/Registry.php", "--format", "json"],
     );
     let items = result["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);

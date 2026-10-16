@@ -203,3 +203,24 @@ fn implementations_flag_expands_and_stop_cuts_the_tree() {
     assert_eq!(handle["stopped"], true);
     assert!(handle.get("children").is_none());
 }
+
+#[test]
+fn a_trait_method_is_expanded_for_the_class_using_it() {
+    let tmp = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    write(root, "src/Notifies.php", "<?php\nnamespace App;\n\ntrait Notifies\n{\n    public function notify(): void\n    {\n        $this->send();\n    }\n}\n");
+    write(
+        root,
+        "src/Mailer.php",
+        "<?php\nnamespace App;\n\nfinal class Mailer\n{\n    use Notifies;\n\n    public function run(): void\n    {\n        $this->notify();\n    }\n\n    public function send(): void\n    {\n    }\n}\n",
+    );
+    run(root, cache.path(), &["rebuild"]);
+    let tree = run(root, cache.path(), &["callees", "App\\Mailer::run", "--depth", "2", "--format", "json"]);
+    let notify = find(&tree["calls"], "App\\Mailer::notify");
+    assert_eq!(notify["declared_in"], "App\\Notifies");
+    let send = find(&notify["children"], "App\\Mailer::send");
+    assert!(send.get("undeclared").is_none(), "{send:#?}");
+    assert_eq!(send["declared_at"], "src/Mailer.php:13-15");
+}

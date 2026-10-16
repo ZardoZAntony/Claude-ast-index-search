@@ -102,6 +102,11 @@ fn project() -> (TempDir, TempDir) {
     write(root, "frontend/src/main.js", "const products = window.dataApp.products\n");
     write(root, "local/templates/main/components/shop/list/custom/template.php", TEMPLATE);
     write(root, "frontend/dist/app.js", "fetch('/api/v1/should-not-appear')\n");
+    write(
+        root,
+        "local/templates/main/components/shop/basket/custom/script.js",
+        "const COMPONENT_NAME = 'shop:small.basket';\nconst runAction = (action, data) => BX.ajax.runComponentAction(COMPONENT_NAME, action, { mode: 'class', data: data });\nrunAction('load', { siteId: 's1' });\n",
+    );
     run(root, cache.path(), &["rebuild"]);
     (tmp, cache)
 }
@@ -148,4 +153,21 @@ fn calls_resolve_imported_constants_and_wrappers_vue_and_templates() {
     assert_eq!(data_app["writes"][0]["keys"], serde_json::json!(["products", "offers"]));
     assert_eq!(data_app["reads"][0]["key"], "products");
     assert!(data_app["reads"][0]["path"].as_str().unwrap().ends_with("main.js"));
+}
+
+#[test]
+fn path_filter_and_component_action_wrappers() {
+    let (tmp, cache) = project();
+    let result = run(tmp.path(), cache.path(), &["http-calls", "--path", "local/templates", "--format", "json"]);
+    let calls = result["calls"].as_array().unwrap();
+    assert!(calls.iter().all(|c| c["path"].as_str().unwrap().starts_with("local/templates/")), "{calls:#?}");
+    let wrapped = calls
+        .iter()
+        .find(|c| c["path"].as_str().unwrap().ends_with("basket/custom/script.js"))
+        .expect("the wrapper call");
+    assert_eq!(wrapped["client"], "bx.runComponentAction");
+    assert_eq!(wrapped["via"], "runAction");
+    assert_eq!(wrapped["component"], "shop:small.basket");
+    assert_eq!(wrapped["action"], "load");
+    assert_eq!(wrapped["params"], serde_json::json!(["siteId"]));
 }

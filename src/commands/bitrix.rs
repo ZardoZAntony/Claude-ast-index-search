@@ -5,11 +5,11 @@ use std::path::Path;
 
 use anyhow::Result;
 use colored::Colorize;
-use rusqlite::params;
 use serde::Serialize;
 use serde_json::Value as Json;
 
 use super::php::{is_test_path, open, print_json};
+use super::under_path_prefix;
 use super::php_classes::IndexClasses;
 use crate::parsers::php_ast::{self, Names};
 use crate::parsers::php_calls::{self, Classes};
@@ -18,8 +18,13 @@ use crate::parsers::php_events::{self, Handler};
 use crate::parsers::php_model;
 use crate::parsers::php_routes::RouteHandler;
 
-const REGISTERING_CALLS: &str = "('addEventHandler', 'addEventHandlerCompatible', 'registerEventHandler', \
-     'registerEventHandlerCompatible', 'RegisterModuleDependences')";
+const REGISTERING_CALLS: [&str; 5] = [
+    "addEventHandler",
+    "addEventHandlerCompatible",
+    "registerEventHandler",
+    "registerEventHandlerCompatible",
+    "RegisterModuleDependences",
+];
 
 #[derive(Serialize)]
 struct EventEntry {
@@ -73,38 +78,16 @@ pub fn cmd_events(
 ) -> Result<()> {
     let _lease = crate::db::acquire_project_lease(root)?;
     let conn = open(root)?;
-    let sql = format!(
-        "SELECT DISTINCT f.path, f.root_path FROM refs r JOIN files f ON f.id = r.file_id
-         WHERE r.name COLLATE NOCASE IN {REGISTERING_CALLS} AND f.external = 0
-           AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml')
-         ORDER BY f.path"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let files = stmt
-        .query_map(params![], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let prefix = module.map(|m| m.trim_start_matches("./").trim_end_matches('/').to_string());
+    let files = crate::db::php_files_with_ref_names(&conn, &REGISTERING_CALLS)?;
     let event_filter = event.map(str::to_ascii_lowercase);
     let classes = IndexClasses::new(&conn, root);
 
     let mut entries = Vec::new();
-    for (path, root_path) in files {
-        if prefix
-            .as_deref()
-            .is_some_and(|p| !(path == p || path.starts_with(&format!("{p}/"))))
-        {
+    for file in files {
+        if !under_path_prefix(&file.path, module) || (no_tests && is_test_path(&file.path)) {
             continue;
         }
-        if no_tests && is_test_path(&path) {
-            continue;
-        }
-        let base = match root_path.as_deref() {
-            Some(r) if !r.is_empty() => Path::new(r).to_path_buf(),
-            _ => root.to_path_buf(),
-        };
-        let Some(content) = classes.read(&base.join(&path)) else {
+        let Some((path, content)) = classes.read_file(&file) else {
             continue;
         };
         let Ok(found) = php_events::registrations(&content, &classes) else {
@@ -299,6 +282,7 @@ struct RouteEntry {
 }
 
 const BITRIX_CONTROLLER: &str = "Bitrix\\Main\\Engine\\Controller";
+const ROUTING_CONFIGURATOR: &str = "Bitrix\\Main\\Routing\\RoutingConfigurator";
 
 fn short(fqn: &str) -> String {
     crate::parsers::php_ast::short_name(fqn).to_string()
@@ -308,7 +292,7 @@ fn short(fqn: &str) -> String {
 fn core_default_prefilters() -> Vec<Filter> {
     let filter = |name: &str, args: Vec<Json>| Filter {
         class: name.to_string(),
-        fqn: format!("Bitrix\\Main\\Engine\\ActionFilter\\{name}"),
+        fqn: format!("{ACTION_FILTERS}{name}"),
         from: BITRIX_CONTROLLER.to_string(),
         args,
         implicit: false,
@@ -352,9 +336,7 @@ fn with_method<T>(
     let tree = php_ast::parse(&content).ok()?;
     let root = tree.root_node();
     let names = Names::of(root, &content);
-    let class_node = php_ast::class_like_nodes(root).into_iter().find(|n| {
-        php_model::declared_fqn(*n, &content, &names).is_some_and(|f| f.eq_ignore_ascii_case(class))
-    })?;
+    let class_node = php_model::find_class_node(root, &content, &names, class)?;
     let method = class_node.child_by_field_name("body").and_then(|body| {
         php_ast::named_children(body).into_iter().find(|m| {
             m.kind() == "method_declaration"
@@ -510,35 +492,164 @@ fn configured_actions(classes: &IndexClasses, class: &str) -> Result<Vec<(String
     .unwrap_or_else(|| Ok(Vec::new()))
 }
 
-/// The prefilters Bitrix runs for `action` of `class`.
+const FILTER_RULES: &str = "Bitrix\\Main\\Engine\\ActionFilter\\Attribute\\Rule\\";
+const ACTION_FILTERS: &str = "Bitrix\\Main\\Engine\\ActionFilter\\";
+
+/// `FilterType` case → the configuration key it stands for.
+fn filter_type(value: Option<&Val>) -> String {
+    let case = match value {
+        Some(Val::Case { value: Some(v), .. }) => {
+            if let Val::Str(s) = v.as_ref() {
+                return s.clone();
+            }
+            String::new()
+        }
+        Some(Val::Case { fqn, .. }) => fqn.rsplit("::").next().unwrap_or_default().to_string(),
+        Some(Val::Expr(text)) => text.rsplit("::").next().unwrap_or_default().to_string(),
+        _ => String::new(),
+    };
+    match case.as_str() {
+        "Prefilter" => "prefilters",
+        "Postfilter" => "postfilters",
+        "DisablePrefilter" => "-prefilters",
+        "EnablePostfilter" => "+postfilters",
+        "DisablePostfilter" => "-postfilters",
+        _ => "+prefilters",
+    }
+    .to_string()
+}
+
+/// The configuration Bitrix reads from filter attributes on the action method
+/// (`ActionFilter\Attribute\Rule\*`, `AttributeReader::buildConfig`): key → filters in
+/// attribute order. Empty when the method has none.
+fn attribute_config(classes: &IndexClasses, class: &str, method: &str) -> Vec<(String, Val)> {
+    with_method(classes, class, method, |node, src, names| {
+        let evaluator = Evaluator {
+            class: Some(class.to_string()),
+            ..Evaluator::new(src, names, classes)
+        };
+        let mut config: Vec<(String, Vec<Val>)> = Vec::new();
+        let mut push = |key: String, filters: Vec<Val>| match config.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, existing)) => existing.extend(filters),
+            None => config.push((key, filters)),
+        };
+        for list in php_ast::named_children(node).into_iter().filter(|c| c.kind() == "attribute_list") {
+            for group in php_ast::named_children(list) {
+                for attribute in php_ast::named_children(group).into_iter().filter(|a| a.kind() == "attribute") {
+                    let Some(name) = php_ast::named_children(attribute)
+                        .into_iter()
+                        .find(|n| matches!(n.kind(), "name" | "qualified_name"))
+                    else {
+                        continue;
+                    };
+                    let fqn = names.resolve_class(php_ast::text(name, src), name.start_byte());
+                    let Some(rule) = fqn
+                        .get(..FILTER_RULES.len())
+                        .filter(|p| p.eq_ignore_ascii_case(FILTER_RULES))
+                        .map(|_| fqn[FILTER_RULES.len()..].to_string())
+                    else {
+                        continue;
+                    };
+                    let (args, mut named) = attribute
+                        .child_by_field_name("parameters")
+                        .map(|a| evaluator.arguments(a))
+                        .unwrap_or_default();
+                    let list_argument = |field: &str, named: &[(String, Val)]| -> Vec<Val> {
+                        match named.iter().find(|(k, _)| k == field).map(|(_, v)| v).or(args.first()) {
+                            Some(Val::List(items)) => items.clone(),
+                            _ => Vec::new(),
+                        }
+                    };
+                    match rule.as_str() {
+                        "Prefilters" => push("prefilters".into(), list_argument("prefilters", &named)),
+                        "EnablePrefilters" => push("+prefilters".into(), list_argument("enablePrefilters", &named)),
+                        "DisablePrefilters" => push("-prefilters".into(), list_argument("disablePrefilters", &named)),
+                        "Postfilters" | "EnablePostfilters" | "DisablePostfilters" => {}
+                        single => {
+                            let ty = filter_type(named.iter().find(|(k, _)| k == "type").map(|(_, v)| v));
+                            named.retain(|(k, _)| k != "type");
+                            let filter_class = format!("{ACTION_FILTERS}{single}");
+                            if ty.ends_with("postfilters") {
+                                continue;
+                            }
+                            let filter = if ty.starts_with('-') {
+                                Val::Str(filter_class)
+                            } else {
+                                Val::New {
+                                    class: filter_class,
+                                    args: args.clone(),
+                                    named,
+                                }
+                            };
+                            push(ty, vec![filter]);
+                        }
+                    }
+                }
+            }
+        }
+        config.into_iter().map(|(k, v)| (k, Val::List(v))).collect()
+    })
+    .unwrap_or_default()
+}
+
+/// `class` is `base`, or extends or implements it somewhere up its parents (`is_a()`).
+fn is_a(classes: &IndexClasses, class: &str, base: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = vec![class.to_string()];
+    while let Some(current) = queue.pop() {
+        if current.eq_ignore_ascii_case(base) {
+            return true;
+        }
+        if !seen.insert(current.to_ascii_lowercase()) {
+            continue;
+        }
+        if let Some(model) = classes.class(&current) {
+            queue.extend(model.parent.iter().cloned());
+            queue.extend(model.interfaces.iter().cloned());
+        }
+    }
+    false
+}
+
+/// The prefilters Bitrix runs for `action` of `class` (`Controller::buildFilters()`): the
+/// action's configuration — from filter attributes on its method, or `configureActions()` —
+/// over the defaults.
 fn prefilters_for(
     classes: &IndexClasses,
     class: &str,
     action: &str,
+    method_owner: Option<(&str, &str)>,
     component_class: bool,
 ) -> (Option<Vec<Filter>>, Option<String>) {
-    let configured = match configured_actions(classes, class) {
-        Ok(c) => c,
-        Err(note) => return (None, Some(note)),
-    };
-    let config = configured
-        .iter()
-        .find(|(k, _)| *k == action.to_ascii_lowercase())
-        .map(|(_, v)| v.clone());
-    let entry = |key: &str| -> Option<Val> {
-        match &config {
+    let from_attributes = method_owner
+        .map(|(declaring, method)| attribute_config(classes, declaring, method))
+        .unwrap_or_default();
+    let (config, origin): (Vec<(String, Val)>, &str) = if !from_attributes.is_empty() {
+        (from_attributes, "attribute")
+    } else {
+        let configured = match configured_actions(classes, class) {
+            Ok(c) => c,
+            Err(note) => return (None, Some(note)),
+        };
+        let entry = configured
+            .into_iter()
+            .find(|(k, _)| *k == action.to_ascii_lowercase())
+            .map(|(_, v)| v);
+        let pairs = match entry {
             Some(Val::Map(pairs)) => pairs
-                .iter()
-                .find(|(k, _)| k.as_str() == Some(key))
-                .map(|(_, v)| v.clone()),
-            _ => None,
-        }
+                .into_iter()
+                .filter_map(|(k, v)| k.as_str().map(|k| (k.to_string(), v)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        (pairs, "configureActions")
     };
+    let entry = |key: &str| config.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
     let as_filters = |value: Val| -> Result<Vec<Filter>, String> {
         match value {
             Val::List(items) => items
                 .iter()
-                .map(|i| filter_of(i, "configureActions").ok_or_else(|| format!("{}", i.to_json())))
+                .map(|i| filter_of(i, origin).ok_or_else(|| format!("{}", i.to_json())))
                 .collect(),
             other => Err(format!("{}", other.to_json())),
         }
@@ -546,7 +657,7 @@ fn prefilters_for(
     let mut filters = match entry("prefilters") {
         Some(listed) => match as_filters(listed) {
             Ok(f) => f,
-            Err(note) => return (None, Some(format!("configureActions() prefilters: {note}"))),
+            Err(note) => return (None, Some(format!("{origin} prefilters: {note}"))),
         },
         None if component_class => core_default_prefilters(),
         None => match default_prefilters(classes, class, 0) {
@@ -555,7 +666,7 @@ fn prefilters_for(
         },
     };
     // The order of `Controller::buildFilters()`: the implicit CSRF check joins the base list,
-    // then `-prefilters` are removed, then `+prefilters` appended.
+    // then `-prefilters` are removed (by `is_a()`), then `+prefilters` appended.
     let allows_post = filters.iter().any(|f| {
         f.class.eq_ignore_ascii_case("HttpMethod")
             // `"POST"`, or `HttpMethod::METHOD_POST` left unfolded when the core is not indexed.
@@ -565,7 +676,7 @@ fn prefilters_for(
     if allows_post && !has_csrf {
         filters.push(Filter {
             class: "Csrf".into(),
-            fqn: "Bitrix\\Main\\Engine\\ActionFilter\\Csrf".into(),
+            fqn: format!("{ACTION_FILTERS}Csrf"),
             from: BITRIX_CONTROLLER.into(),
             args: Vec::new(),
             implicit: true,
@@ -574,18 +685,18 @@ fn prefilters_for(
     if let Some(Val::List(removed)) = entry("-prefilters") {
         let removed: Vec<String> = removed
             .iter()
-            .filter_map(|r| r.as_str().map(|s| s.trim_start_matches('\\').to_ascii_lowercase()))
+            .filter_map(|r| r.as_str().map(|s| s.trim_start_matches('\\').to_string()))
             .collect();
         filters.retain(|f| {
-            !removed
-                .iter()
-                .any(|r| *r == f.fqn.to_ascii_lowercase() || *r == f.class.to_ascii_lowercase())
+            !removed.iter().any(|r| {
+                f.class.eq_ignore_ascii_case(r) || is_a(classes, &f.fqn, r)
+            })
         });
     }
     if let Some(added) = entry("+prefilters") {
         match as_filters(added) {
             Ok(f) => filters.extend(f),
-            Err(note) => return (None, Some(format!("configureActions() +prefilters: {note}"))),
+            Err(note) => return (None, Some(format!("{origin} +prefilters: {note}"))),
         }
     }
     (Some(filters), None)
@@ -620,10 +731,7 @@ fn class_attributes(classes: &IndexClasses, class: &str) -> Vec<ClassAttribute> 
             if let Ok(tree) = php_ast::parse(&content) {
                 let root = tree.root_node();
                 let names = Names::of(root, &content);
-                if let Some(node) = php_ast::class_like_nodes(root).into_iter().find(|n| {
-                    php_model::declared_fqn(*n, &content, &names)
-                        .is_some_and(|f| f.eq_ignore_ascii_case(&model.fqn))
-                }) {
+                if let Some(node) = php_model::find_class_node(root, &content, &names, &model.fqn) {
                     for attribute in attribute_texts(node, &content) {
                         out.push(ClassAttribute {
                             attribute,
@@ -663,7 +771,8 @@ fn action_details(classes: &IndexClasses, class: &str, action: &str, component_c
         ),
         None => (Some(format!("{class}::{method_name}")), None, Vec::new()),
     };
-    let (prefilters, prefilters_note) = prefilters_for(classes, &class, action, component_class);
+    let owner = found.as_ref().map(|(declaring, m)| (declaring.fqn.as_str(), m.name.as_str()));
+    let (prefilters, prefilters_note) = prefilters_for(classes, &class, action, owner, component_class);
     ActionDetails {
         handler,
         handler_at: at,
@@ -678,35 +787,14 @@ pub fn cmd_routes(root: &Path, kind: Option<&str>, path_prefix: Option<&str>, fo
     let _lease = crate::db::acquire_project_lease(root)?;
     let conn = open(root)?;
     let classes = IndexClasses::new(&conn, root);
-    let prefix = path_prefix.map(|p| p.trim_start_matches("./").trim_end_matches('/').to_string());
-    let in_scope = |path: &str| {
-        prefix
-            .as_deref()
-            .is_none_or(|p| path == p || path.starts_with(&format!("{p}/")))
-    };
-    let read = |path: &str, root_path: &Option<String>| {
-        let base = match root_path.as_deref() {
-            Some(r) if !r.is_empty() => Path::new(r).to_path_buf(),
-            _ => root.to_path_buf(),
-        };
-        classes.read(&base.join(path))
-    };
     let mut entries = Vec::new();
 
     if kind.is_none_or(|k| k == "route") {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT f.path, f.root_path FROM refs r JOIN files f ON f.id = r.file_id
-             WHERE r.fqn = 'Bitrix\\Main\\Routing\\RoutingConfigurator' COLLATE NOCASE AND f.external = 0
-             ORDER BY f.path",
-        )?;
-        let files = stmt
-            .query_map(params![], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (path, root_path) in files {
-            if !in_scope(&path) {
+        for file in crate::db::files_referencing_fqn(&conn, ROUTING_CONFIGURATOR)? {
+            if !under_path_prefix(&file.path, path_prefix) {
                 continue;
             }
-            let Some(content) = read(&path, &root_path) else {
+            let Some((path, content)) = classes.read_file(&file) else {
                 continue;
             };
             let Ok(routes) = crate::parsers::php_routes::route_definitions(&content, &classes) else {
@@ -764,28 +852,19 @@ pub fn cmd_routes(root: &Path, kind: Option<&str>, path_prefix: Option<&str>, fo
     }
 
     if kind.is_none_or(|k| k == "component") {
-        let mut stmt = conn.prepare(
-            "SELECT f.path, f.root_path FROM files f
-             WHERE f.external = 0 AND f.path LIKE '%components/%'
-               AND (f.path LIKE '%/class.php' OR f.path LIKE '%/ajax.php')
-             ORDER BY f.path",
-        )?;
-        let files = stmt
-            .query_map(params![], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (path, root_path) in files {
-            if !in_scope(&path) {
+        for file in crate::db::component_controller_files(&conn)? {
+            if !under_path_prefix(&file.path, path_prefix) {
                 continue;
             }
-            let Some(content) = read(&path, &root_path) else {
+            let Some((path, content)) = classes.read_file(&file) else {
                 continue;
             };
             let Ok(models) = php_model::class_models(&content) else {
                 continue;
             };
-            let mode = if path.ends_with("/ajax.php") { "ajax" } else { "class" };
+            let mode = if file.path.ends_with("/ajax.php") { "ajax" } else { "class" };
             let dir = path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
-            let component = component_name(&dir);
+            let component = component_name(&file.path);
             for model in models {
                 let mut actions: Vec<&php_model::MethodModel> = model
                     .methods
@@ -865,13 +944,15 @@ pub fn cmd_routes(root: &Path, kind: Option<&str>, path_prefix: Option<&str>, fo
     Ok(())
 }
 
-/// `vendor:name` for a component directory under `local/components` or `bitrix/components`.
-fn component_name(dir: &str) -> Option<String> {
-    let parts: Vec<&str> = dir.split('/').collect();
+/// `vendor:name` for a file of a component under `local/components` or `bitrix/components`.
+fn component_name(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
     let at = parts
         .windows(2)
         .position(|w| matches!(w[0], "local" | "bitrix") && w[1] == "components")?;
-    let vendor = parts.get(at + 2)?;
-    let name = parts.get(at + 3)?;
-    Some(format!("{vendor}:{name}"))
+    // `components/<vendor>/<name>/<file>`: a file right under the vendor names no component.
+    if parts.len() <= at + 4 {
+        return None;
+    }
+    Some(format!("{}:{}", parts[at + 2], parts[at + 3]))
 }

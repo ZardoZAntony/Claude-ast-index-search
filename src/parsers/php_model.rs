@@ -83,6 +83,25 @@ pub fn class_models(content: &str) -> Result<Vec<ClassModel>> {
         .collect())
 }
 
+/// The declaration of class-like `fqn` in a parsed file.
+pub fn find_class_node<'t>(root: Node<'t>, src: &str, names: &Names, fqn: &str) -> Option<Node<'t>> {
+    php_ast::class_like_nodes(root)
+        .into_iter()
+        .find(|n| declared_fqn(*n, src, names).is_some_and(|f| f.eq_ignore_ascii_case(fqn)))
+}
+
+/// FQN of the class-like declaration a node is written in.
+pub fn enclosing_class(node: Node, src: &str, names: &Names) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if php_ast::CLASS_LIKE_KINDS.contains(&n.kind()) {
+            return declared_fqn(n, src, names);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 /// FQN of the class-like declaration `node`.
 pub fn declared_fqn(node: Node, src: &str, names: &Names) -> Option<String> {
     let name = php_ast::text(node.child_by_field_name("name")?, src);

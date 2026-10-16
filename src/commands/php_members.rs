@@ -7,30 +7,16 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 use colored::Colorize;
-use rusqlite::params;
 use serde::Serialize;
 use serde_json::{json, Value as Json};
 use tree_sitter::Node;
 
-use super::php::{is_test_path, normalize_fqn, not_defined, open, print_json, type_fqns};
+use super::php::{ensure_php_names, is_test_path, open, print_json, resolve_one_class, with_subtypes};
 use super::php_classes::IndexClasses;
 use crate::parsers::php_ast::{self, Names};
 use crate::parsers::php_calls::Classes;
 use crate::parsers::php_eval::{Constants, Evaluator, Val};
 use crate::parsers::php_model;
-
-fn resolve_class(conn: &rusqlite::Connection, written: &str) -> Result<String> {
-    let wanted = normalize_fqn(written);
-    match type_fqns(conn, &wanted)?.as_slice() {
-        [] => bail!("{}", not_defined(conn, "class ", &wanted)),
-        [only] => Ok(only.clone()),
-        many => bail!(
-            "{} classes are named {wanted}; pass one FQN: {}",
-            many.len(),
-            many.join(", ")
-        ),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // enum <FQN> [--method m]
@@ -48,7 +34,7 @@ struct CaseEntry {
 pub fn cmd_enum(root: &Path, fqn: &str, methods: &[String], format: &str) -> Result<()> {
     let _lease = crate::db::acquire_project_lease(root)?;
     let conn = open(root)?;
-    let fqn = resolve_class(&conn, fqn)?;
+    let fqn = resolve_one_class(&conn, fqn)?;
     let classes = IndexClasses::new(&conn, root);
     let Some(model) = classes.class(&fqn) else {
         bail!("{fqn} is not readable from its file");
@@ -62,9 +48,7 @@ pub fn cmd_enum(root: &Path, fqn: &str, methods: &[String], format: &str) -> Res
     let tree = php_ast::parse(&content)?;
     let root_node = tree.root_node();
     let names = Names::of(root_node, &content);
-    let Some(enum_node) = php_ast::class_like_nodes(root_node).into_iter().find(|n| {
-        php_model::declared_fqn(*n, &content, &names).is_some_and(|f| f.eq_ignore_ascii_case(&fqn))
-    }) else {
+    let Some(enum_node) = php_model::find_class_node(root_node, &content, &names, &fqn) else {
         bail!("{fqn} is not readable from its file");
     };
     let backed = php_ast::named_children(enum_node)
@@ -248,30 +232,40 @@ fn per_case_values(
 // usages <FQN>::<MEMBER>
 // ---------------------------------------------------------------------------
 
-/// `Class::MEMBER` whose class part names a PHP class: written with a namespace, or a short
-/// name a PHP class in the index has.
-pub fn is_php_member_spec(root: &Path, spec: &str) -> Result<bool> {
+/// `usages 'Class::MEMBER'` when the class part names a PHP class — written with a namespace,
+/// or a short name a PHP class in the index has. `Ok(false)`, with nothing printed, otherwise:
+/// Ruby and C++ names are qualified with `::` too.
+pub fn try_member_usages(
+    root: &Path,
+    spec: &str,
+    limit: usize,
+    no_tests: bool,
+    format: &str,
+) -> Result<bool> {
     let Some((class_part, member)) = spec.rsplit_once("::") else {
         return Ok(false);
     };
+    let (class_part, member) = (class_part.trim(), member.trim());
     if member.is_empty() || class_part.is_empty() {
         return Ok(false);
     }
-    if class_part.contains('\\') {
-        return Ok(true);
-    }
-    if !crate::db::db_exists(root) {
+    let qualified = class_part.contains('\\');
+    if !qualified && !crate::db::db_exists(root) {
         return Ok(false);
     }
-    let conn = crate::db::open_db_leased(root)?;
-    let found: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM symbols s JOIN files f ON f.id = s.file_id
-           WHERE s.name = ?1 COLLATE NOCASE AND s.kind IN ('class', 'interface', 'trait', 'enum')
-             AND (f.path LIKE '%.php' OR f.path LIKE '%.phtml'))",
-        params![class_part.trim()],
-        |row| row.get(0),
-    )?;
-    Ok(found)
+    let _lease = crate::db::acquire_project_lease(root)?;
+    let conn = if qualified {
+        open(root)?
+    } else {
+        let conn = crate::db::open_db_leased(root)?;
+        if !crate::db::has_php_class_named(&conn, class_part)? {
+            return Ok(false);
+        }
+        ensure_php_names(&conn)?;
+        conn
+    };
+    member_usages(&conn, root, class_part, member, limit, no_tests, format)?;
+    Ok(true)
 }
 
 #[derive(Serialize)]
@@ -286,21 +280,38 @@ struct MemberUsage {
     inside: bool,
 }
 
-pub fn cmd_member_usages(
+/// The class that declares `member` for `class`: itself, or the nearest parent, interface or
+/// trait that does.
+fn declaring_class(classes: &IndexClasses, class: &str, member: &str) -> Option<String> {
+    let mut seen = HashSet::new();
+    let mut queue = vec![class.to_string()];
+    while let Some(current) = queue.pop() {
+        if !seen.insert(current.to_ascii_lowercase()) {
+            continue;
+        }
+        let model = classes.class(&current)?;
+        if model.constants.iter().any(|c| c.name == member) || model.cases.iter().any(|c| c.name == member) {
+            return Some(model.fqn.clone());
+        }
+        queue.extend(model.traits.iter().cloned());
+        queue.extend(model.interfaces.iter().cloned());
+        queue.extend(model.parent.iter().cloned());
+    }
+    None
+}
+
+fn member_usages(
+    conn: &rusqlite::Connection,
     root: &Path,
-    spec: &str,
+    class_part: &str,
+    member: &str,
     limit: usize,
     no_tests: bool,
     format: &str,
 ) -> Result<()> {
-    let _lease = crate::db::acquire_project_lease(root)?;
-    let conn = open(root)?;
-    let Some((class_part, member)) = spec.rsplit_once("::") else {
-        bail!("expected Class::MEMBER");
-    };
-    let member = member.trim();
-    let fqn = resolve_class(&conn, class_part)?;
-    let classes = IndexClasses::new(&conn, root);
+    let asked = resolve_one_class(conn, class_part)?;
+    let classes = IndexClasses::new(conn, root);
+    let fqn = declaring_class(&classes, &asked, member).unwrap_or_else(|| asked.clone());
     let model = classes.class(&fqn);
     let declared = model.as_ref().and_then(|m| {
         m.cases
@@ -312,39 +323,50 @@ pub fn cmd_member_usages(
     });
     let declared_path = classes.source(&fqn).map(|(p, _)| p);
 
-    // Files that reference the class, and the class's own file for `self::`.
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT f.path, f.root_path FROM refs r JOIN files f ON f.id = r.file_id
-         WHERE r.fqn = ?1 COLLATE NOCASE AND f.external = 0 ORDER BY f.path",
-    )?;
-    let mut files = stmt
-        .query_map(params![fqn], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(own) = &declared_path {
-        if !files.iter().any(|(p, _)| p == own) {
-            files.push((own.clone(), None));
+    // The member is reachable through every subtype that does not declare its own.
+    let owners: Vec<String> = with_subtypes(conn, std::slice::from_ref(&fqn))?
+        .into_iter()
+        .filter(|t| t.eq_ignore_ascii_case(&fqn) || declaring_class(&classes, t, member).is_some_and(|d| d.eq_ignore_ascii_case(&fqn)))
+        .collect();
+    let owner_set: HashSet<String> = owners.iter().map(|o| o.to_ascii_lowercase()).collect();
+
+    // Files that reference an owner, and the owners' own files for `self::`/`parent::`.
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for owner in &owners {
+        for file in crate::db::files_referencing_fqn(conn, owner)? {
+            if seen.insert(file.path.clone()) {
+                files.push(file);
+            }
         }
     }
-    let mut seen = HashSet::new();
+    let mut own_files: Vec<(String, std::rc::Rc<String>)> = Vec::new();
+    for owner in &owners {
+        if let Some((path, content)) = classes.source(owner) {
+            if !own_files.iter().any(|(p, _)| *p == path) {
+                own_files.push((path, content));
+            }
+        }
+    }
+    let mut sources: Vec<(String, std::rc::Rc<String>)> = Vec::new();
+    for file in files {
+        if let Some((path, content)) = classes.read_file(&file) {
+            sources.push((path, content));
+        }
+    }
+    for (path, content) in own_files {
+        if !sources.iter().any(|(p, _)| *p == path) {
+            sources.push((path, content));
+        }
+    }
+
     let mut items = Vec::new();
     let mut phpdoc = Vec::new();
-    for (path, root_path) in files {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
+    for (path, content) in sources {
         let test = is_test_path(&path);
         if no_tests && test {
             continue;
         }
-        let base = match root_path.as_deref() {
-            Some(r) if !r.is_empty() => Path::new(r).to_path_buf(),
-            _ => root.to_path_buf(),
-        };
-        let Some(content) = classes.read(&base.join(&path)) else {
-            continue;
-        };
         let Ok(tree) = php_ast::parse(&content) else {
             continue;
         };
@@ -356,7 +378,7 @@ pub fn cmd_member_usages(
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "class_constant_access_expression" => {
-                    if let Some(inside) = names_member(node, &content, &names, &fqn, member) {
+                    if let Some(inside) = names_member(node, &content, &names, &classes, &fqn, &owner_set, member) {
                         let line = php_ast::line(node);
                         items.push(MemberUsage {
                             path: path.clone(),
@@ -369,7 +391,7 @@ pub fn cmd_member_usages(
                 }
                 "comment" => {
                     for (offset, text) in php_ast::text(node, &content).lines().enumerate() {
-                        if mentions_member(text, &names, node.start_byte(), &fqn, member) {
+                        if mentions_member(text, &names, node.start_byte(), &owner_set, member) {
                             let line = php_ast::line(node) + offset;
                             phpdoc.push(MemberUsage {
                                 path: path.clone(),
@@ -399,6 +421,7 @@ pub fn cmd_member_usages(
             "member": shown,
             "kind": declared.map(|(k, _)| k),
             "declared_at": declared.and_then(|(_, line)| declared_path.as_ref().map(|p| format!("{p}:{line}"))),
+            "subtypes": owners.iter().filter(|o| !o.eq_ignore_ascii_case(&fqn)).collect::<Vec<_>>(),
             "items": items,
             "phpdoc": phpdoc,
             "pagination": {"total": total, "returned": items.len(), "truncated": total > items.len(), "limit": limit},
@@ -431,41 +454,38 @@ pub fn cmd_member_usages(
     Ok(())
 }
 
-/// `Some(inside the class)` when `node` (`X::NAME`) names `member` of `fqn`.
-fn names_member(node: Node, src: &str, names: &Names, fqn: &str, member: &str) -> Option<bool> {
+/// `Some(inside the declaring class)` when `node` (`X::NAME`) names `member` of `fqn`: through
+/// `fqn` or a subtype that inherits it (`owners`), `self::`/`static::` in one of them, or
+/// `parent::` in a class whose parent is one of them.
+fn names_member(
+    node: Node,
+    src: &str,
+    names: &Names,
+    classes: &IndexClasses,
+    fqn: &str,
+    owners: &HashSet<String>,
+    member: &str,
+) -> Option<bool> {
     let parts = php_ast::named_children(node);
     let (scope, name) = (parts.first()?, parts.get(1)?);
     if php_ast::text(*name, src) != member {
         return None;
     }
     let written = php_ast::text(*scope, src);
-    let in_class = enclosing_class(node, src, names);
+    let in_class = php_model::enclosing_class(node, src, names);
     let inside = in_class.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(fqn));
-    match scope.kind() {
-        "relative_scope" => matches!(written.to_ascii_lowercase().as_str(), "self" | "static")
-            .then_some(inside)
-            .filter(|i| *i),
-        "name" | "qualified_name" | "relative_name" => names
-            .resolve_class(written, scope.start_byte())
-            .eq_ignore_ascii_case(fqn)
-            .then_some(inside),
+    let owned = |class: &str| owners.contains(&class.to_ascii_lowercase());
+    let through = match (scope.kind(), written.to_ascii_lowercase().as_str()) {
+        ("relative_scope", "self" | "static") => in_class.clone(),
+        ("relative_scope", "parent") => in_class.as_deref().and_then(|c| classes.class(c)).and_then(|m| m.parent.clone()),
+        ("name" | "qualified_name" | "relative_name", _) => Some(names.resolve_class(written, scope.start_byte())),
         _ => None,
-    }
+    }?;
+    owned(&through).then_some(inside)
 }
 
-fn enclosing_class(node: Node, src: &str, names: &Names) -> Option<String> {
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if php_ast::CLASS_LIKE_KINDS.contains(&n.kind()) {
-            return php_model::declared_fqn(n, src, names);
-        }
-        current = n.parent();
-    }
-    None
-}
-
-/// A comment line naming `Class::MEMBER` with `Class` resolving to `fqn`.
-fn mentions_member(line: &str, names: &Names, at: usize, fqn: &str, member: &str) -> bool {
+/// A comment line naming `Class::MEMBER` with `Class` resolving to one of `owners`.
+fn mentions_member(line: &str, names: &Names, at: usize, owners: &HashSet<String>, member: &str) -> bool {
     let needle = format!("::{member}");
     line.match_indices(&needle).any(|(pos, _)| {
         let after = line[pos + needle.len()..].chars().next();
@@ -480,6 +500,6 @@ fn mentions_member(line: &str, names: &Names, at: usize, fqn: &str, member: &str
             .into_iter()
             .rev()
             .collect();
-        !class.is_empty() && names.resolve_class(&class, at).eq_ignore_ascii_case(fqn)
+        !class.is_empty() && owners.contains(&names.resolve_class(&class, at).to_ascii_lowercase())
     })
 }

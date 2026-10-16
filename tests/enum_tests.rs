@@ -199,3 +199,45 @@ fn case_usages_follow_the_class_not_its_namesake() {
     assert_eq!(mobile_items.len(), 1);
     assert_eq!(mobile_items[0]["line"], 17);
 }
+
+#[test]
+fn constant_usages_follow_subclasses_that_inherit_it() {
+    let tmp = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    write(root, "src/Base.php", "<?php\nnamespace App;\n\nclass Base\n{\n    public const LIMIT = 10;\n}\n");
+    write(
+        root,
+        "src/Child.php",
+        "<?php\nnamespace App;\n\nclass Child extends Base\n{\n    public function a(): int { return self::LIMIT; }\n    public function b(): int { return static::LIMIT + parent::LIMIT; }\n}\n",
+    );
+    write(
+        root,
+        "src/Override.php",
+        "<?php\nnamespace App;\n\nclass Override extends Base\n{\n    public const LIMIT = 20;\n    public function c(): int { return self::LIMIT; }\n}\n",
+    );
+    write(root, "src/User.php", "<?php\nnamespace App;\n\nfinal class User\n{\n    public function d(): int { return Child::LIMIT; }\n}\n");
+    run(root, cache.path(), &["rebuild"]);
+
+    let result = run(root, cache.path(), &["usages", "App\\Base::LIMIT", "--format", "json"]);
+    let places: Vec<(String, u64)> = result["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["path"].as_str().unwrap().to_string(), i["line"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        places,
+        vec![
+            ("src/Child.php".into(), 6),
+            ("src/Child.php".into(), 7),
+            ("src/Child.php".into(), 7),
+            ("src/User.php".into(), 6),
+        ],
+        "Override redeclares LIMIT: its self::LIMIT is its own"
+    );
+    assert_eq!(result["subtypes"], serde_json::json!(["App\\Child"]));
+    let through_child = run(root, cache.path(), &["usages", "App\\Child::LIMIT", "--format", "json"]);
+    assert_eq!(through_child["member"], "App\\Base::LIMIT");
+}

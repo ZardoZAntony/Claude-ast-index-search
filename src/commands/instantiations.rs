@@ -5,14 +5,15 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use colored::Colorize;
-use rusqlite::params;
 use serde::Serialize;
 use serde_json::Value as Json;
 use tree_sitter::Node;
 
-use super::php::{is_test_path, normalize_fqn, not_defined, open, print_json, type_fqns};
+use super::php::{is_test_path, open, print_json, resolve_one_class};
+use super::under_path_prefix;
+use crate::db::IndexedFile;
 use super::php_classes::IndexClasses;
 use crate::parsers::php_ast::{self, Names};
 use crate::parsers::php_eval::{Evaluator, Val};
@@ -40,55 +41,22 @@ pub fn cmd_new(
 ) -> Result<()> {
     let _lease = crate::db::acquire_project_lease(root)?;
     let conn = open(root)?;
-    let wanted = normalize_fqn(fqn);
-    let class = match type_fqns(&conn, &wanted)?.as_slice() {
-        [] => bail!("{}", not_defined(&conn, "class ", &wanted)),
-        [only] => only.clone(),
-        many => bail!(
-            "{} classes are named {wanted}; pass one FQN: {}",
-            many.len(),
-            many.join(", ")
-        ),
-    };
-    let mut stmt = conn.prepare(
-        "SELECT f.path, f.root_path, r.line FROM refs r JOIN files f ON f.id = r.file_id
-         WHERE r.fqn = ?1 COLLATE NOCASE AND r.ref_kind = 'new' AND f.external = 0
-         ORDER BY f.path, r.line",
-    )?;
-    let rows = stmt
-        .query_map(params![class], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut by_file: BTreeMap<(String, Option<String>), HashSet<usize>> = BTreeMap::new();
-    for (path, root_path, line) in rows {
+    let class = resolve_one_class(&conn, fqn)?;
+    let mut by_file: BTreeMap<String, (IndexedFile, HashSet<usize>)> = BTreeMap::new();
+    for (file, line) in crate::db::new_sites(&conn, &class)? {
         by_file
-            .entry((path, root_path))
-            .or_default()
+            .entry(file.path.clone())
+            .or_insert_with(|| (file, HashSet::new()))
+            .1
             .insert(line as usize);
     }
-    let prefix = path_prefix.map(|p| p.trim_start_matches("./").trim_end_matches('/').to_string());
     let classes = IndexClasses::new(&conn, root);
     let mut found = Vec::new();
-    for ((path, root_path), lines) in by_file {
-        if prefix
-            .as_deref()
-            .is_some_and(|p| !(path == p || path.starts_with(&format!("{p}/"))))
-        {
+    for (file, lines) in by_file.into_values() {
+        if !under_path_prefix(&file.path, path_prefix) || (no_tests && is_test_path(&file.path)) {
             continue;
         }
-        if no_tests && is_test_path(&path) {
-            continue;
-        }
-        let base = match root_path.as_deref() {
-            Some(r) if !r.is_empty() => Path::new(r).to_path_buf(),
-            _ => root.to_path_buf(),
-        };
-        let Some(content) = classes.read(&base.join(&path)) else {
+        let Some((path, content)) = classes.read_file(&file) else {
             continue;
         };
         let Ok(tree) = php_ast::parse(&content) else {
@@ -181,18 +149,13 @@ fn enclosing(node: Node, src: &str, names: &Names) -> (Option<String>, Option<St
     let mut method = None;
     let mut current = node.parent();
     while let Some(n) = current {
-        match n.kind() {
-            "method_declaration" | "function_definition" if method.is_none() => {
-                method = n
-                    .child_by_field_name("name")
-                    .map(|name| php_ast::text(name, src).to_string());
-            }
-            kind if php_ast::CLASS_LIKE_KINDS.contains(&kind) => {
-                return (php_model::declared_fqn(n, src, names), method);
-            }
-            _ => {}
+        if matches!(n.kind(), "method_declaration" | "function_definition") {
+            method = n
+                .child_by_field_name("name")
+                .map(|name| php_ast::text(name, src).to_string());
+            break;
         }
         current = n.parent();
     }
-    (None, method)
+    (php_model::enclosing_class(node, src, names), method)
 }

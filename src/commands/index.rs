@@ -1337,8 +1337,8 @@ pub fn cmd_usages(
 ) -> Result<()> {
     // `Class::MEMBER` of a PHP class: a constant or enum case of that very class. Ruby and C++
     // names are qualified with `::` too and go the general way.
-    if super::php_members::is_php_member_spec(root, symbol)? {
-        return super::php_members::cmd_member_usages(root, symbol, limit, no_tests, format);
+    if super::php_members::try_member_usages(root, symbol, limit, no_tests, format)? {
+        return Ok(());
     }
     // A fully qualified PHP name: exact references of that class, not of its namesakes.
     if symbol.contains('\\') {

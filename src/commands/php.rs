@@ -72,6 +72,12 @@ pub(super) fn open(root: &Path) -> Result<db::LeasedConnection> {
         bail!("Index not found. Run 'ast-index rebuild' first.");
     }
     let conn = db::open_db_leased(root)?;
+    ensure_php_names(&conn)?;
+    Ok(conn)
+}
+
+/// An index built before PHP names were resolved has no reference kinds to answer from.
+pub(super) fn ensure_php_names(conn: &Connection) -> Result<()> {
     let has_kinds: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_kind IS NOT NULL)",
         [],
@@ -80,7 +86,7 @@ pub(super) fn open(root: &Path) -> Result<db::LeasedConnection> {
     if !has_kinds {
         bail!("The index has no resolved PHP names yet. Run 'ast-index rebuild'.");
     }
-    Ok(conn)
+    Ok(())
 }
 
 pub(super) fn normalize_fqn(fqn: &str) -> String {
@@ -126,7 +132,7 @@ pub(super) fn not_defined(conn: &Connection, what: &str, fqn: &str) -> String {
 }
 
 /// Path for output (relative to the project root when inside it) and the absolute path.
-fn locate(root: &Path, root_path: &str, path: &str) -> (String, PathBuf) {
+pub(super) fn locate(root: &Path, root_path: &str, path: &str) -> (String, PathBuf) {
     let base = if root_path.is_empty() {
         root.to_path_buf()
     } else {
@@ -1582,6 +1588,21 @@ fn print_sites(title: &str, sites: &[CallSite], with_receiver: bool) {
             String::new()
         };
         println!("  {}:{}{receiver}  {}", c.path.cyan(), c.line, c.context);
+    }
+}
+
+/// The one class a written name (FQN or short) stands for; several classes of a short name,
+/// or none, are an error naming them.
+pub(super) fn resolve_one_class(conn: &Connection, written: &str) -> Result<String> {
+    let wanted = normalize_fqn(written);
+    match type_fqns(conn, &wanted)?.as_slice() {
+        [] => bail!("{}", not_defined(conn, "class ", &wanted)),
+        [only] => Ok(only.clone()),
+        many => bail!(
+            "{} classes are named {wanted}; pass one FQN: {}",
+            many.len(),
+            many.join(", ")
+        ),
     }
 }
 

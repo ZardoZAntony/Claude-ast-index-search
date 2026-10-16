@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 
 use super::php::{definitions, read_lossy};
 use crate::parsers::php_ast::{self, Names};
@@ -41,6 +41,12 @@ impl<'a> IndexClasses<'a> {
         self.sources.borrow().get(&fqn.to_ascii_lowercase()).cloned()
     }
 
+    /// Path for output (absolute outside the project root) and content of an indexed file.
+    pub(super) fn read_file(&self, file: &crate::db::IndexedFile) -> Option<(String, Rc<String>)> {
+        let (shown, abs) = super::php::locate(self.root, file.root_path.as_deref().unwrap_or(""), &file.path);
+        Some((shown, self.read(&abs)?))
+    }
+
     pub(super) fn read(&self, abs: &Path) -> Option<Rc<String>> {
         if let Some(content) = self.files.borrow().get(abs) {
             return Some(content.clone());
@@ -54,24 +60,10 @@ impl<'a> IndexClasses<'a> {
 
     /// `path:start-end` of a function declared outside any class.
     pub(super) fn function_at(&self, name: &str) -> Option<String> {
-        let short = php_ast::short_name(name);
-        self.conn
-            .query_row(
-                "SELECT f.path, s.line, s.end_line FROM symbols s JOIN files f ON f.id = s.file_id
-                 WHERE s.kind = 'function' AND s.name = ?1 COLLATE NOCASE
-                   AND NOT EXISTS (SELECT 1 FROM symbols c WHERE c.file_id = s.file_id
-                       AND c.kind IN ('class', 'interface', 'trait', 'enum')
-                       AND c.line <= s.line AND COALESCE(c.end_line, c.line) >= s.line)
-                 ORDER BY f.path LIMIT 1",
-                params![short],
-                |row| {
-                    let path: String = row.get(0)?;
-                    let line: i64 = row.get(1)?;
-                    let end: Option<i64> = row.get(2)?;
-                    Ok(format!("{path}:{line}-{}", end.unwrap_or(line)))
-                },
-            )
+        crate::db::free_function_location(self.conn, php_ast::short_name(name))
             .ok()
+            .flatten()
+            .map(|(path, line, end)| format!("{path}:{line}-{end}"))
     }
 
     /// The value of constant or enum case `name` declared in `fqn` itself.
@@ -80,10 +72,7 @@ impl<'a> IndexClasses<'a> {
         let tree = php_ast::parse(&content).ok()?;
         let root = tree.root_node();
         let names = Names::of(root, &content);
-        let class = php_ast::class_like_nodes(root).into_iter().find(|n| {
-            php_model::declared_fqn(*n, &content, &names)
-                .is_some_and(|f| f.eq_ignore_ascii_case(fqn))
-        })?;
+        let class = php_model::find_class_node(root, &content, &names, fqn)?;
         let body = class.child_by_field_name("body")?;
         let evaluator = Evaluator {
             class: Some(fqn.to_string()),

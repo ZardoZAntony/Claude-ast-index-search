@@ -147,7 +147,7 @@ fn registration(
     };
     let shape = shape(call, is_method)?;
     let argument_nodes = positional(arguments, &shape, src);
-    let class = enclosing_class(node, src, names);
+    let class = php_model::enclosing_class(node, src, names);
 
     let mut combos: Vec<HashMap<String, Val>> = vec![HashMap::new()];
     for each in loop_bindings(node, src) {
@@ -305,17 +305,6 @@ fn loop_bindings<'t>(node: Node<'t>, src: &str) -> Vec<Loop<'t>> {
     }
     loops.reverse();
     loops
-}
-
-fn enclosing_class(node: Node, src: &str, names: &Names) -> Option<String> {
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if php_ast::CLASS_LIKE_KINDS.contains(&n.kind()) {
-            return php_model::declared_fqn(n, src, names);
-        }
-        current = n.parent();
-    }
-    None
 }
 
 fn callback(node: Node, evaluator: &Evaluator, class: Option<&str>, src: &str) -> Handler {

@@ -205,3 +205,31 @@ fn renamed_file_with_new_namespace_is_a_move() {
     assert_eq!(moved["old_path"], "src/Legacy/Adapter.php");
     assert!(class(&result, "App\\Legacy\\Adapter").is_none());
 }
+
+#[test]
+fn constants_and_enum_cases_are_listed() {
+    let repo = new_repo();
+    let root = repo.path();
+    write(root, "src/Status.php", "<?php\nnamespace App;\n\nenum Status: string\n{\n    case Active = 'active';\n    case Old = 'old';\n}\n");
+    commit_all(root, "base");
+    git(root, &["checkout", "-qb", "feature"]);
+    write(root, "src/Status.php", "<?php\nnamespace App;\n\nenum Status: string\n{\n    case Active = 'on';\n    case Paused = 'paused';\n}\n");
+    commit_all(root, "feature");
+
+    let result = changed_symbols(root, &["--base", "main"]);
+    let status = class(&result, "App\\Status").expect("enum listed");
+    let changes: Vec<(String, String)> = status["constants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["name"].as_str().unwrap().to_string(), c["change"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            ("Active".into(), "changed".into()),
+            ("Paused".into(), "added".into()),
+            ("Old".into(), "removed".into()),
+        ]
+    );
+}

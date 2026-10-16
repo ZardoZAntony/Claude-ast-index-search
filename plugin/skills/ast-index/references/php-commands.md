@@ -64,7 +64,8 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   `new`, `property` — typed, promoted or `@var`, `param`, `@var`, `instanceof` — inside the
   `if` or after a guard that returns, `return` — the declared return type of a call on a known
   type, `template` — `@return T` with `@param class-string<T>`, as in `getHandler(Foo::class)`),
-  where the method is declared (`declared_in` when inherited, `declared_at`), class constants
+  where the method is declared (`declared_in` when inherited — a trait method is read with
+  `$this` as the class using the trait, `declared_at`), class constants
   and enum cases passed as arguments (`constants`), `Foo::class` arguments (`classes`). An
   abstract or interface method lists its `implementations`; `--implementations` expands them
   too. `--depth N` (default 2) sets the levels; `--stop <Class|Class::method|Ns\>` keeps a
@@ -83,12 +84,16 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   mode `class`, and `ajax.php`, mode `ajax`, with `vendor:name` under `local|bitrix/components`).
   Each entry has the handler (`[Ctrl::class, 'add']` and `'addAction'` both run `addAction`),
   `handler_at`, the method's `attributes` and the class's (`class_attributes`, parents too) as
-  written, and `prefilters` the way `Controller::buildFilters()` builds them:
-  `configureActions()` `prefilters` replace the defaults — `getDefaultPreFilters()` of the first
+  written, and `prefilters` the way `Controller::buildFilters()` builds them: the action's
+  configuration comes from Bitrix filter attributes on the method
+  (`#[Rule\Prefilters([...])]`, `#[Rule\Csrf(type: FilterType::DisablePrefilter)]`, …) or else
+  from `configureActions()`; its `prefilters` replace the defaults — `getDefaultPreFilters()` of the first
   class up the parents that declares it, `parent::getDefaultPreFilters()` and `array_merge`
   followed, the core's own defaults when the chain leaves the index or for a component class —
   a CSRF filter added when POST is allowed without one (`implicit`), then `-prefilters` removed
-  and `+prefilters` appended. Each filter says where it comes from (`from`). Descriptor-based
+  (subclasses of a removed filter too, as `is_a()` does) and `+prefilters` appended. Each filter
+  says where it comes from (`from`). Configuration that `onBuildActions` event handlers add is
+  not seen. Descriptor-based
   component actions are not methods: read them with `new <Descriptor FQN>`.
 - **`new <FQN>`** lists every `new Foo(...)` with its arguments folded to values — strings,
   numbers, arrays, `Bar::class` as an FQN, class constants and enum cases (`{"case": …}`),
@@ -101,7 +106,9 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   concatenation and `$this->value` folded, and the line of the arm. What does not fold
   (`'tag_' . $code`) comes as `expr`.
 - **`usages Class::MEMBER`** finds a constant or an enum case of that class only — a namesake
-  enum in another namespace, imported under an alias, is not mixed in. Uses inside the class
+  enum in another namespace, imported under an alias, is not mixed in. It starts from the class
+  that declares the member and follows the subclasses that inherit it (`Child::LIMIT`,
+  `self::`/`static::` in a subclass, `parent::`), skipping those that redeclare it (`subtypes`). Uses inside the class
   itself are tagged `self`, tests `test` (`--no-tests` drops them); PHPDoc mentions
   (`{@see Class::MEMBER}`) are listed apart. `--no-tests` also works for `usages <FQN>`.
 - **`unused-symbols`** checks PHP classes by FQN, so a dead class with a live namesake is
@@ -122,8 +129,10 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   has no default), removed and changed parameters, and the class header (`extends`,
   `implements`, modifiers). Interfaces and abstract classes list protected methods too;
   narrowing public to protected or private is `removed`. A renamed file whose class changed
-  namespace is `moved` (`moved_from`). Layout, comments, phpDoc and attributes are no change;
-  a default value is; class names compare by FQN, so an import alias is no change.
+  namespace is `moved` (`moved_from`). Constants (public; protected too in interfaces and
+  abstract classes) and enum cases come under `constants`: added, removed, or `changed` value.
+  Layout, comments, phpDoc and attributes are no change; a default value is; class names compare
+  by FQN, so an import alias is no change.
 - **`usages <ShortName>`** notes when several classes share the name; pass the FQN instead.
 
 ## Framework and vendor code

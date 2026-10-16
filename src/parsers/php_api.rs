@@ -28,6 +28,20 @@ pub struct ClassApi {
     /// The same with class names resolved and interfaces in a fixed order.
     pub header_canonical: String,
     pub methods: Vec<MethodApi>,
+    /// Class constants and enum cases.
+    pub constants: Vec<ConstantApi>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstantApi {
+    pub name: String,
+    /// `constant` or `case`.
+    pub kind: &'static str,
+    pub visibility: &'static str,
+    /// The value as written; empty for a pure enum case.
+    pub value: String,
+    pub canonical: String,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +104,9 @@ fn class_api(node: Node, src: &str, names: &Names) -> Option<ClassApi> {
                 .collect()
         })
         .unwrap_or_default();
+    let constants = body
+        .map(|body| constant_apis(body, src, names))
+        .unwrap_or_default();
     Some(ClassApi {
         fqn,
         kind,
@@ -98,7 +115,63 @@ fn class_api(node: Node, src: &str, names: &Names) -> Option<ClassApi> {
         header: header(node, body, src, None),
         header_canonical: header(node, body, src, Some(names)),
         methods,
+        constants,
     })
+}
+
+fn constant_apis(body: Node, src: &str, names: &Names) -> Vec<ConstantApi> {
+    let mut out = Vec::new();
+    for member in php_ast::named_children(body) {
+        match member.kind() {
+            "const_declaration" => {
+                let visibility = {
+                    let mut cursor = member.walk();
+                    let found = member
+                        .children(&mut cursor)
+                        .find(|c| c.kind() == "visibility_modifier")
+                        .map(|c| php_ast::text(c, src).to_ascii_lowercase());
+                    match found.as_deref() {
+                        Some("private") => "private",
+                        Some("protected") => "protected",
+                        _ => "public",
+                    }
+                };
+                for element in php_ast::named_children(member) {
+                    if element.kind() != "const_element" {
+                        continue;
+                    }
+                    let parts = php_ast::named_children(element);
+                    let (Some(name), Some(value)) = (parts.first(), parts.get(1)) else {
+                        continue;
+                    };
+                    out.push(ConstantApi {
+                        name: php_ast::text(*name, src).to_string(),
+                        kind: "constant",
+                        visibility,
+                        value: php_ast::render(*value, src, None),
+                        canonical: php_ast::render(*value, src, Some(names)),
+                        line: php_ast::line(element),
+                    });
+                }
+            }
+            "enum_case" => {
+                let Some(name) = member.child_by_field_name("name") else {
+                    continue;
+                };
+                let value = member.child_by_field_name("value");
+                out.push(ConstantApi {
+                    name: php_ast::text(name, src).to_string(),
+                    kind: "case",
+                    visibility: "public",
+                    value: value.map(|v| php_ast::render(v, src, None)).unwrap_or_default(),
+                    canonical: value.map(|v| php_ast::render(v, src, Some(names))).unwrap_or_default(),
+                    line: php_ast::line(member),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn header(node: Node, body: Option<Node>, src: &str, names: Option<&Names>) -> String {
@@ -307,12 +380,91 @@ pub struct ClassDiff {
     pub header: Option<HeaderChange>,
     pub methods: Vec<MethodChange>,
     pub constructor: Option<ConstructorChange>,
+    pub constants: Vec<ConstantChange>,
 }
 
 impl ClassDiff {
     pub fn is_empty(&self) -> bool {
-        self.header.is_none() && self.methods.is_empty() && self.constructor.is_none()
+        self.header.is_none()
+            && self.methods.is_empty()
+            && self.constructor.is_none()
+            && self.constants.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConstantChange {
+    pub name: String,
+    /// `constant` or `case`.
+    pub kind: &'static str,
+    /// `added`, `removed` or `changed` (another value).
+    pub change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Line in the new version, or in the old one for a removed constant.
+    pub line: usize,
+}
+
+/// Constants and cases that belong to the API: public ones, protected ones too where protected
+/// methods count; enum cases always.
+fn diff_constants(before: Option<&ClassApi>, after: Option<&ClassApi>, protected: bool) -> Vec<ConstantChange> {
+    let listed = |class: Option<&ClassApi>| -> Vec<ConstantApi> {
+        class
+            .map(|c| {
+                c.constants
+                    .iter()
+                    .filter(|k| k.visibility == "public" || (protected && k.visibility == "protected"))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (old, new) = (listed(before), listed(after));
+    let shown = |k: &ConstantApi| {
+        if k.value.is_empty() {
+            k.name.clone()
+        } else {
+            format!("{} = {}", k.name, k.value)
+        }
+    };
+    let mut out = Vec::new();
+    for k in &new {
+        match old.iter().find(|o| o.name == k.name && o.kind == k.kind) {
+            None => out.push(ConstantChange {
+                name: k.name.clone(),
+                kind: k.kind,
+                change: "added",
+                before: None,
+                after: Some(shown(k)),
+                line: k.line,
+            }),
+            Some(o) if o.canonical != k.canonical => out.push(ConstantChange {
+                name: k.name.clone(),
+                kind: k.kind,
+                change: "changed",
+                before: Some(shown(o)),
+                after: Some(shown(k)),
+                line: k.line,
+            }),
+            Some(_) => {}
+        }
+    }
+    for o in &old {
+        if !new.iter().any(|k| k.name == o.name && k.kind == o.kind) {
+            out.push(ConstantChange {
+                name: o.name.clone(),
+                kind: o.kind,
+                change: "removed",
+                before: Some(shown(o)),
+                after: None,
+                line: o.line,
+            });
+        }
+    }
+    out.sort_by_key(|c| c.line);
+    out
 }
 
 const CONSTRUCTOR: &str = "__construct";
@@ -375,6 +527,7 @@ pub fn diff_classes(before: Option<&ClassApi>, after: Option<&ClassApi>) -> Clas
         header,
         methods,
         constructor,
+        constants: diff_constants(before, after, protected),
     }
 }
 
@@ -633,6 +786,20 @@ mod tests {
             "<?php\nclass S { public function GetList() {} }\n",
         );
         assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn constants_and_enum_cases_are_api() {
+        let d = diff(
+            "<?php\nenum S: string {\n    case A = 'a';\n    case B = 'b';\n    public const TTL = 60;\n    private const HIDDEN = 1;\n}\n",
+            "<?php\nenum S: string {\n    case A = 'a';\n    case C = 'c';\n    public const TTL = 60 * 2;\n    private const HIDDEN = 2;\n}\n",
+        );
+        let summary: Vec<(&str, &str, &str)> = d.constants.iter().map(|c| (c.name.as_str(), c.kind, c.change)).collect();
+        assert_eq!(
+            summary,
+            vec![("C", "case", "added"), ("B", "case", "removed"), ("TTL", "constant", "changed")]
+        );
+        assert_eq!(d.constants[2].after.as_deref(), Some("TTL = 60 * 2"));
     }
 
     #[test]

@@ -220,8 +220,12 @@ impl<'a> Evaluator<'a> {
         {
             return self.expr(node); // "a{$b}": interpolation
         }
+        // A string the parser recovered without its closing quote is no value.
         let (quote, inner) = match raw.chars().next() {
-            Some(q @ ('\'' | '"')) if raw.len() >= 2 => (q, &raw[1..raw.len() - 1]),
+            Some(q @ ('\'' | '"')) => match raw[1..].strip_suffix(q) {
+                Some(inner) => (q, inner),
+                None => return self.expr(node),
+            },
             _ => return self.expr(node),
         };
         Val::Str(if quote == '\'' {
@@ -401,13 +405,30 @@ impl<'a> Evaluator<'a> {
     }
 
     /// The value of `$var` from its one assignment before `at` in the same function (or the
-    /// file's top-level code), when nothing else binds it there.
+    /// file's top-level code), when nothing changes it on the way: no `.=`/`+=`, `++`, list
+    /// destructuring, reference, `unset`, loop binding, and no call taking it as an argument
+    /// (it may take it by reference) between the assignment and `at`.
     fn assigned_value(&self, var: &str, at: Node) -> Option<Val> {
         if self.depth >= MAX_DEPTH {
             return None;
         }
+        let is_var = |n: Node| n.kind() == "variable_name" && self.text(n).trim_start_matches('$') == var;
+        let mentions_var = |n: Node| {
+            let mut inner = vec![n];
+            while let Some(x) = inner.pop() {
+                if is_var(x) {
+                    return true;
+                }
+                if !is_function_like(x.kind()) {
+                    inner.extend(php_ast::named_children(x));
+                }
+            }
+            false
+        };
         let scope = enclosing_scope(at);
-        let mut found: Vec<Node> = Vec::new();
+        let mut assignments: Vec<Node> = Vec::new();
+        // Start bytes of places that change the variable or may change it.
+        let mut changes: Vec<usize> = Vec::new();
         let mut stack = vec![scope];
         while let Some(node) = stack.pop() {
             if node.start_byte() >= at.start_byte() {
@@ -418,36 +439,45 @@ impl<'a> Evaluator<'a> {
             }
             match node.kind() {
                 "assignment_expression" => {
-                    let left = node.child_by_field_name("left");
-                    if left.is_some_and(|l| {
-                        l.kind() == "variable_name" && self.text(l).trim_start_matches('$') == var
-                    }) {
-                        if node.end_byte() > at.start_byte() {
-                            return None; // `$x = f($x)`: the value is being computed
+                    match node.child_by_field_name("left") {
+                        Some(l) if is_var(l) => {
+                            if node.end_byte() > at.start_byte() {
+                                return None; // `$x = f($x)`: the value is being computed
+                            }
+                            assignments.push(node);
                         }
-                        found.push(node);
+                        // `[$x, $y] = …`, `list($x) = …`
+                        Some(l) if mentions_var(l) => changes.push(node.start_byte()),
+                        _ => {}
+                    }
+                }
+                "augmented_assignment_expression" | "reference_assignment_expression" => {
+                    if mentions_var(node) {
+                        changes.push(node.start_byte());
+                    }
+                }
+                "update_expression" | "unset_statement" => {
+                    if mentions_var(node) {
+                        changes.push(node.start_byte());
                     }
                 }
                 "foreach_statement" | "global_declaration" | "function_static_declaration" => {
-                    let binds = php_ast::named_children(node).into_iter().skip(1).any(|n| {
-                        let mut inner = vec![n];
-                        while let Some(x) = inner.pop() {
-                            if x.kind() == "variable_name"
-                                && self.text(x).trim_start_matches('$') == var
-                            {
-                                return true;
-                            }
-                            if !matches!(x.kind(), "compound_statement") {
-                                inner.extend(php_ast::named_children(x));
-                            }
-                        }
-                        false
-                    });
-                    if binds && node.kind() != "foreach_statement" {
+                    let binds = php_ast::named_children(node)
+                        .into_iter()
+                        .skip(1)
+                        .filter(|n| n.kind() != "compound_statement")
+                        .any(mentions_var);
+                    if binds {
                         return None;
                     }
-                    if binds && !(node.start_byte() <= at.start_byte() && at.end_byte() <= node.end_byte()) {
-                        return None;
+                }
+                "argument" => {
+                    // Passed to a call that is not the use itself.
+                    let passed = php_ast::named_children(node).into_iter().any(is_var);
+                    let call = node.parent().and_then(|args| args.parent());
+                    let around_use = call.is_some_and(|c| c.start_byte() <= at.start_byte() && at.end_byte() <= c.end_byte());
+                    if passed && !around_use {
+                        changes.push(node.start_byte());
                     }
                 }
                 _ => {}
@@ -457,9 +487,12 @@ impl<'a> Evaluator<'a> {
             stack.extend(children.into_iter().rev());
         }
         // Assigned more than once: which one applies depends on the path taken.
-        let [only] = found.as_slice() else {
+        let [only] = assignments.as_slice() else {
             return None;
         };
+        if changes.iter().any(|c| *c >= only.end_byte()) {
+            return None;
+        }
         let right = only.child_by_field_name("right")?;
         let nested = Evaluator {
             src: self.src,
@@ -620,6 +653,45 @@ mod tests {
         );
         assert!(!eval_return("<?php\n$a = 'x';\n$a = 'y';\nreturn $a;\n").is_known());
         assert!(!eval_return("<?php return \"a{$b}\";").is_known());
+    }
+
+    #[test]
+    fn a_variable_changed_after_its_assignment_does_not_fold() {
+        for changed in [
+            "$p = 'Order';\n$p .= 'Extra';\nreturn $p;",
+            "$p = 1;\n$p++;\nreturn $p;",
+            "$p = 'a';\n[$p, $q] = f();\nreturn $p;",
+            "$p = 'a';\n$r = &$p;\nreturn $p;",
+            "$p = 'a';\nunset($p);\nreturn $p;",
+            "$p = 'a';\n$this->mutate($p);\nreturn $p;",
+            "foreach ([1, 2] as $p) {}\nreturn $p;",
+        ] {
+            let value = eval_return(&format!("<?php\n{changed}\n"));
+            assert!(!value.is_known(), "{changed} folded to {value:?}");
+        }
+        let Val::New { args, .. } = eval_return("<?php\n$p = ['a'];\nreturn new Dto($p);\n") else {
+            panic!("not new");
+        };
+        assert_eq!(
+            args,
+            vec![Val::List(vec![Val::Str("a".into())])],
+            "the call holding the use is the use, not a change"
+        );
+        assert_eq!(eval_return("<?php\n$p = 'a';\nreturn [$p];\n"), Val::List(vec![Val::Str("a".into())]));
+    }
+
+    #[test]
+    fn a_string_without_its_closing_quote_is_no_value() {
+        let src = "<?php return 'привет";
+        let tree = php_ast::parse(src).unwrap();
+        let names = Names::of(tree.root_node(), src);
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "string" {
+                assert!(!Evaluator::new(src, &names, &NoConstants).eval(n).is_known());
+            }
+            stack.extend(php_ast::named_children(n));
+        }
     }
 
     #[test]

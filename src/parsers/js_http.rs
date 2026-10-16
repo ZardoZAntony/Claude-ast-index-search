@@ -67,6 +67,20 @@ pub struct Wrapper {
     pub returns_body: bool,
     /// Not a function but an `axios.create()` instance: its methods are axios methods.
     pub instance: bool,
+    /// A wrapper around `BX.ajax.runComponentAction` / `runAction`: that client, with the
+    /// component fixed or taken from a parameter, the action from a parameter.
+    pub action: Option<ActionWrapper>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionWrapper {
+    /// `bx.runComponentAction` or `bx.runAction`.
+    pub client: &'static str,
+    pub component: Option<String>,
+    pub component_param: Option<usize>,
+    pub action_param: Option<usize>,
+    pub mode: Option<String>,
+    pub method: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,7 +532,12 @@ impl<'a> Ctx<'a> {
                     .and_then(|a| named(a).into_iter().next());
                 match (callee.as_str(), first) {
                     ("JSON.stringify" | "URLSearchParams", Some(arg)) => self.keys(arg),
-                    _ => Vec::new(),
+                    // `buildParams(root)`: a function of this script returning an object literal.
+                    _ => self
+                        .function_named(&callee)
+                        .and_then(|f| self.returned_object(f))
+                        .map(|o| self.keys(o))
+                        .unwrap_or_default(),
                 }
             }
             "identifier" => {
@@ -692,6 +711,22 @@ impl<'a> Ctx<'a> {
             }
             _ => {
                 let wrapper = self.wrapper_for(function, member.as_ref())?;
+                if let Some(action) = &wrapper.action {
+                    out.client = action.client;
+                    out.via = Some(callee.clone());
+                    out.component = action
+                        .component
+                        .clone()
+                        .or_else(|| action.component_param.and_then(|i| args.get(i)).and_then(|a| self.string_of(*a)));
+                    out.action = action.action_param.and_then(|i| args.get(i)).and_then(|a| self.string_of(*a));
+                    out.mode = action.mode.clone().or_else(|| (action.client == "bx.runComponentAction").then(|| "ajax".to_string()));
+                    out.method = Some(action.method.clone().unwrap_or_else(|| "POST".into()));
+                    if let Some(data) = wrapper.data_param.and_then(|i| args.get(i)) {
+                        out.params = self.keys(*data);
+                    }
+                    self.reads(call, &mut out, if wrapper.returns_body { "" } else { "data" });
+                    return Some(out);
+                }
                 if wrapper.instance {
                     let (object, method) = member?;
                     if !AXIOS_METHODS.contains(&method.as_str()) {
@@ -1113,6 +1148,20 @@ impl<'a> Ctx<'a> {
         None
     }
 
+    /// The object literal a function returns: `() => ({ a })` or `return { a }`.
+    fn returned_object(&self, function: Node<'a>) -> Option<Node<'a>> {
+        let body = function.child_by_field_name("body")?;
+        let expr = if body.kind() == "statement_block" {
+            named(body)
+                .into_iter()
+                .find(|s| s.kind() == "return_statement")
+                .and_then(|r| named(r).into_iter().next())?
+        } else {
+            body
+        };
+        self.object_literal(expr)
+    }
+
     /// The member path of `param` a function returns: `return p?.data?.data ?? p?.data` → `data.data`.
     fn returned_path(&self, function: Node<'a>, param: &str) -> Option<String> {
         let body = function.child_by_field_name("body")?;
@@ -1295,6 +1344,7 @@ impl<'a> Ctx<'a> {
                 method: None,
                 returns_body: false,
                 instance: true,
+                action: None,
             })
             .collect();
         let mut stack = vec![self.root];
@@ -1332,6 +1382,9 @@ impl<'a> Ctx<'a> {
             return None;
         }
         let body = function.child_by_field_name("body")?;
+        if let Some(w) = self.action_wrapper(name, body, &params) {
+            return Some(w);
+        }
         let mut stack = vec![body];
         while let Some(node) = stack.pop() {
             if node.kind() == "call_expression" {
@@ -1368,10 +1421,70 @@ impl<'a> Ctx<'a> {
                                 method: inner,
                                 returns_body: returns_data(body, self.src),
                                 instance: false,
+                                action: None,
                             });
                         }
                     }
                 }
+            }
+            push_children(&mut stack, node);
+        }
+        None
+    }
+
+    /// A function passing a parameter as the action (or component) of `BX.ajax.runComponentAction`
+    /// or `BX.ajax.runAction`.
+    fn action_wrapper(&self, name: &str, body: Node<'a>, params: &[String]) -> Option<Wrapper> {
+        let param_of = |n: Node| -> Option<usize> {
+            matches!(n.kind(), "identifier" | "shorthand_property_identifier")
+                .then(|| params.iter().position(|p| p == self.text(n)))
+                .flatten()
+        };
+        let mut stack = vec![body];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" {
+                let callee = node
+                    .child_by_field_name("function")
+                    .map(|f| self.text(f).replace(char::is_whitespace, ""))
+                    .unwrap_or_default();
+                let args = Self::args(node);
+                let (client, component_arg, action_arg, config) = match callee.as_str() {
+                    "BX.ajax.runComponentAction" => {
+                        ("bx.runComponentAction", args.first().copied(), args.get(1).copied(), args.get(2).copied())
+                    }
+                    "BX.ajax.runAction" => ("bx.runAction", None, args.first().copied(), args.get(1).copied()),
+                    _ => {
+                        push_children(&mut stack, node);
+                        continue;
+                    }
+                };
+                let component_param = component_arg.and_then(param_of);
+                let action_param = action_arg.and_then(param_of);
+                if component_param.is_none() && action_param.is_none() {
+                    return None;
+                }
+                let data_param = config.and_then(|c| self.property(c, "data")).and_then(param_of);
+                let config_string = |key: &str| config.and_then(|c| self.property(c, key)).and_then(|v| self.string_of(v));
+                return Some(Wrapper {
+                    name: name.to_string(),
+                    url_param: 0,
+                    data_param,
+                    method: config_string("method").map(|m| m.to_ascii_uppercase()),
+                    returns_body: returns_data(body, self.src),
+                    instance: false,
+                    action: Some(ActionWrapper {
+                        client,
+                        component: if component_param.is_none() {
+                            component_arg.and_then(|c| self.string_of(c))
+                        } else {
+                            None
+                        },
+                        component_param,
+                        action_param,
+                        mode: config_string("mode"),
+                        method: config_string("method").map(|m| m.to_ascii_uppercase()),
+                    }),
+                });
             }
             push_children(&mut stack, node);
         }
@@ -1427,6 +1540,7 @@ impl<'a> Ctx<'a> {
                         method: None,
                         returns_body: false,
                         instance: true,
+                        action: None,
                     });
                 }
                 if value.kind() == "object" {
@@ -1793,6 +1907,39 @@ async function add() {
         assert_eq!(facts.global_writes.len(), 1);
         assert_eq!(facts.global_writes[0].name, "config");
         assert_eq!(facts.global_writes[0].keys, Some(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn component_action_wrapper_with_component_in_a_constant() {
+        let script = r#"
+(function () {
+    const COMPONENT_NAME = 'orteka:small.basket';
+    const buildParams = (root) => ({
+        siteId: root.getAttribute('data-site-id') || 's1',
+        showDelay: 'Y',
+    });
+    const runAction = (action, data) => BX.ajax.runComponentAction(COMPONENT_NAME, action, {
+        mode: 'class',
+        data: data,
+    });
+    const load = async (root) => {
+        const response = await runAction('load', buildParams(root));
+        const payload = response?.data?.data || {};
+        setContent(root, payload.html);
+    };
+})();
+"#;
+        let found = calls(script);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let call = &found[0];
+        assert_eq!(call.client, "bx.runComponentAction");
+        assert_eq!(call.via.as_deref(), Some("runAction"));
+        assert_eq!(call.component.as_deref(), Some("orteka:small.basket"));
+        assert_eq!(call.action.as_deref(), Some("load"));
+        assert_eq!(call.mode.as_deref(), Some("class"));
+        assert_eq!(call.method.as_deref(), Some("POST"));
+        assert_eq!(call.params, vec!["siteId", "showDelay"]);
+        assert_eq!(call.line, 13);
     }
 
     #[test]

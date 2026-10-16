@@ -10,9 +10,10 @@ use colored::Colorize;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::php::{normalize_fqn, not_defined, open, print_json, type_fqns, with_subtypes};
+use super::php::{normalize_fqn, open, print_json, resolve_one_class, with_subtypes};
 use super::php_classes::IndexClasses;
 use crate::parsers::php_calls::{self, CallSite, Classes};
+use crate::parsers::php_model::ClassModel;
 
 #[derive(Serialize)]
 struct Constant {
@@ -132,13 +133,14 @@ impl Walk<'_> {
         out
     }
 
-    fn expand(&mut self, class: &str, method: &str, depth: usize) -> Result<Vec<CallNode>> {
-        self.expanded
-            .insert(format!("{}::{}", class.to_ascii_lowercase(), method.to_ascii_lowercase()));
+    /// Calls of `method` declared in `class`, read with `$this` standing for `this_class` (the
+    /// class using the trait when `class` is one).
+    fn expand(&mut self, class: &str, this_class: &str, method: &str, depth: usize) -> Result<Vec<CallNode>> {
+        self.expanded.insert(expansion_key(class, this_class, method));
         let Some((path, content)) = self.classes.source(class) else {
             return Ok(Vec::new());
         };
-        let Some(found) = php_calls::method_calls(&content, class, method, self.classes)? else {
+        let Some(found) = php_calls::method_calls(&content, class, method, this_class, self.classes)? else {
             return Ok(Vec::new());
         };
         let mut nodes = Vec::new();
@@ -213,27 +215,22 @@ impl Walk<'_> {
             return Ok(node);
         }
         if !method.is_abstract {
-            let key = format!(
-                "{}::{}",
-                declaring.fqn.to_ascii_lowercase(),
-                method.name.to_ascii_lowercase()
-            );
-            if self.expanded.contains(&key) {
+            let this_class = this_for(&declaring, &owner);
+            if self.expanded.contains(&expansion_key(&declaring.fqn, &this_class, &method.name)) {
                 node.expanded_above = true;
             } else {
-                node.children = Some(self.expand(&declaring.fqn, &method.name, depth - 1)?);
+                node.children = Some(self.expand(&declaring.fqn, &this_class, &method.name, depth - 1)?);
             }
         } else if self.implementations {
             let mut children = Vec::new();
             for implementor in self.implementors_of(&declaring.fqn, &method.name) {
                 let fqn = &implementor.fqn;
-                let key = format!("{}::{}", fqn.to_ascii_lowercase(), method.name.to_ascii_lowercase());
-                let already = self.expanded.contains(&key);
+                let already = self.expanded.contains(&expansion_key(fqn, fqn, &method.name));
                 let stopped = self.stops(fqn, &method.name);
                 let grandchildren = if already || stopped {
                     None
                 } else {
-                    Some(self.expand(fqn, &method.name, depth - 1)?)
+                    Some(self.expand(fqn, fqn, &method.name, depth - 1)?)
                 };
                 children.push(CallNode {
                     call: Some(format!("{fqn}::{}", method.name)),
@@ -262,6 +259,25 @@ impl Walk<'_> {
     }
 }
 
+/// The class `$this` stands for in a method of `declaring` reached through `owner`: the owner
+/// for a trait method, the declaring class otherwise.
+fn this_for(declaring: &ClassModel, owner: &str) -> String {
+    if declaring.kind == "trait" {
+        owner.to_string()
+    } else {
+        declaring.fqn.clone()
+    }
+}
+
+fn expansion_key(class: &str, this_class: &str, method: &str) -> String {
+    format!(
+        "{}::{}@{}",
+        class.to_ascii_lowercase(),
+        method.to_ascii_lowercase(),
+        this_class.to_ascii_lowercase()
+    )
+}
+
 pub fn cmd_callees(
     root: &Path,
     spec: &str,
@@ -279,16 +295,7 @@ pub fn cmd_callees(
     if type_part.is_empty() || method.is_empty() {
         bail!("expected Type::method");
     }
-    let types = type_fqns(&conn, &type_part)?;
-    let owner = match types.as_slice() {
-        [] => bail!("{}", not_defined(&conn, "type ", &type_part)),
-        [only] => only.clone(),
-        many => bail!(
-            "{} classes are named {type_part}; pass one FQN: {}",
-            many.len(),
-            many.join(", ")
-        ),
-    };
+    let owner = resolve_one_class(&conn, &type_part)?;
     let classes = IndexClasses::new(&conn, root);
     let Some((declaring, declared)) = php_calls::find_method(&classes, &owner, &method) else {
         let mut known: Vec<String> = classes
@@ -316,7 +323,7 @@ pub fn cmd_callees(
     let calls = if declared.is_abstract {
         Vec::new()
     } else {
-        walk.expand(&declaring.fqn, &declared.name, depth.max(1))?
+        walk.expand(&declaring.fqn, &this_for(&declaring, &owner), &declared.name, depth.max(1))?
     };
     let implementations_list = if declared.is_abstract {
         walk.implementors_of(&declaring.fqn, &declared.name)
