@@ -13,6 +13,7 @@
 pub mod analysis;
 pub mod android;
 pub mod changed;
+pub mod changed_symbols;
 pub mod explore;
 pub mod files;
 pub mod git_signals;

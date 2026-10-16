@@ -636,11 +636,23 @@ enum Commands {
         #[arg(short, long, default_value = "100")]
         limit: usize,
     },
-    /// Show changed files in the current branch (git/arc)
+    /// Show changed files in the current branch (git/arc); with --symbols, how the API of the
+    /// PHP classes it touches changed
     Changed {
         /// Base branch (default: trunk for arc; auto-detected for git)
         #[arg(long)]
         base: Option<String>,
+        /// Revision to compare with the base instead of HEAD (git)
+        #[arg(long)]
+        head: Option<String>,
+        /// PHP classes the branch changed, from both versions in git: public methods added,
+        /// removed or changed (signature before and after, `body` when only the body changed),
+        /// the constructor with added, removed and changed parameters, the class header.
+        /// Interfaces and abstract classes list protected methods too; narrowing public to
+        /// protected or private is `removed`. Layout, comments, phpDoc and attributes are no
+        /// change; class names compare by FQN
+        #[arg(long)]
+        symbols: bool,
         /// VCS subprocess wall-clock timeout in milliseconds
         #[arg(long, default_value = "30000")]
         timeout_ms: u64,
@@ -1586,9 +1598,19 @@ fn main() -> Result<()> {
         }
         Commands::Changed {
             base,
+            head,
+            symbols,
             timeout_ms,
             verbose,
-        } => commands::changed::cmd_changed(&root, base.as_deref(), timeout_ms, verbose, format),
+        } => commands::changed::cmd_changed(
+            &root,
+            base.as_deref(),
+            head.as_deref(),
+            symbols,
+            timeout_ms,
+            verbose,
+            format,
+        ),
         Commands::Hotspots {
             collect,
             full,

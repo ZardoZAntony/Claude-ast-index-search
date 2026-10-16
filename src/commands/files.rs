@@ -546,7 +546,7 @@ fn is_swift_public_declaration(signature: &str) -> bool {
 /// Compatibility entry point for the legacy changed command API.
 #[deprecated(note = "use commands::changed::cmd_changed for structured changed-file output")]
 pub fn cmd_changed(root: &Path, base: &str) -> Result<()> {
-    super::changed::cmd_changed(root, Some(base), 30_000, false, "text")
+    super::changed::cmd_changed(root, Some(base), None, false, 30_000, false, "text")
 }
 
 /// Compatibility entry point for callers that detect the repository VCS.

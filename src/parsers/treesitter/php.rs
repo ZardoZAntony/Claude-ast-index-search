@@ -9,7 +9,7 @@ use super::{node_line, node_text, parse_tree, signature_line, text_end_line, Lan
 use crate::db::SymbolKind;
 use crate::parsers::{extract_references_for_lang, phpdoc, FileType, ParsedRef, ParsedSymbol};
 
-static PHP_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_php::LANGUAGE_PHP.into());
+pub(crate) static PHP_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_php::LANGUAGE_PHP.into());
 
 static PHP_QUERY: LazyLock<Query> = LazyLock::new(|| {
     Query::new(&PHP_LANGUAGE, include_str!("queries/php.scm"))

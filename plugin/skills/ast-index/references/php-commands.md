@@ -25,6 +25,7 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
 | Callers of a method through a type and its subtypes | `ast-index callers 'CacheInvalidatorInterface::invalidate'` |
 | Dead classes in a directory | `ast-index unused-symbols --module src/Order/ --export-only` |
 | Copy-pasted classes | `ast-index duplicates --path src/` |
+| How a branch changed the API of PHP classes | `ast-index changed --symbols --base origin/master [--head <ref>]` |
 
 - **`impact`** lists the definition and every reference with its kind (`import`,
   `trait-use`, `type`, `new`, `static`, `::class`, `phpdoc`, `attribute`, `string`, `check`,
@@ -62,6 +63,15 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   Pairs where a path contains one of `duplicate_mirrors` from the config are deliberate copies,
   tagged `[mirror]` and listed last; copies that declare the same FQN are tagged `[same FQN]` —
   their references cannot be told apart.
+- **`changed --symbols`** reads both versions of every PHP file the branch touched from git
+  (merge base and `--head`, HEAD by default — no checkout, no index) and compares them by
+  syntax tree: per class, public methods added, removed or changed (signature before and
+  after; `body` when only the body changed), the constructor with added (`required` when it
+  has no default), removed and changed parameters, and the class header (`extends`,
+  `implements`, modifiers). Interfaces and abstract classes list protected methods too;
+  narrowing public to protected or private is `removed`. A renamed file whose class changed
+  namespace is `moved` (`moved_from`). Layout, comments, phpDoc and attributes are no change;
+  a default value is; class names compare by FQN, so an import alias is no change.
 - **`usages <ShortName>`** notes when several classes share the name; pass the FQN instead.
 
 ## Framework and vendor code

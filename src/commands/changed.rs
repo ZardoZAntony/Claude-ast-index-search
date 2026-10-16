@@ -115,6 +115,8 @@ impl Deadline {
 pub fn cmd_changed(
     invocation_cwd: &Path,
     base: Option<&str>,
+    head: Option<&str>,
+    symbols: bool,
     timeout_ms: u64,
     verbose: bool,
     format: &str,
@@ -143,7 +145,17 @@ pub fn cmd_changed(
         deadline,
         verbose,
     )?;
-    let args = diff_args(vcs_root.vcs, &base, scope.as_deref());
+    if vcs_root.vcs == Vcs::Arc && (head.is_some() || symbols) {
+        bail!("--head and --symbols need a git repository");
+    }
+    let head = match head {
+        Some(head) => {
+            validate_ref(head, "--head")?;
+            head.to_string()
+        }
+        None => "HEAD".to_string(),
+    };
+    let args = diff_args(vcs_root.vcs, &base, &head, scope.as_deref());
     let command_dir = if vcs_root.vcs == Vcs::Arc && scope.is_some() {
         invocation_cwd
     } else {
@@ -187,11 +199,43 @@ pub fn cmd_changed(
         Vcs::Git => parse_git_name_status(&output.stdout.bytes)?,
     };
     let changes = filter_scope(changes, scope.as_deref());
+    if symbols {
+        let merge_base = git_merge_base(&executable, &vcs_root.path, &base, &head, deadline, verbose)?;
+        let (classes, parse_errors) = super::changed_symbols::symbol_changes(
+            &vcs_root.path,
+            &executable,
+            &merge_base,
+            &head,
+            &changes,
+        )?;
+        let result = super::changed_symbols::SymbolsResult {
+            schema_version: 1,
+            base,
+            merge_base,
+            head,
+            scope,
+            classes,
+            parse_errors,
+        };
+        let rendered = super::changed_symbols::render_symbols(&result, format)?;
+        std::io::stdout()
+            .lock()
+            .write_all(rendered.as_bytes())
+            .context("failed to write changed-symbols output")?;
+        if verbose {
+            eprintln!(
+                "changed: {} class(es) in {}ms",
+                result.classes.len(),
+                started.elapsed().as_millis()
+            );
+        }
+        return Ok(());
+    }
     let result = ChangedResult {
         schema_version: 1,
         vcs: vcs_root.vcs,
         base,
-        head: "HEAD".to_string(),
+        head,
         scope,
         changes,
     };
@@ -293,16 +337,44 @@ fn is_git_root(path: &Path) -> bool {
 }
 
 fn validate_base(base: &str) -> Result<()> {
-    if base.is_empty() || base.trim().is_empty() {
-        bail!("--base must not be empty");
+    validate_ref(base, "--base")
+}
+
+fn validate_ref(value: &str, flag: &str) -> Result<()> {
+    if value.is_empty() || value.trim().is_empty() {
+        bail!("{flag} must not be empty");
     }
-    if base.starts_with('-') {
-        bail!("--base must not start with '-'");
+    if value.starts_with('-') {
+        bail!("{flag} must not start with '-'");
     }
-    if base.chars().any(char::is_control) {
-        bail!("--base must not contain control characters");
+    if value.chars().any(char::is_control) {
+        bail!("{flag} must not contain control characters");
     }
     Ok(())
+}
+
+fn git_merge_base(
+    executable: &OsStr,
+    repo: &Path,
+    base: &str,
+    head: &str,
+    deadline: Deadline,
+    verbose: bool,
+) -> Result<String> {
+    let output = run_bounded(executable, &os_args(&["merge-base", base, head]), repo, deadline, verbose)
+        .context("git merge-base failed")?;
+    if !output.status.success() {
+        bail!(
+            "git merge-base {base} {head} exited with {}: {}",
+            output.status,
+            render_stderr(&output.stderr)
+        );
+    }
+    let sha = String::from_utf8_lossy(&output.stdout.bytes).trim().to_string();
+    if sha.is_empty() {
+        bail!("git merge-base {base} {head} printed nothing");
+    }
+    Ok(sha)
 }
 
 fn invocation_scope(invocation_cwd: &Path, vcs_root: &Path) -> Result<Option<String>> {
@@ -406,7 +478,7 @@ pub(crate) fn os_args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
-fn diff_args(vcs: Vcs, base: &str, scope: Option<&str>) -> Vec<OsString> {
+fn diff_args(vcs: Vcs, base: &str, head: &str, scope: Option<&str>) -> Vec<OsString> {
     match vcs {
         Vcs::Git => {
             let mut args = os_args(&[
@@ -418,7 +490,7 @@ fn diff_args(vcs: Vcs, base: &str, scope: Option<&str>) -> Vec<OsString> {
                 "--no-ext-diff",
                 "--no-textconv",
                 base,
-                "HEAD",
+                head,
             ]);
             if let Some(scope) = scope {
                 args.push(OsString::from("--"));
@@ -1090,7 +1162,7 @@ mod tests {
     #[test]
     fn git_argv_uses_one_merge_base_diff() {
         assert_eq!(
-            diff_args(Vcs::Git, "origin/main", Some("nested")),
+            diff_args(Vcs::Git, "origin/main", "HEAD", Some("nested")),
             [
                 "diff",
                 "--merge-base",
@@ -1113,14 +1185,14 @@ mod tests {
     #[test]
     fn arc_argv_uses_native_branch_diff() {
         assert_eq!(
-            diff_args(Vcs::Arc, "trunk", None),
+            diff_args(Vcs::Arc, "trunk", "HEAD", None),
             ["diff", "-B", "--name-status", "--no-color"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            diff_args(Vcs::Arc, "feature-base", Some("nested")),
+            diff_args(Vcs::Arc, "feature-base", "HEAD", Some("nested")),
             [
                 "diff",
                 "-B",

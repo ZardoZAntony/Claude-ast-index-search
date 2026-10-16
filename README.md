@@ -33,6 +33,7 @@ them. On top of that, new commands answer typical refactoring questions in one c
 | PHPDoc is not indexed | PHPDoc tag types are references, just like code |
 | Words in SQL strings, heredocs, comments and inline HTML, enum cases, named arguments and constants pass for classes | A per-file lexer resolves names in code only; keywords are case-insensitive; each reference keeps its kind (`import`, `trait-use`, `new`, `type`, …) |
 | Kotlin/Java naming rules: `Exception`, `Result`, `get()` dropped as noise; `EO_*`/lower-case classes, snake_case and same-class calls, callables `[Foo::class, 'handle']` unseen | PHP reserved words are the only noise; these names are references |
+| What a branch changed in class APIs takes reading every diff | `changed --symbols --base <ref> [--head <ref>]`: methods and constructor parameters added, removed, changed, from both versions in git, by syntax tree |
 | Hidden paths are always skipped | `include_hidden` in `.ast-index.yaml` |
 | Same-second edits are lost; non-UTF-8 files and directories like `auth.mts/` are re-parsed on every `update` | Nanosecond mtimes; lossy decoding of non-UTF-8 sources; `update` walks files only |
 
