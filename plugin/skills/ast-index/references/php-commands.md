@@ -24,6 +24,8 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
 | Direct parents and children of one class | `ast-index hierarchy 'App\Base\Version'` |
 | Callers of a method through a type and its subtypes | `ast-index callers 'CacheInvalidatorInterface::invalidate'` |
 | What a method calls, as a tree with receiver types | `ast-index callees 'App\Event\Bridge::onSaved' --depth 3` |
+| Bitrix event subscriptions and their handlers | `ast-index events [--module local/modules/x] [--event OnSale]` |
+| Every `new Foo(...)` with its arguments as values | `ast-index new 'App\Dto\Descriptor'` |
 | Dead classes in a directory | `ast-index unused-symbols --module src/Order/ --export-only` |
 | Copy-pasted classes | `ast-index duplicates --path src/` |
 | How a branch changed the API of PHP classes | `ast-index changed --symbols --base origin/master [--head <ref>]` |
@@ -65,6 +67,18 @@ Method names are matched case-insensitively (`GetList` called as `getList`).
   too. `--depth N` (default 2) sets the levels; `--stop <Class|Class::method|Ns\>` keeps a
   branch closed (repeatable); a method met again is marked `expanded_above`. A receiver whose
   type nothing states is `call: null` with the receiver as written — check those by hand.
+- **`events`** lists Bitrix event subscriptions — `addEventHandler`, `addEventHandlerCompatible`,
+  `registerEventHandler(Compatible)`, legacy `AddEventHandler()` and `RegisterModuleDependences()`,
+  a call over several lines at the line it starts on: module, event names (concatenation, class
+  constants and a `foreach` over a literal array around the call are folded — one entry per
+  handler with all its events), the handler (`[Foo::class, 'm']`, `['Ns\\Foo', 'm']`,
+  `[$this, 'm']`, `'Foo::m'`, a function, a closure) with `handler_at` — the lines of its body,
+  inherited ones too. A callback built at run time is `dynamic`, with its source.
+- **`new <FQN>`** lists every `new Foo(...)` with its arguments folded to values — strings,
+  numbers, arrays, `Bar::class` as an FQN, class constants and enum cases (`{"case": …}`),
+  nested `new` (`{"new": …, "args": […], "named": {…}}`), a variable assigned once before;
+  what does not fold stays `{"expr": "<source>"}`. Registries made of objects — descriptors,
+  manifests, subscription lists — read as data.
 - **`unused-symbols`** checks PHP classes by FQN, so a dead class with a live namesake is
   reported. A reference counts wherever it is: code, PHPDoc, tests, callables
   (`[Foo::class, 'handle']`, `[$this, 'handle']`, `array('Foo', 'handle')`, `'Foo::handle'`). Classes referenced only where a DI config

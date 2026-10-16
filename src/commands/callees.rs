@@ -2,88 +2,17 @@
 //! receiver resolves to and the method it lands in; an abstract or interface method lists its
 //! implementations. The opposite direction of `callers 'Type::method'`.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::rc::Rc;
 
 use anyhow::{bail, Result};
 use colored::Colorize;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::php::{
-    definitions, normalize_fqn, not_defined, open, print_json, read_lossy, type_fqns,
-    with_subtypes,
-};
+use super::php::{normalize_fqn, not_defined, open, print_json, type_fqns, with_subtypes};
+use super::php_classes::IndexClasses;
 use crate::parsers::php_calls::{self, CallSite, Classes};
-use crate::parsers::php_model::{self, ClassModel};
-
-/// Classes of the index, parsed on demand from their files.
-pub(super) struct IndexClasses<'a> {
-    conn: &'a Connection,
-    root: &'a Path,
-    models: RefCell<HashMap<String, Option<Rc<ClassModel>>>>,
-    /// Lowercased FQN → (path for output, file content).
-    sources: RefCell<HashMap<String, (String, Rc<String>)>>,
-    files: RefCell<HashMap<std::path::PathBuf, Rc<String>>>,
-}
-
-impl<'a> IndexClasses<'a> {
-    pub(super) fn new(conn: &'a Connection, root: &'a Path) -> Self {
-        IndexClasses {
-            conn,
-            root,
-            models: RefCell::new(HashMap::new()),
-            sources: RefCell::new(HashMap::new()),
-            files: RefCell::new(HashMap::new()),
-        }
-    }
-
-    /// Path (for output) and content of the file declaring `fqn`.
-    pub(super) fn source(&self, fqn: &str) -> Option<(String, Rc<String>)> {
-        self.class(fqn)?;
-        self.sources.borrow().get(&fqn.to_ascii_lowercase()).cloned()
-    }
-
-    fn read(&self, abs: &Path) -> Option<Rc<String>> {
-        if let Some(content) = self.files.borrow().get(abs) {
-            return Some(content.clone());
-        }
-        let content = Rc::new(read_lossy(abs)?);
-        self.files
-            .borrow_mut()
-            .insert(abs.to_path_buf(), content.clone());
-        Some(content)
-    }
-}
-
-impl Classes for IndexClasses<'_> {
-    fn class(&self, fqn: &str) -> Option<Rc<ClassModel>> {
-        let key = fqn.to_ascii_lowercase();
-        if let Some(found) = self.models.borrow().get(&key) {
-            return found.clone();
-        }
-        let mut found = None;
-        for def in definitions(self.conn, self.root, fqn).unwrap_or_default() {
-            let Some(content) = self.read(&def.abs) else {
-                continue;
-            };
-            let Ok(models) = php_model::class_models(&content) else {
-                continue;
-            };
-            if let Some(model) = models.into_iter().find(|m| m.fqn.eq_ignore_ascii_case(fqn)) {
-                self.sources
-                    .borrow_mut()
-                    .insert(key.clone(), (def.path.clone(), content));
-                found = Some(Rc::new(model));
-                break;
-            }
-        }
-        self.models.borrow_mut().insert(key, found.clone());
-        found
-    }
-}
 
 #[derive(Serialize)]
 struct Constant {

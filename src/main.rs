@@ -102,6 +102,8 @@ PHP:
   move-plan              Edits to move a PHP class or a JS/TS/Vue file
   duplicates             Same-named PHP classes whose bodies are near copies
   callees                What a PHP method calls, as a tree with receiver types
+  events                 Bitrix event subscriptions with their handlers
+  new                    Every `new Class(...)` with its arguments as values
 
 Programmatic Access:
   agrep                  Structural code search via ast-grep
@@ -183,6 +185,34 @@ enum Commands {
         /// backslash; repeatable
         #[arg(long)]
         stop: Vec<String>,
+    },
+    /// Bitrix event subscriptions: module, event names (loops over literal arrays unrolled),
+    /// handler with the lines of its body
+    Events {
+        /// Only subscriptions written under this path (`local/modules/orteka.basket`)
+        #[arg(long)]
+        module: Option<String>,
+        /// Only subscriptions to events whose name contains this (case-insensitive)
+        #[arg(long)]
+        event: Option<String>,
+        /// Leave out subscriptions written in tests
+        #[arg(long)]
+        no_tests: bool,
+    },
+    /// Every `new Class(...)` of a PHP class, with its arguments folded to values: strings,
+    /// numbers, arrays, `Foo::class`, constants, nested `new`, a variable assigned once
+    New {
+        /// Class FQN, or a short name when one class has it
+        fqn: String,
+        /// Only places under this path
+        #[arg(long)]
+        path: Option<String>,
+        /// Leave out tests
+        #[arg(long)]
+        no_tests: bool,
+        /// Max results
+        #[arg(short, long, default_value = "100")]
+        limit: usize,
     },
     /// Show call hierarchy (callers tree up) for a function
     CallTree {
@@ -1289,6 +1319,17 @@ fn main() -> Result<()> {
             implementations,
             stop,
         } => commands::callees::cmd_callees(&root, &spec, depth, implementations, &stop, format),
+        Commands::Events {
+            module,
+            event,
+            no_tests,
+        } => commands::bitrix::cmd_events(&root, module.as_deref(), event.as_deref(), no_tests, format),
+        Commands::New {
+            fqn,
+            path,
+            no_tests,
+            limit,
+        } => commands::instantiations::cmd_new(&root, &fqn, path.as_deref(), no_tests, limit, format),
         Commands::CallTree {
             function_name,
             depth,

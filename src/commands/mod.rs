@@ -12,6 +12,7 @@
 
 pub mod analysis;
 pub mod android;
+pub mod bitrix;
 pub mod callees;
 pub mod changed;
 pub mod changed_symbols;
@@ -21,12 +22,14 @@ pub mod git_signals;
 pub mod graph;
 pub mod grep;
 pub mod index;
+pub mod instantiations;
 pub mod js;
 pub mod ios;
 pub mod management;
 pub mod modules;
 pub mod perl;
 pub mod php;
+pub mod php_classes;
 pub mod project_info;
 pub mod rank;
 pub mod test_paths;
