@@ -1,6 +1,6 @@
 # HOWTO: кто вызывает эндпоинт бэкенда — `http-calls`
 
-[English version](http-calls.md)
+[English version](http-calls.md) · часть [HOWTO](howto.ru.md)
 
 `ast-index http-calls` выдаёт вызовы бэкенда из фронтенда: модулей JS/TS/Vue и встроенных
 `<script>` PHP-шаблонов. Для каждого вызова — метод, адрес, отправляемые ключи и ключи, которые

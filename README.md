@@ -3,6 +3,8 @@
 A fork of [defendend/Claude-ast-index-search](https://github.com/defendend/Claude-ast-index-search) v3.56.0,
 tuned for a large PHP/Bitrix codebase (~10k files) with a JS/Vue frontend (~1.3k files).
 
+**Task-by-task guide: [HOWTO](docs/howto.md) ([по-русски](docs/howto.ru.md)).**
+
 **Scope of the plugin.** The Claude Code plugin — skill, command references, `/initialize`, hooks — covers PHP,
 JavaScript, TypeScript and Vue only. References and `initialize-*` commands for the other upstream languages
 (Kotlin/Java, Swift/ObjC, Dart, Rust, Ruby, C#, Go, Python, Perl, C++, Proto, WSDL…) were removed from it. The

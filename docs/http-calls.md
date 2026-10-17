@@ -1,6 +1,6 @@
 # HOWTO: find who calls a backend endpoint with `http-calls`
 
-[Русская версия](http-calls.ru.md)
+[Русская версия](http-calls.ru.md) · part of the [HOWTO](howto.md)
 
 `ast-index http-calls` lists the backend calls the frontend makes — JS/TS/Vue modules and the
 inline `<script>` blocks of PHP templates — with the method, the address, the keys sent and the
