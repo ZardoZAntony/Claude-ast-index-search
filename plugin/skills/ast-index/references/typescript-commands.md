@@ -38,17 +38,25 @@ or without extension, or a directory with `index.*`). A module is named by its p
 - Specifiers that did not resolve but end with the module's name are listed under `unresolved:` — check those
   by hand.
 - `http-calls` — backend calls of JS/TS/Vue modules and of inline `<script>` blocks of PHP templates (PHP
-  islands shown as `{php:$expr}`): `fetch`, `axios` and `axios.create()` instances, project wrappers (a function
-  that forwards a parameter as the address, imported too — `request.get(url)`; one that forwards a parameter as
-  the action of `runComponentAction`, the component from a constant — `runAction('load', data)`), jQuery
+  islands shown as `{php:$expr}`): `fetch`, `axios` and `axios.create()` instances (also passed through a function
+  such as an interceptor setup), project wrappers (a function that forwards a parameter as the address, imported
+  too — `request.get(url)`; one that forwards a parameter as the action of `runComponentAction`, the component
+  from a constant — `runAction('load', data)`), client objects a factory returns (`http.get(url)` with
+  `http = createClient()`, a parameter default — destructured too, `injected || createClient()`, an import or a
+  chain of them, the module object of an IIFE;
+  method and argument positions from what each method forwards, `via` — `createClient.get`; a client parameter
+  without a default gives no call), `this.method()` of a forwarding method (component options too), jQuery
   `$.ajax/post/get`,
   `BX.ajax`, `BX.ajax.runComponentAction` (component, action, mode), `BX.ajax.runAction`, and `ajax.php?c=…&action=…`
-  addresses. The address folds literals, template strings, concatenation and constants (imported ones too); the
+  addresses. The address folds literals, template strings, concatenation, constants (imported ones too), keys of
+  object constants (`Object.freeze` too; `map[variable]` gives one call per value), local helpers returning an
+  address, non-empty parameter defaults; the
   rest is `{expression}` — `/api/v1/basket/items/{basketItemId}` matches the route's `{basketItemId}`. `params` —
   keys sent (object literals, `JSON.stringify`, `FormData.append`); `reads` — paths read from the answer
   (`.then`, `await`, destructuring, a variable `.then`-ed later, success callbacks, one level into a local helper
   such as `getPayload(response)`); `response_keys` — the same without the client's envelope (axios `data`, the
-  `data` of a Bitrix action result). Addresses outside recognised calls are under `literals`. `globals` — data a
+  `data` of a Bitrix action result). Addresses outside recognised calls are under `literals` (strings a call's
+  address was folded from are not). HOWTO: `docs/http-calls.md` in the repository (Russian: `docs/http-calls.ru.md`). `globals` — data a
   template hands to scripts through `window.X = …` (object or array, PHP value, `JSON.parse`): writes with keys
   when the array is visible in the template, and reads (`window.X.key`, a destructuring). `dist/` and minified files
   are skipped.

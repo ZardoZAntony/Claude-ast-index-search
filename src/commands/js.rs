@@ -505,6 +505,19 @@ struct Project {
 
 impl Project {
     fn load(conn: &Connection, root: &Path) -> Result<Self> {
+        let project = Self::read(conn, root)?;
+        if project.set.modules.is_empty() {
+            bail!("The index has no JS/TS/Vue files.");
+        }
+        let has_facts: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM js_exports)", [], |r| r.get(0))?;
+        if !has_facts {
+            bail!("The index has no JS/TS module facts yet. Run 'ast-index update' (or 'ast-index rebuild').");
+        }
+        Ok(project)
+    }
+
+    /// The modules and their imports as indexed, none at all included.
+    fn read(conn: &Connection, root: &Path) -> Result<Self> {
         let mut stmt = conn.prepare(&format!(
             "SELECT id, path, root_path FROM files WHERE {} AND external = 0 ORDER BY path",
             db::JS_MODULE_PATH_SQL
@@ -598,13 +611,6 @@ impl Project {
                     .clone()
             })
             .collect();
-        if set.modules.is_empty() {
-            bail!("The index has no JS/TS/Vue files.");
-        }
-        let has_facts: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM js_exports)", [], |r| r.get(0))?;
-        if !has_facts {
-            bail!("The index has no JS/TS module facts yet. Run 'ast-index update' (or 'ast-index rebuild').");
-        }
 
         Ok(Project {
             root: root.to_path_buf(),
@@ -1579,16 +1585,28 @@ mod tests {
     }
 }
 
-/// A JS/TS/Vue module of the index with its imports: (local name, imported name — a name,
-/// `default` or `*` — and the module it resolves to, by index in the returned list).
+/// A JS/TS/Vue module of the index with its imports and re-exports.
 pub(super) struct ModuleImports {
     pub(super) path: String,
     pub(super) abs: PathBuf,
-    pub(super) imports: Vec<(Option<String>, Option<String>, Option<usize>)>,
+    pub(super) imports: Vec<ImportRef>,
 }
 
+/// An import (or a re-export, `export { a as b } from`, `export * from`) of a module.
+pub(super) struct ImportRef {
+    /// Local binding of an import; the exported alias of a re-export.
+    pub(super) local: Option<String>,
+    /// A name, `default` or `*`.
+    pub(super) imported: Option<String>,
+    /// The module it resolves to, by index in the list.
+    pub(super) target: Option<usize>,
+    pub(super) reexport: bool,
+}
+
+/// Scripts without a single `export` (plain scripts, template scripts only) still have calls:
+/// no module facts is no error here.
 pub(super) fn modules_with_imports(conn: &Connection, root: &Path) -> Result<Vec<ModuleImports>> {
-    let project = Project::load(conn, root)?;
+    let project = Project::read(conn, root)?;
     let mut out: Vec<ModuleImports> = project
         .set
         .modules
@@ -1604,9 +1622,12 @@ pub(super) fn modules_with_imports(conn: &Connection, root: &Path) -> Result<Vec
             Some(Target::Module(t)) => Some(*t),
             _ => None,
         };
-        out[import.file]
-            .imports
-            .push((import.local.clone(), import.imported.clone(), target));
+        out[import.file].imports.push(ImportRef {
+            local: import.local.clone(),
+            imported: import.imported.clone(),
+            target,
+            reexport: import.kind == "reexport",
+        });
     }
     Ok(out)
 }

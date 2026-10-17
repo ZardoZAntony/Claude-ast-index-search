@@ -1,12 +1,13 @@
 //! Backend calls a JS/TS/Vue script makes: `fetch`, `axios`, an `axios.create()` instance, a
-//! project wrapper around one of those, jQuery `$.ajax`/`$.post`/`$.get`, `BX.ajax`,
+//! project wrapper around one of those, a client object whose methods forward to one of those
+//! (what a client factory returns), jQuery `$.ajax`/`$.post`/`$.get`, `BX.ajax`,
 //! `BX.ajax.runComponentAction`, `BX.ajax.runAction` — with the method, the address folded from
-//! literals, template strings and constants (the rest as `{…}`), the keys sent, and the keys the
-//! code reads from the answer. Also `window.X = …` writes and `window.X.key` reads, which carry
-//! data from a PHP template to scripts.
+//! literals, template strings, constants, maps and local helpers (the rest as `{…}`), the keys
+//! sent, and the keys the code reads from the answer. Also `window.X = …` writes and
+//! `window.X.key` reads, which carry data from a PHP template to scripts.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Parser, Tree};
 
@@ -52,6 +53,115 @@ pub struct HttpCall {
     /// The same with the client's envelope removed: axios' `data`, the `data` of a Bitrix
     /// action result.
     pub response_keys: Vec<String>,
+    /// The addresses when a part of it is a map indexed by a variable, one per value:
+    /// `analyze` reports a call for each.
+    candidates: Vec<String>,
+}
+
+/// Where a part of a backend call comes from, seen from the function that makes it: fixed
+/// there, or taken from the function's arguments (`config.url` → argument 0, path `url`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Slot {
+    /// Not given: the client's default applies (GET, nothing sent).
+    #[default]
+    Absent,
+    /// Computed in a way not followed.
+    Unknown,
+    Lit(String),
+    Arg(usize, Vec<String>),
+    /// An object literal of such values, with its spreads: `{ ...config, method: 'get', url }`.
+    Object(Vec<(String, Slot)>, Vec<Slot>),
+    /// The first, or the second when the first is not given: `path || '/api/default/'`.
+    Or(Box<Slot>, Box<Slot>),
+}
+
+impl Slot {
+    fn get(&self, key: &str) -> Slot {
+        match self {
+            Slot::Arg(i, path) => {
+                let mut path = path.clone();
+                path.push(key.to_string());
+                Slot::Arg(*i, path)
+            }
+            Slot::Object(fields, spreads) => {
+                if let Some((_, value)) = fields.iter().rev().find(|(k, _)| k == key) {
+                    return value.clone();
+                }
+                for spread in spreads.iter().rev() {
+                    match spread.get(key) {
+                        Slot::Absent => continue,
+                        found => return found,
+                    }
+                }
+                Slot::Absent
+            }
+            Slot::Or(first, second) => Slot::Or(Box::new(first.get(key)), Box::new(second.get(key))),
+            Slot::Absent => Slot::Absent,
+            _ => Slot::Unknown,
+        }
+    }
+
+    /// The same seen from the caller, which passes `args`.
+    fn subst(&self, args: &[Slot]) -> Slot {
+        match self {
+            Slot::Arg(i, path) => path
+                .iter()
+                .fold(args.get(*i).cloned().unwrap_or_default(), |slot, key| slot.get(key)),
+            Slot::Object(fields, spreads) => Slot::Object(
+                fields.iter().map(|(k, v)| (k.clone(), v.subst(args))).collect(),
+                spreads.iter().map(|s| s.subst(args)).collect(),
+            ),
+            Slot::Or(first, second) => Slot::Or(Box::new(first.subst(args)), Box::new(second.subst(args))),
+            other => other.clone(),
+        }
+    }
+
+    fn depends_on_args(&self) -> bool {
+        match self {
+            Slot::Arg(..) => true,
+            Slot::Object(fields, spreads) => fields.iter().any(|(_, v)| v.depends_on_args()) || spreads.iter().any(Slot::depends_on_args),
+            Slot::Or(first, second) => first.depends_on_args() || second.depends_on_args(),
+            _ => false,
+        }
+    }
+}
+
+/// How a function's arguments become the backend call it makes: `get(url, config)` that calls
+/// `request({ ...config, method: 'get', url })` fixes the method, takes the address from
+/// argument 0 and the query from `params` of argument 1.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forward {
+    pub method: Slot,
+    pub url: Slot,
+    pub body: Slot,
+    pub query: Slot,
+    /// It resolves to the answer's body (`return response.data`), so its callers read no
+    /// envelope.
+    pub returns_body: bool,
+    /// The address when the caller leaves it out: the parameter's default value.
+    pub url_default: Option<String>,
+}
+
+impl Forward {
+    fn subst(&self, args: &[Slot]) -> Forward {
+        Forward {
+            method: self.method.subst(args),
+            url: self.url.subst(args),
+            body: self.body.subst(args),
+            query: self.query.subst(args),
+            returns_body: self.returns_body,
+            url_default: self.url_default.clone(),
+        }
+    }
+
+    /// The address comes from the arguments: its calls are reported where it is called.
+    fn forwards(&self) -> bool {
+        match &self.url {
+            Slot::Arg(..) => true,
+            Slot::Or(first, _) => matches!(**first, Slot::Arg(..)),
+            _ => false,
+        }
+    }
 }
 
 /// A function that forwards one of its parameters as the address of a backend call.
@@ -59,17 +169,39 @@ pub struct HttpCall {
 pub struct Wrapper {
     /// The export it is reachable by: `get`, or `default.get` for a default-exported object.
     pub name: String,
-    pub url_param: usize,
-    pub data_param: Option<usize>,
-    pub method: Option<String>,
-    /// The wrapper returns the answer's body (`return resp.data`), so its callers read no
-    /// envelope.
-    pub returns_body: bool,
+    /// How its arguments become the call; unused for an instance.
+    pub forward: Forward,
     /// Not a function but an `axios.create()` instance: its methods are axios methods.
     pub instance: bool,
     /// A wrapper around `BX.ajax.runComponentAction` / `runAction`: that client, with the
     /// component fixed or taken from a parameter, the action from a parameter.
     pub action: Option<ActionWrapper>,
+}
+
+/// Methods of a client object by name, with what each forwards.
+pub type Methods = Vec<(String, Forward)>;
+
+/// An object whose methods forward to an HTTP client: what a client factory returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    /// The factory, or the object's name, that calls through it show in `via`.
+    pub origin: String,
+    pub methods: Methods,
+}
+
+impl Client {
+    fn method(&self, name: &str) -> Option<Forward> {
+        self.methods.iter().find(|(m, _)| m == name).map(|(_, f)| f.clone())
+    }
+}
+
+/// A client object, or a factory returning one, that a module exports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedClient {
+    /// The export: a name or `default`.
+    pub name: String,
+    pub factory: bool,
+    pub client: Client,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,8 +241,12 @@ pub struct GlobalRead {
 pub struct ScriptFacts {
     pub calls: Vec<HttpCall>,
     pub wrappers: Vec<Wrapper>,
-    /// Exported string constants: name → value.
+    pub clients: Vec<ExportedClient>,
+    /// Exported string constants: name → value, `NAME.key` for the values of an object.
     pub constants: Vec<(String, String)>,
+    /// Imported constants the addresses of calls were folded from: (local name — `NAME` or
+    /// `NAME.key`, every value of an object). Their strings are no addresses outside calls.
+    pub imported_constants: Vec<(String, bool)>,
     pub literals: Vec<LiteralUrl>,
     pub global_writes: Vec<GlobalWrite>,
     pub global_reads: Vec<GlobalRead>,
@@ -118,11 +254,20 @@ pub struct ScriptFacts {
 
 /// What the script's imports bring, as resolved by the caller.
 pub trait Imports {
-    /// The string value of an imported constant bound to `local`.
+    /// The string value of an imported constant bound to `local`, or of its key
+    /// (`ENDPOINTS.list`).
     fn constant(&self, local: &str) -> Option<String>;
     /// The wrapper (or instance) an imported `local` is, or its `member` for an imported
     /// object (`request.get`).
     fn wrapper(&self, local: &str, member: Option<&str>) -> Option<Wrapper>;
+    /// The string values of an imported object constant.
+    fn constants_of(&self, _local: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// The client object an imported `local` (or its `member`) is, or returns when `called`.
+    fn client(&self, _local: &str, _member: Option<&str>, _called: bool) -> Option<Client> {
+        None
+    }
 }
 
 pub struct NoImports;
@@ -147,6 +292,22 @@ pub fn analyze(
     placeholders: &[String],
     globals: &HashSet<String>,
 ) -> ScriptFacts {
+    run(script, imports, placeholders, globals, true)
+}
+
+/// What a script gives other scripts: exported wrappers, clients and constants, and the
+/// `window.X` globals it writes. Its own calls are not looked for.
+pub fn exports(script: &str, imports: &dyn Imports, placeholders: &[String]) -> ScriptFacts {
+    run(script, imports, placeholders, &HashSet::new(), false)
+}
+
+fn run(
+    script: &str,
+    imports: &dyn Imports,
+    placeholders: &[String],
+    globals: &HashSet<String>,
+    calls: bool,
+) -> ScriptFacts {
     let Some(tree) = parse(script) else {
         return ScriptFacts::default();
     };
@@ -156,40 +317,58 @@ pub fn analyze(
         root,
         imports,
         placeholders,
-        local_wrappers: RefCell::new(Vec::new()),
+        local_wrappers: RefCell::new(HashMap::new()),
         declared_names: RefCell::new(None),
+        instances: RefCell::new(HashSet::new()),
+        forwards: RefCell::new(HashMap::new()),
+        factories: RefCell::new(HashMap::new()),
+        objects: RefCell::new(HashMap::new()),
+        folded: RefCell::new(Vec::new()),
+        folded_imports: RefCell::new(Vec::new()),
+        scopes: RefCell::new(HashMap::new()),
+        receivers: RefCell::new(HashMap::new()),
+        called: RefCell::new(HashSet::new()),
     };
     let mut facts = ScriptFacts::default();
     let instances = ctx.instances();
+    *ctx.instances.borrow_mut() = instances.clone();
     // Local wrappers first: calls through them in the same file are calls too.
     let wrappers = ctx.wrappers(&instances);
-    *ctx.local_wrappers.borrow_mut() = wrappers.clone();
     let mut in_call: HashSet<(usize, usize)> = HashSet::new();
+    // Strings an address of a call was folded from (constants, map values, helpers): no
+    // longer addresses outside calls.
+    let mut used: HashSet<usize> = HashSet::new();
+    let mut strings: Vec<Node> = Vec::new();
+    // Calls inside a forwarding method reported at its `this.method()` calls, if there are any.
+    let mut deferred: Vec<(HttpCall, usize)> = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "call_expression" {
+        if calls && node.kind() == "call_expression" {
+            ctx.folded.borrow_mut().clear();
+            ctx.folded_imports.borrow_mut().clear();
             if let Some(call) = ctx.http_call(node, &instances) {
                 in_call.insert((node.start_byte(), node.end_byte()));
-                // A wrapper's own inner call forwards its parameter: reported at the callers.
+                used.extend(ctx.folded.borrow().iter().copied());
+                for folded in ctx.folded_imports.borrow().iter() {
+                    if !facts.imported_constants.contains(folded) {
+                        facts.imported_constants.push(folded.clone());
+                    }
+                }
+                // An action wrapper's own inner call: reported at its callers. Other forwarding
+                // calls are found by what they forward (`forwarder_of`).
                 let in_wrapper = enclosing_function_name(node, script)
-                    .is_some_and(|f| wrappers.iter().any(|w| !w.instance && w.name.rsplit('.').next() == Some(f.as_str())));
+                    .is_some_and(|f| wrappers.iter().any(|w| w.action.is_some() && w.name == f));
                 if !in_wrapper {
-                    facts.calls.push(call);
+                    match ctx.forwarder_of(node) {
+                        None | Some((Callers::Never, _)) => push_call(&mut facts.calls, call),
+                        Some((Callers::Always, _)) => {}
+                        Some((Callers::IfCalled, function)) => deferred.push((call, function)),
+                    }
                 }
             }
         }
-        if matches!(node.kind(), "string" | "template_string") {
-            let inside_call = in_call
-                .iter()
-                .any(|(s, e)| *s <= node.start_byte() && node.end_byte() <= *e);
-            if !inside_call {
-                if let Some(url) = ctx.literal_url(node) {
-                    facts.literals.push(LiteralUrl {
-                        line: line(node),
-                        url,
-                    });
-                }
-            }
+        if calls && matches!(node.kind(), "string" | "template_string") {
+            strings.push(node);
         }
         if node.kind() == "assignment_expression" {
             if let Some(write) = ctx.global_write(node) {
@@ -208,13 +387,52 @@ pub fn analyze(
         let children: Vec<Node> = node.children(&mut cursor).collect();
         stack.extend(children.into_iter().rev());
     }
+    for (call, function) in deferred {
+        if !ctx.called.borrow().contains(&function) {
+            push_call(&mut facts.calls, call);
+        }
+    }
+    for node in strings {
+        let inside_call = in_call
+            .iter()
+            .any(|(s, e)| *s <= node.start_byte() && node.end_byte() <= *e);
+        if inside_call || used.contains(&node.start_byte()) {
+            continue;
+        }
+        if let Some(url) = ctx.literal_url(node) {
+            facts.literals.push(LiteralUrl {
+                line: line(node),
+                url,
+            });
+        }
+    }
     facts.calls.sort_by_key(|c| c.line);
     facts.literals.sort_by_key(|l| l.line);
     facts.global_reads.dedup();
     facts.wrappers = ctx.exported_wrappers(&wrappers, &instances);
+    facts.clients = ctx.exported_clients();
     facts.constants = ctx.exported_constants();
     facts
 }
+
+/// One call per candidate address.
+fn push_call(calls: &mut Vec<HttpCall>, mut call: HttpCall) {
+    let candidates = std::mem::take(&mut call.candidates);
+    if candidates.is_empty() {
+        calls.push(call);
+        return;
+    }
+    for url in candidates {
+        calls.push(HttpCall {
+            url: Some(url),
+            url_expr: None,
+            ..call.clone()
+        });
+    }
+}
+
+/// Addresses one call expands to at most; past that the map stays a `{…}` hole.
+const MAX_CANDIDATES: usize = 64;
 
 fn line(node: Node) -> usize {
     node.start_position().row + 1
@@ -232,14 +450,59 @@ struct Ctx<'a> {
     root: Node<'a>,
     imports: &'a dyn Imports,
     placeholders: &'a [String],
-    local_wrappers: RefCell<Vec<Wrapper>>,
+    /// Wrapper functions of the script by start byte.
+    local_wrappers: RefCell<HashMap<usize, Wrapper>>,
     /// Functions and classes declared anywhere in the script, collected on first use.
     declared_names: RefCell<Option<HashSet<String>>>,
+    instances: RefCell<HashSet<String>>,
+    /// What a function forwards, by its start byte (`None` while it is being worked out).
+    forwards: RefCell<HashMap<usize, Option<Forward>>>,
+    /// The client a function returns, by its start byte.
+    factories: RefCell<HashMap<usize, Option<Client>>>,
+    /// The forwarding methods of an object literal, by its start byte.
+    objects: RefCell<HashMap<usize, Option<Methods>>>,
+    /// Start bytes of the strings `parts` has folded.
+    folded: RefCell<Vec<usize>>,
+    /// The imported constants it has folded: (local name, every value of an object).
+    folded_imports: RefCell<Vec<(String, bool)>>,
+    /// What each block declares, by node id.
+    scopes: RefCell<HashMap<usize, HashMap<&'a str, Node<'a>>>>,
+    /// The client a bound value holds, by the value's start byte.
+    receivers: RefCell<HashMap<usize, Option<Client>>>,
+    /// Forwarding methods called as `this.name()`, by start byte.
+    called: RefCell<HashSet<usize>>,
 }
 
 enum Part {
     Lit(String),
     Hole(String),
+    /// A map indexed by a variable (the expression as written): each of its string values.
+    Alt(String, Vec<String>),
+}
+
+fn folds(parts: &[Part]) -> bool {
+    parts.iter().all(|p| matches!(p, Part::Lit(_) | Part::Alt(..)))
+}
+
+/// What a name refers to in its scope.
+enum Bound<'a> {
+    /// `const x = value`, `let`, `var`.
+    Value(Node<'a>),
+    /// A parameter, with its default value.
+    Param(Option<Node<'a>>),
+    /// A function declaration or a variable holding a function.
+    Function(Node<'a>),
+    /// Declared without a value.
+    Opaque,
+}
+
+/// A slot of a forwarded call as given at a call site.
+enum At<'a> {
+    Absent,
+    Lit(String),
+    Node(Node<'a>),
+    /// Not visible at the call: the expression as far as it is written (`config.url`).
+    Opaque(Option<String>),
 }
 
 impl<'a> Ctx<'a> {
@@ -264,7 +527,7 @@ impl<'a> Ctx<'a> {
                 if let (Some(name), Some(value)) =
                     (node.child_by_field_name("name"), node.child_by_field_name("value"))
                 {
-                    if name.kind() == "identifier" && self.is_axios_create(value) {
+                    if name.kind() == "identifier" && self.creates_instance(value, 0) {
                         found.insert(self.text(name).to_string());
                     }
                 }
@@ -281,39 +544,227 @@ impl<'a> Ctx<'a> {
                 .is_some_and(|f| self.text(f).replace(char::is_whitespace, "") == "axios.create")
     }
 
-    /// The value expression a name is bound to by `const`/`let`/`var` visible at `at`.
-    fn binding(&self, name: &str, at: Node<'a>) -> Option<Node<'a>> {
-        let mut scope = at.parent();
-        while let Some(s) = scope {
-            if matches!(s.kind(), "statement_block" | "program" | "class_body") {
-                for statement in named(s) {
-                    let declaration = if statement.kind() == "export_statement" {
-                        match statement.child_by_field_name("declaration") {
-                            Some(d) => d,
-                            None => continue,
+    /// `axios.create(…)`, or one passed through a function that returns it: `wrap(axios.create())`
+    /// attaching interceptors. A local function is checked; an imported one is taken to return
+    /// what it is given, as interceptor setups do.
+    fn creates_instance(&self, value: Node<'a>, depth: usize) -> bool {
+        if depth > 3 {
+            return false;
+        }
+        match value.kind() {
+            "parenthesized_expression" | "await_expression" | "as_expression" | "satisfies_expression" | "non_null_expression" => {
+                named(value).into_iter().next().is_some_and(|v| self.creates_instance(v, depth + 1))
+            }
+            "call_expression" => {
+                if self.is_axios_create(value) {
+                    return true;
+                }
+                let Some(index) = Self::args(value).into_iter().position(|a| self.creates_instance(a, depth + 1)) else {
+                    return false;
+                };
+                let Some(function) = value.child_by_field_name("function").filter(|f| f.kind() == "identifier") else {
+                    return false;
+                };
+                match self.resolve(self.text(function), function) {
+                    Some(Bound::Function(f)) => self.returns_param(f, index),
+                    Some(_) => false,
+                    None => true,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn returns_param(&self, function: Node<'a>, index: usize) -> bool {
+        let Some(name) = self.param_slots(function).into_iter().find_map(|(n, s)| (s == Slot::Arg(index, Vec::new())).then_some(n)) else {
+            return false;
+        };
+        let Some(body) = function.child_by_field_name("body") else {
+            return false;
+        };
+        let returned = if body.kind() == "statement_block" { returned_values(body) } else { vec![body] };
+        returned.iter().any(|r| r.kind() == "identifier" && self.text(*r) == name)
+    }
+
+    /// What `name` refers to at `at`: the nearest declaration, parameter or function declaration
+    /// of the enclosing scopes; `None` for a global or an import.
+    fn resolve(&self, name: &str, at: Node<'a>) -> Option<Bound<'a>> {
+        for scope in self.ancestors(at) {
+            if is_function(scope) || matches!(scope.kind(), "function_declaration" | "method_definition" | "generator_function_declaration") {
+                if let Some(default) = param_binding(scope, name, self.src) {
+                    return Some(Bound::Param(default));
+                }
+            }
+            if matches!(scope.kind(), "statement_block" | "program") {
+                if let Some(declared) = self.declared(scope, name) {
+                    return Some(match declared.kind() {
+                        "variable_declarator" => match declared.child_by_field_name("value") {
+                            Some(v) if is_function(v) => Bound::Function(v),
+                            Some(v) => Bound::Value(v),
+                            None => Bound::Opaque,
+                        },
+                        _ => Bound::Function(declared),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The parameters of a function as slots: `(url, { params, signal } = {})` → `url` is
+    /// argument 0, `params` is `params` of argument 1.
+    fn param_slots(&self, function: Node<'a>) -> Vec<(String, Slot)> {
+        let mut out = Vec::new();
+        if let Some(single) = function.child_by_field_name("parameter") {
+            out.push((self.text(single).to_string(), Slot::Arg(0, Vec::new())));
+            return out;
+        }
+        let Some(params) = function.child_by_field_name("parameters") else {
+            return out;
+        };
+        for (i, param) in named(params).into_iter().enumerate() {
+            let pattern = param.child_by_field_name("pattern").unwrap_or(param);
+            self.pattern_slots(pattern, Slot::Arg(i, Vec::new()), &mut out);
+        }
+        out
+    }
+
+    fn pattern_slots(&self, pattern: Node<'a>, slot: Slot, out: &mut Vec<(String, Slot)>) {
+        match pattern.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => out.push((self.text(pattern).to_string(), slot)),
+            "assignment_pattern" => {
+                if let Some(left) = pattern.child_by_field_name("left") {
+                    self.pattern_slots(left, slot, out);
+                }
+            }
+            "rest_pattern" => {
+                if let Some(inner) = named(pattern).into_iter().next() {
+                    self.pattern_slots(inner, slot, out);
+                }
+            }
+            "object_pattern" => {
+                for member in named(pattern) {
+                    match member.kind() {
+                        "shorthand_property_identifier_pattern" => {
+                            let key = self.text(member);
+                            out.push((key.to_string(), slot.get(key)));
                         }
-                    } else {
-                        statement
-                    };
-                    if !matches!(declaration.kind(), "lexical_declaration" | "variable_declaration") {
-                        continue;
-                    }
-                    for declarator in named(declaration) {
-                        if declarator.kind() != "variable_declarator" {
-                            continue;
+                        "object_assignment_pattern" => {
+                            if let Some(left) = member.child_by_field_name("left") {
+                                self.pattern_slots(left, slot.get(self.text(left)), out);
+                            }
                         }
-                        let fits = declarator
-                            .child_by_field_name("name")
-                            .is_some_and(|n| n.kind() == "identifier" && self.text(n) == name);
-                        if fits {
-                            return declarator.child_by_field_name("value");
+                        "pair_pattern" => {
+                            if let (Some(key), Some(value)) = (member.child_by_field_name("key"), member.child_by_field_name("value")) {
+                                self.pattern_slots(value, slot.get(&self.key_text(key)), out);
+                            }
                         }
+                        "rest_pattern" => self.pattern_slots(member, slot.clone(), out),
+                        _ => {}
                     }
                 }
             }
-            scope = s.parent();
+            _ => {}
+        }
+    }
+
+    /// The default value of parameter `index` (or of its key `path[0]`, destructured).
+    fn param_default(&self, function: Node<'a>, index: usize, path: &[String]) -> Option<Node<'a>> {
+        let param = named(function.child_by_field_name("parameters")?).into_iter().nth(index)?;
+        let [key] = path else {
+            return path.is_empty().then(|| param.child_by_field_name("value")).flatten();
+        };
+        let pattern = param.child_by_field_name("pattern").filter(|p| p.kind() == "object_pattern")?;
+        named(pattern).into_iter().find_map(|member| match member.kind() {
+            "object_assignment_pattern" => member
+                .child_by_field_name("left")
+                .is_some_and(|l| self.text(l) == key)
+                .then(|| member.child_by_field_name("right"))
+                .flatten(),
+            "pair_pattern" => {
+                let value = member.child_by_field_name("value").filter(|v| v.kind() == "assignment_pattern")?;
+                member
+                    .child_by_field_name("key")
+                    .is_some_and(|k| self.key_text(k) == *key)
+                    .then(|| value.child_by_field_name("right"))
+                    .flatten()
+            }
+            _ => None,
+        })
+    }
+
+    fn key_text(&self, key: Node) -> String {
+        match key.kind() {
+            "string" => self.string_value(key),
+            _ => self.text(key).to_string(),
+        }
+    }
+
+    /// The value expression a name is bound to by `const`/`let`/`var` visible at `at`.
+    fn binding(&self, name: &str, at: Node<'a>) -> Option<Node<'a>> {
+        for scope in self.ancestors(at) {
+            if matches!(scope.kind(), "statement_block" | "program") {
+                if let Some(declared) = self.declared(scope, name).filter(|d| d.kind() == "variable_declarator") {
+                    return declared.child_by_field_name("value");
+                }
+            }
         }
         None
+    }
+
+    /// The ancestors of `node`, innermost first, in one descent from the root: `Node::parent`
+    /// descends from the root at every level, and name lookups climb many levels per call.
+    fn ancestors(&self, node: Node<'a>) -> Vec<Node<'a>> {
+        let mut out = Vec::new();
+        let mut current = self.root;
+        while current != node {
+            out.push(current);
+            match current.child_with_descendant(node) {
+                Some(child) => current = child,
+                None => break,
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// The declarator or function declaration of `name` in a block, the first of a name. Each
+    /// block's names are collected once: lookups walk up many blocks for every call.
+    fn declared(&self, scope: Node<'a>, name: &str) -> Option<Node<'a>> {
+        if let Some(known) = self.scopes.borrow().get(&scope.id()) {
+            return known.get(name).copied();
+        }
+        let mut declared: HashMap<&'a str, Node<'a>> = HashMap::new();
+        for statement in named(scope) {
+            let declaration = match statement.kind() {
+                "export_statement" => match statement.child_by_field_name("declaration") {
+                    Some(d) => d,
+                    None => continue,
+                },
+                _ => statement,
+            };
+            match declaration.kind() {
+                "function_declaration" | "generator_function_declaration" => {
+                    if let Some(name) = declaration.child_by_field_name("name") {
+                        declared.entry(self.text(name)).or_insert(declaration);
+                    }
+                }
+                "lexical_declaration" | "variable_declaration" => {
+                    for declarator in named(declaration) {
+                        if let Some(name) = declarator
+                            .child_by_field_name("name")
+                            .filter(|n| declarator.kind() == "variable_declarator" && n.kind() == "identifier")
+                        {
+                            declared.entry(self.text(name)).or_insert(declarator);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let found = declared.get(name).copied();
+        self.scopes.borrow_mut().insert(scope.id(), declared);
+        found
     }
 
     /// A declaration, a parameter of an enclosing function, or a declared function or class.
@@ -359,12 +810,37 @@ impl<'a> Ctx<'a> {
     }
 
     fn parts(&self, node: Node<'a>, depth: usize) -> Vec<Part> {
+        self.parts_in(node, depth, &[])
+    }
+
+    /// An imported constant, noted as folded.
+    fn imported_constant(&self, name: &str) -> Option<String> {
+        let value = self.imports.constant(name)?;
+        self.folded_imports.borrow_mut().push((name.to_string(), false));
+        Some(value)
+    }
+
+    fn imported_constants_of(&self, name: &str) -> Vec<String> {
+        let values = self.imports.constants_of(name);
+        if !values.is_empty() {
+            self.folded_imports.borrow_mut().push((name.to_string(), true));
+        }
+        values
+    }
+
+    /// `env`: the parameters of a local helper being folded, bound to the arguments of its call.
+    fn parts_in(&self, node: Node<'a>, depth: usize, env: &[(String, Node<'a>)]) -> Vec<Part> {
         if depth > 6 {
             return vec![Part::Hole(self.text(node).to_string())];
         }
+        let hole = || vec![Part::Hole(self.text(node).to_string())];
         match node.kind() {
-            "string" => vec![Part::Lit(self.string_value(node))],
+            "string" => {
+                self.folded.borrow_mut().push(node.start_byte());
+                vec![Part::Lit(self.string_value(node))]
+            }
             "template_string" => {
+                self.folded.borrow_mut().push(node.start_byte());
                 let mut out = Vec::new();
                 for child in named(node) {
                     match child.kind() {
@@ -375,8 +851,8 @@ impl<'a> Ctx<'a> {
                             let Some(expr) = named(child).into_iter().next() else {
                                 continue;
                             };
-                            let inner = self.parts(expr, depth + 1);
-                            if inner.iter().all(|p| matches!(p, Part::Lit(_))) {
+                            let inner = self.parts_in(expr, depth + 1, env);
+                            if folds(&inner) {
                                 out.extend(inner);
                             } else {
                                 out.push(Part::Hole(self.text(expr).to_string()));
@@ -391,31 +867,152 @@ impl<'a> Ctx<'a> {
                 let op = node.child_by_field_name("operator").map(|o| self.text(o));
                 match (op, node.child_by_field_name("left"), node.child_by_field_name("right")) {
                     (Some("+"), Some(l), Some(r)) => {
-                        let mut out = self.parts(l, depth + 1);
-                        out.extend(self.parts(r, depth + 1));
+                        let mut out = self.parts_in(l, depth + 1, env);
+                        out.extend(self.parts_in(r, depth + 1, env));
                         out
                     }
-                    _ => vec![Part::Hole(self.text(node).to_string())],
+                    _ => hole(),
                 }
             }
             "parenthesized_expression" => match named(node).into_iter().next() {
-                Some(inner) => self.parts(inner, depth + 1),
+                Some(inner) => self.parts_in(inner, depth + 1, env),
                 None => Vec::new(),
             },
-            "identifier" => {
+            "identifier" | "shorthand_property_identifier" => {
                 let name = self.text(node);
-                if let Some(value) = self.binding(name, node) {
+                if let Some((_, arg)) = env.iter().find(|(n, _)| *n == name) {
+                    return self.parts(*arg, depth + 1);
+                }
+                let value = match self.resolve(name, node) {
+                    Some(Bound::Value(v)) => Some(v),
+                    // The address unless the caller passes another; an empty default only
+                    // marks an optional part, which stays a hole.
+                    Some(Bound::Param(Some(d))) if self.string_of(d).is_none_or(|s| !s.is_empty()) => Some(d),
+                    _ => None,
+                };
+                if let Some(value) = value {
                     let inner = self.parts(value, depth + 1);
-                    if inner.iter().all(|p| matches!(p, Part::Lit(_))) {
+                    if folds(&inner) {
                         return inner;
                     }
                 }
-                match self.imports.constant(name) {
+                match self.imported_constant(name) {
                     Some(value) => vec![Part::Lit(value)],
                     None => vec![Part::Hole(name.to_string())],
                 }
             }
-            _ => vec![Part::Hole(self.text(node).to_string())],
+            // `ENDPOINTS.list` of an object constant, local or imported.
+            "member_expression" => {
+                let (Some(object), Some(property)) =
+                    (node.child_by_field_name("object"), node.child_by_field_name("property"))
+                else {
+                    return hole();
+                };
+                if object.kind() != "identifier" || property.kind() != "property_identifier" {
+                    return hole();
+                }
+                let key = self.text(property);
+                match self.object_value(object) {
+                    Some(map) => {
+                        if let Some(value) = self.property(map, key) {
+                            let inner = self.parts(value, depth + 1);
+                            if folds(&inner) {
+                                return inner;
+                            }
+                        }
+                        hole()
+                    }
+                    None => match self.imported_constant(&format!("{}.{key}", self.text(object))) {
+                        Some(value) => vec![Part::Lit(value)],
+                        None => hole(),
+                    },
+                }
+            }
+            // `endpoints[key]`: the value of a known key, or each value of the map.
+            "subscript_expression" => {
+                let (Some(object), Some(index)) =
+                    (node.child_by_field_name("object"), node.child_by_field_name("index"))
+                else {
+                    return hole();
+                };
+                if object.kind() != "identifier" {
+                    return hole();
+                }
+                let key = self.string_of(index);
+                let values = match (self.object_value(object), key) {
+                    (Some(map), Some(key)) => {
+                        let inner = self.property(map, &key).map(|v| self.parts(v, depth + 1));
+                        return inner.filter(|p| folds(p)).unwrap_or_else(hole);
+                    }
+                    (Some(map), None) => named(map)
+                        .into_iter()
+                        .filter(|m| m.kind() == "pair")
+                        .filter_map(|m| m.child_by_field_name("value"))
+                        .filter_map(|v| self.string_of(v))
+                        .collect(),
+                    (None, Some(key)) => {
+                        return match self.imported_constant(&format!("{}.{key}", self.text(object))) {
+                            Some(value) => vec![Part::Lit(value)],
+                            None => hole(),
+                        }
+                    }
+                    (None, None) => self.imported_constants_of(self.text(object)),
+                };
+                if values.is_empty() {
+                    hole()
+                } else {
+                    vec![Part::Alt(self.text(node).to_string(), values)]
+                }
+            }
+            "call_expression" => self.helper_parts(node, depth).unwrap_or_else(hole),
+            _ => hole(),
+        }
+    }
+
+    /// `itemUrl(id)` of a local helper returning an address: `(id) => \`/api/items/${id}/\``;
+    /// `this.apiUrl(path)` of a method of the same object.
+    fn helper_parts(&self, call: Node<'a>, depth: usize) -> Option<Vec<Part>> {
+        let function = call.child_by_field_name("function")?;
+        let helper = match function.kind() {
+            "identifier" => match self.resolve(self.text(function), function)? {
+                Bound::Function(f) => f,
+                _ => return None,
+            },
+            "member_expression" if function.child_by_field_name("object").is_some_and(|o| o.kind() == "this") => {
+                self.sibling(function, self.text(function.child_by_field_name("property")?))?
+            }
+            _ => return None,
+        };
+        let body = helper.child_by_field_name("body")?;
+        let returned = if body.kind() == "statement_block" {
+            match named(body).as_slice() {
+                [only] if only.kind() == "return_statement" => named(*only).into_iter().next()?,
+                _ => return None,
+            }
+        } else {
+            body
+        };
+        let args = Self::args(call);
+        let env: Vec<(String, Node<'a>)> = self
+            .param_slots(helper)
+            .into_iter()
+            .filter_map(|(name, slot)| match slot {
+                Slot::Arg(i, path) if path.is_empty() => Some((name, *args.get(i)?)),
+                _ => None,
+            })
+            .collect();
+        let parts = self.parts_in(returned, depth + 1, &env);
+        parts
+            .iter()
+            .any(|p| matches!(p, Part::Lit(s) if !s.is_empty()) || matches!(p, Part::Alt(..)))
+            .then_some(parts)
+    }
+
+    /// The object literal a name is bound to (`Object.freeze({…})` too).
+    fn object_value(&self, name: Node<'a>) -> Option<Node<'a>> {
+        match self.resolve(self.text(name), name)? {
+            Bound::Value(v) => self.object_literal(v),
+            _ => None,
         }
     }
 
@@ -427,20 +1024,59 @@ impl<'a> Ctx<'a> {
         inner.replace("\\/", "/").replace("\\'", "'").replace("\\\"", "\"")
     }
 
+    /// (address, nothing folded → the expression as written, the addresses for each value of
+    /// a map indexed by a variable).
+    fn addresses(&self, node: Node<'a>) -> (Option<String>, Option<String>, Vec<String>) {
+        let parts = self.parts(node, 0);
+        if !parts
+            .iter()
+            .any(|p| matches!(p, Part::Lit(s) if !s.is_empty()) || matches!(p, Part::Alt(..)))
+        {
+            return (None, Some(self.with_placeholders(self.text(node))), Vec::new());
+        }
+        let mut shown = String::new();
+        let mut variants = vec![String::new()];
+        for part in &parts {
+            match part {
+                Part::Lit(s) => {
+                    shown.push_str(s);
+                    variants.iter_mut().for_each(|v| v.push_str(s));
+                }
+                Part::Alt(expr, values) if variants.len() * values.len() <= MAX_CANDIDATES => {
+                    shown.push_str(&format!("{{{expr}}}"));
+                    variants = variants
+                        .iter()
+                        .flat_map(|v| values.iter().map(move |value| format!("{v}{value}")))
+                        .collect();
+                }
+                Part::Hole(expr) | Part::Alt(expr, _) => {
+                    let hole = format!("{{{expr}}}");
+                    shown.push_str(&hole);
+                    variants.iter_mut().for_each(|v| v.push_str(&hole));
+                }
+            }
+        }
+        match variants.as_slice() {
+            [only] => (Some(self.with_placeholders(only)), None, Vec::new()),
+            _ => (
+                Some(self.with_placeholders(&shown)),
+                None,
+                variants.iter().map(|v| self.with_placeholders(v)).collect(),
+            ),
+        }
+    }
+
     /// (address, nothing folded → the expression as written).
     fn url(&self, node: Node<'a>) -> (Option<String>, Option<String>) {
-        let parts = self.parts(node, 0);
-        if !parts.iter().any(|p| matches!(p, Part::Lit(s) if !s.is_empty())) {
-            return (None, Some(self.with_placeholders(self.text(node))));
-        }
-        let joined: String = parts
-            .iter()
-            .map(|p| match p {
-                Part::Lit(s) => s.clone(),
-                Part::Hole(h) => format!("{{{h}}}"),
-            })
-            .collect();
-        (Some(self.with_placeholders(&joined)), None)
+        let (url, expr, _) = self.addresses(node);
+        (url, expr)
+    }
+
+    fn set_url(&self, node: Node<'a>, out: &mut HttpCall) {
+        let (url, expr, candidates) = self.addresses(node);
+        out.url = url;
+        out.url_expr = expr;
+        out.candidates = candidates;
     }
 
     fn string_of(&self, node: Node<'a>) -> Option<String> {
@@ -449,7 +1085,7 @@ impl<'a> Ctx<'a> {
         for p in parts {
             match p {
                 Part::Lit(s) => out.push_str(&s),
-                Part::Hole(_) => return None,
+                Part::Hole(_) | Part::Alt(..) => return None,
             }
         }
         Some(self.with_placeholders(&out))
@@ -457,6 +1093,10 @@ impl<'a> Ctx<'a> {
 
     /// The value of `key` in an object literal (or a name bound to one).
     fn property(&self, object: Node<'a>, key: &str) -> Option<Node<'a>> {
+        self.property_at(object, key, 0)
+    }
+
+    fn property_at(&self, object: Node<'a>, key: &str, depth: usize) -> Option<Node<'a>> {
         let object = self.object_literal(object)?;
         for member in named(object) {
             match member.kind() {
@@ -484,7 +1124,16 @@ impl<'a> Ctx<'a> {
                 _ => {}
             }
         }
-        None
+        // `{ ...base, url }`: a key of a known object spread into it.
+        if depth > 4 {
+            return None;
+        }
+        named(object)
+            .into_iter()
+            .rev()
+            .filter(|m| m.kind() == "spread_element")
+            .filter_map(|m| named(m).into_iter().next())
+            .find_map(|inner| self.property_at(inner, key, depth + 1))
     }
 
     fn object_literal(&self, node: Node<'a>) -> Option<Node<'a>> {
@@ -492,8 +1141,15 @@ impl<'a> Ctx<'a> {
             "object" => Some(node),
             "identifier" => self
                 .binding(self.text(node), node)
-                .and_then(|v| (v.kind() == "object").then_some(v)),
+                .and_then(|v| self.object_literal(v).filter(|_| v.kind() != "identifier")),
             "parenthesized_expression" => named(node).into_iter().next().and_then(|n| self.object_literal(n)),
+            "call_expression"
+                if node
+                    .child_by_field_name("function")
+                    .is_some_and(|f| self.text(f).replace(char::is_whitespace, "") == "Object.freeze") =>
+            {
+                Self::args(node).into_iter().next().filter(|a| a.kind() == "object")
+            }
             _ => None,
         }
     }
@@ -540,7 +1196,7 @@ impl<'a> Ctx<'a> {
                         .unwrap_or_default(),
                 }
             }
-            "identifier" => {
+            "identifier" | "shorthand_property_identifier" => {
                 let name = self.text(node);
                 let value = self.binding(name, node);
                 if value.is_some_and(|v| v.kind() == "new_expression" && self.text(v).contains("FormData")) {
@@ -610,9 +1266,7 @@ impl<'a> Ctx<'a> {
         match (callee.as_str(), member.as_ref()) {
             ("fetch" | "window.fetch", _) => {
                 out.client = "fetch";
-                let (url, expr) = self.url(*args.first()?);
-                out.url = url;
-                out.url_expr = expr;
+                self.set_url(*args.first()?, &mut out);
                 let options = args.get(1).copied();
                 out.method = Some(
                     options
@@ -649,9 +1303,7 @@ impl<'a> Ctx<'a> {
             ("BX.ajax", _) => {
                 out.client = "bx.ajax";
                 let config = *args.first()?;
-                let (url, expr) = self.url(self.property(config, "url")?);
-                out.url = url;
-                out.url_expr = expr;
+                self.set_url(self.property(config, "url")?, &mut out);
                 out.method = Some(
                     self.property(config, "method")
                         .and_then(|m| self.string_of(m))
@@ -664,9 +1316,7 @@ impl<'a> Ctx<'a> {
             }
             ("BX.ajax.post" | "BX.ajax.get" | "BX.ajax.loadJSON", _) => {
                 out.client = "bx.ajax";
-                let (url, expr) = self.url(*args.first()?);
-                out.url = url;
-                out.url_expr = expr;
+                self.set_url(*args.first()?, &mut out);
                 out.method = Some(if callee.ends_with("post") { "POST" } else { "GET" }.into());
                 if let Some(data) = args.get(1) {
                     out.params = self.keys(*data);
@@ -710,7 +1360,10 @@ impl<'a> Ctx<'a> {
                 }
             }
             _ => {
-                let wrapper = self.wrapper_for(function, member.as_ref())?;
+                let Some(wrapper) = self.wrapper_for(function, member.as_ref()) else {
+                    return self.client_call(call, function, member.as_ref(), &args, out);
+                };
+                let returns_body = wrapper.forward.returns_body;
                 if let Some(action) = &wrapper.action {
                     out.client = action.client;
                     out.via = Some(callee.clone());
@@ -721,10 +1374,8 @@ impl<'a> Ctx<'a> {
                     out.action = action.action_param.and_then(|i| args.get(i)).and_then(|a| self.string_of(*a));
                     out.mode = action.mode.clone().or_else(|| (action.client == "bx.runComponentAction").then(|| "ajax".to_string()));
                     out.method = Some(action.method.clone().unwrap_or_else(|| "POST".into()));
-                    if let Some(data) = wrapper.data_param.and_then(|i| args.get(i)) {
-                        out.params = self.keys(*data);
-                    }
-                    self.reads(call, &mut out, if wrapper.returns_body { "" } else { "data" });
+                    out.params = self.slot_keys(&wrapper.forward.body, &args);
+                    self.reads(call, &mut out, if returns_body { "" } else { "data" });
                     return Some(out);
                 }
                 if wrapper.instance {
@@ -738,16 +1389,10 @@ impl<'a> Ctx<'a> {
                 } else {
                     out.client = "wrapper";
                     out.via = Some(callee.clone());
-                    let (url, expr) = self.url(*args.get(wrapper.url_param)?);
-                    out.url = url;
-                    out.url_expr = expr;
-                    out.method = wrapper.method.clone();
-                    if let Some(data) = wrapper.data_param.and_then(|i| args.get(i)) {
-                        out.params = self.keys(*data);
-                    }
+                    self.apply(&wrapper.forward, &args, &mut out)?;
                 }
                 self.parse_ajax_url(&mut out);
-                self.reads(call, &mut out, if wrapper.returns_body { "" } else { "data" });
+                self.reads(call, &mut out, if returns_body { "" } else { "data" });
                 return Some(out);
             }
         }
@@ -760,24 +1405,122 @@ impl<'a> Ctx<'a> {
         Some(out)
     }
 
-    fn wrapper_for(&self, function: Node, member: Option<&(String, String)>) -> Option<Wrapper> {
-        match member {
-            Some((object, method)) => self.imports.wrapper(object, Some(method)).or_else(|| {
-                self.local_wrappers
-                    .borrow()
-                    .iter()
-                    .find(|w| w.name == format!("{object}.{method}"))
-                    .cloned()
-            }),
-            None => {
-                let name = self.text(function);
-                self.local_wrappers
-                    .borrow()
-                    .iter()
-                    .find(|w| !w.instance && w.name == name)
-                    .cloned()
-                    .or_else(|| self.imports.wrapper(name, None))
+    /// `http.get(url)` where `http` holds a client object: a factory's result bound to a
+    /// constant, a parameter's default value (destructured too), `injected || createClient()`,
+    /// an import. A parameter without a default tells nothing: no call.
+    fn client_call(
+        &self,
+        call: Node<'a>,
+        function: Node<'a>,
+        member: Option<&(String, String)>,
+        args: &[Node<'a>],
+        mut out: HttpCall,
+    ) -> Option<HttpCall> {
+        let (_, method) = member?;
+        let object = function.child_by_field_name("object")?;
+        // `this.request(url)`: a forwarding method of the same object.
+        let (via, forward) = if object.kind() == "this" {
+            let sibling = self.sibling(function, method)?;
+            let forward = self.forward_of(sibling, 0)?;
+            self.called.borrow_mut().insert(sibling.start_byte());
+            (format!("this.{method}"), forward)
+        } else {
+            let client = self.client_of(object, 0)?;
+            (format!("{}.{method}", client.origin), client.method(method)?)
+        };
+        out.client = "wrapper";
+        out.via = Some(via);
+        self.apply(&forward, args, &mut out)?;
+        self.parse_ajax_url(&mut out);
+        self.reads(call, &mut out, if forward.returns_body { "" } else { "data" });
+        Some(out)
+    }
+
+    /// The call a forwarding function makes, given the arguments of its call.
+    fn apply(&self, forward: &Forward, args: &[Node<'a>], out: &mut HttpCall) -> Option<()> {
+        match self.at(&forward.url, args) {
+            At::Node(node) => self.set_url(node, out),
+            At::Lit(url) => out.url = Some(self.with_placeholders(&url)),
+            At::Opaque(Some(expr)) => out.url_expr = Some(self.with_placeholders(&expr)),
+            At::Absent if forward.url_default.is_some() => out.url = forward.url_default.clone(),
+            At::Opaque(None) | At::Absent => return None,
+        }
+        out.method = match self.at(&forward.method, args) {
+            At::Lit(m) => Some(m.to_ascii_uppercase()),
+            At::Node(node) => self.string_of(node).map(|m| m.to_ascii_uppercase()),
+            At::Absent => Some("GET".into()),
+            At::Opaque(_) => None,
+        };
+        out.params = self.slot_keys(&forward.body, args);
+        out.params.extend(self.slot_keys(&forward.query, args));
+        Some(())
+    }
+
+    fn at(&self, slot: &Slot, args: &[Node<'a>]) -> At<'a> {
+        match slot {
+            Slot::Absent => At::Absent,
+            Slot::Lit(s) => At::Lit(s.clone()),
+            Slot::Unknown | Slot::Object(..) => At::Opaque(None),
+            Slot::Or(first, second) => match self.at(first, args) {
+                At::Absent => self.at(second, args),
+                found => found,
+            },
+            Slot::Arg(i, path) => {
+                let Some(mut node) = args.get(*i).copied() else {
+                    return At::Absent;
+                };
+                for (k, key) in path.iter().enumerate() {
+                    let Some(object) = self.object_literal(node) else {
+                        return At::Opaque(Some(format!("{}.{}", self.text(node), path[k..].join("."))));
+                    };
+                    match self.property(object, key) {
+                        Some(value) => node = value,
+                        // A spread whose keys are not known may carry it.
+                        None if named(object).iter().any(|m| {
+                            m.kind() == "spread_element"
+                                && named(*m).into_iter().next().is_none_or(|inner| self.object_literal(inner).is_none())
+                        }) =>
+                        {
+                            return At::Opaque(Some(format!("{}.{}", self.text(object), path[k..].join("."))))
+                        }
+                        None => return At::Absent,
+                    }
+                }
+                At::Node(node)
             }
+        }
+    }
+
+    /// Keys of the data a slot sends at a call.
+    fn slot_keys(&self, slot: &Slot, args: &[Node<'a>]) -> Vec<String> {
+        match slot {
+            Slot::Object(fields, spreads) => {
+                let mut out: Vec<String> = fields.iter().map(|(k, _)| k.clone()).collect();
+                for spread in spreads {
+                    out.extend(self.slot_keys(spread, args));
+                }
+                out
+            }
+            _ => match self.at(slot, args) {
+                At::Node(node) => self.keys(node),
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    fn wrapper_for(&self, function: Node<'a>, member: Option<&(String, String)>) -> Option<Wrapper> {
+        if let Some((object, method)) = member {
+            return self.imports.wrapper(object, Some(method));
+        }
+        let name = self.text(function);
+        // The wrapper in scope: two scripts' IIFEs may each have a `send` of their own.
+        if !self.local_wrappers.borrow().values().any(|w| w.name == name) {
+            return self.imports.wrapper(name, None);
+        }
+        match self.resolve(name, function) {
+            Some(Bound::Function(f)) => self.local_wrappers.borrow().get(&f.start_byte()).cloned(),
+            Some(_) => None,
+            None => self.imports.wrapper(name, None),
         }
     }
 
@@ -786,15 +1529,11 @@ impl<'a> Ctx<'a> {
         let config = if self.object_literal(first).is_some() {
             first
         } else {
-            let (url, expr) = self.url(first);
-            out.url = url;
-            out.url_expr = expr;
+            self.set_url(first, out);
             *args.get(1)?
         };
         if out.url.is_none() && out.url_expr.is_none() {
-            let (url, expr) = self.url(self.property(config, "url")?);
-            out.url = url;
-            out.url_expr = expr;
+            self.set_url(self.property(config, "url")?, out);
         }
         out.method = Some(
             self.property(config, "method")
@@ -814,9 +1553,7 @@ impl<'a> Ctx<'a> {
         if method == "request" {
             return self.axios_config(args, out);
         }
-        let (url, expr) = self.url(*args.first()?);
-        out.url = url;
-        out.url_expr = expr;
+        self.set_url(*args.first()?, out);
         out.method = Some(method.to_ascii_uppercase());
         let with_body = matches!(method, "post" | "put" | "patch");
         let config = if with_body {
@@ -843,15 +1580,11 @@ impl<'a> Ctx<'a> {
             let settings = if self.object_literal(first).is_some() {
                 first
             } else {
-                let (url, expr) = self.url(first);
-                out.url = url;
-                out.url_expr = expr;
+                self.set_url(first, out);
                 *args.get(1)?
             };
             if out.url.is_none() && out.url_expr.is_none() {
-                let (url, expr) = self.url(self.property(settings, "url")?);
-                out.url = url;
-                out.url_expr = expr;
+                self.set_url(self.property(settings, "url")?, out);
             }
             out.method = Some(
                 self.property(settings, "type")
@@ -865,9 +1598,7 @@ impl<'a> Ctx<'a> {
             }
             return Some(());
         }
-        let (url, expr) = self.url(first);
-        out.url = url;
-        out.url_expr = expr;
+        self.set_url(first, out);
         out.method = Some(if method == "post" { "POST" } else { "GET" }.into());
         if let Some(data) = args.get(1).filter(|d| !is_function(**d)) {
             out.params = self.keys(*data);
@@ -898,8 +1629,8 @@ impl<'a> Ctx<'a> {
     }
 
     /// Paths the code reads from the answer of `call`: `.then(cb)` on it (through `.json()` for
-    /// fetch), `await` into a variable or a destructuring, a variable `.then`-ed later, and the
-    /// success callback of jQuery and `BX.ajax`.
+    /// fetch; `cb` inline or a local function), `await` into a variable or a destructuring, a
+    /// variable `.then`-ed later, and the success callback of jQuery and `BX.ajax`.
     fn reads(&self, call: Node<'a>, out: &mut HttpCall, envelope: &str) {
         let mut holders: Vec<(Node<'a>, Node<'a>)> = Vec::new(); // (binding pattern, scope)
         // `.then(cb)` chains, `fetch().then(r => r.json()).then(data => …)` included.
@@ -913,7 +1644,8 @@ impl<'a> Ctx<'a> {
             if prop != Some("then") {
                 break;
             }
-            if let Some(cb) = Self::args(then_call).into_iter().next().filter(|c| is_function(*c)) {
+            // `.then(data)` with `const data = (response) => response.data` of this script too.
+            if let Some(cb) = Self::args(then_call).into_iter().next().and_then(|c| self.function_value(c)) {
                 if let Some(param) = first_param(cb) {
                     if out.client == "fetch" && returns_json(cb, self.src) {
                         body_envelope.clear();
@@ -1339,10 +2071,7 @@ impl<'a> Ctx<'a> {
             .iter()
             .map(|name| Wrapper {
                 name: name.clone(),
-                url_param: 0,
-                data_param: None,
-                method: None,
-                returns_body: false,
+                forward: Forward::default(),
                 instance: true,
                 action: None,
             })
@@ -1358,7 +2087,8 @@ impl<'a> Ctx<'a> {
                 _ => None,
             };
             if let Some((name, function)) = function {
-                if let Some(w) = self.wrapper_of(&name, function, instances) {
+                if let Some(w) = self.wrapper_of(&name, function) {
+                    self.local_wrappers.borrow_mut().insert(function.start_byte(), w.clone());
                     out.push(w);
                 }
             }
@@ -1367,7 +2097,7 @@ impl<'a> Ctx<'a> {
         out
     }
 
-    fn wrapper_of(&self, name: &str, function: Node<'a>, instances: &HashSet<String>) -> Option<Wrapper> {
+    fn wrapper_of(&self, name: &str, function: Node<'a>) -> Option<Wrapper> {
         let params: Vec<String> = function
             .child_by_field_name("parameters")
             .map(named)
@@ -1378,56 +2108,479 @@ impl<'a> Ctx<'a> {
                 self.text(target).to_string()
             })
             .collect();
-        if params.is_empty() {
-            return None;
-        }
         let body = function.child_by_field_name("body")?;
         if let Some(w) = self.action_wrapper(name, body, &params) {
             return Some(w);
         }
+        Some(Wrapper {
+            name: name.to_string(),
+            forward: self.forward_of(function, 0)?,
+            instance: false,
+            action: None,
+        })
+    }
+
+    /// The backend call a function makes from its parameters, when it passes one on as the
+    /// address: directly to a client, or through another such function or client object.
+    fn forward_of(&self, function: Node<'a>, depth: usize) -> Option<Forward> {
+        if depth > 8 {
+            return None;
+        }
+        let key = function.start_byte();
+        if let Some(known) = self.forwards.borrow().get(&key) {
+            return known.clone();
+        }
+        self.forwards.borrow_mut().insert(key, None);
+        let found = self.find_forward(function, depth);
+        self.forwards.borrow_mut().insert(key, found.clone());
+        found
+    }
+
+    fn find_forward(&self, function: Node<'a>, depth: usize) -> Option<Forward> {
+        let env = self.param_slots(function);
+        if env.is_empty() {
+            return None;
+        }
+        let body = function.child_by_field_name("body")?;
         let mut stack = vec![body];
         while let Some(node) = stack.pop() {
+            if node != body && !runs_with_caller(node) {
+                continue;
+            }
             if node.kind() == "call_expression" {
-                if let Some(inner) = self.http_call_shape(node, instances) {
-                    let args = Self::args(node);
-                    let url_arg = args.first()?;
-                    if url_arg.kind() == "identifier" {
-                        if let Some(url_param) = params.iter().position(|p| p == self.text(*url_arg)) {
-                            // The data parameter: passed as is, or inside the config object
-                            // (`api.get(url, { params })`).
-                            let data_param = args.get(1).and_then(|d| {
-                                let candidates: Vec<Node> = if d.kind() == "object" {
-                                    named(*d)
-                                        .into_iter()
-                                        .filter_map(|m| match m.kind() {
-                                            "shorthand_property_identifier" => Some(m),
-                                            "pair" => m.child_by_field_name("value"),
-                                            _ => None,
-                                        })
-                                        .collect()
-                                } else {
-                                    vec![*d]
-                                };
-                                candidates.iter().find_map(|c| {
-                                    matches!(c.kind(), "identifier" | "shorthand_property_identifier")
-                                        .then(|| params.iter().position(|p| p == self.text(*c)))
-                                        .flatten()
-                                })
-                            });
-                            return Some(Wrapper {
-                                name: name.to_string(),
-                                url_param,
-                                data_param,
-                                method: inner,
-                                returns_body: returns_data(body, self.src),
-                                instance: false,
-                                action: None,
-                            });
-                        }
-                    }
+                if let Some(forward) = self.call_forward(node, &env, depth).filter(Forward::forwards) {
+                    let own_default = match &forward.url {
+                        Slot::Arg(i, path) => self
+                            .param_default(function, *i, path)
+                            .and_then(|d| self.string_of(d))
+                            .filter(|d| !d.is_empty()),
+                        _ => None,
+                    };
+                    return Some(Forward {
+                        returns_body: forward.returns_body || returns_data(body, self.src),
+                        url_default: own_default.or(forward.url_default.clone()),
+                        ..forward
+                    });
                 }
             }
             push_children(&mut stack, node);
+        }
+        None
+    }
+
+    /// The backend call `call` makes, in terms of the parameters `env` of the function it is in.
+    fn call_forward(&self, call: Node<'a>, env: &[(String, Slot)], depth: usize) -> Option<Forward> {
+        let arguments = call.child_by_field_name("arguments")?;
+        // Most calls in a function do not touch its parameters; skip them before tracing names.
+        let text = self.text(arguments);
+        if !env.iter().any(|(name, _)| text.contains(name.as_str())) {
+            return None;
+        }
+        let args: Vec<Slot> = named(arguments).into_iter().map(|a| self.abs(a, env, 0)).collect();
+        if !args.iter().any(Slot::depends_on_args) {
+            return None;
+        }
+        let function = call.child_by_field_name("function")?;
+        let callee = self.text(function).replace(char::is_whitespace, "");
+        let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
+        match callee.as_str() {
+            "fetch" | "window.fetch" => {
+                return Some(Forward {
+                    method: arg(1).get("method"),
+                    url: arg(0),
+                    body: arg(1).get("body"),
+                    query: Slot::Absent,
+                    returns_body: false,
+                    url_default: None,
+                })
+            }
+            // `axios(config)` or `axios(url, config)`.
+            "axios" => {
+                return Some(if args.len() > 1 || matches!(arg(0), Slot::Lit(_)) {
+                    Forward {
+                        url: arg(0),
+                        ..config_forward(arg(1))
+                    }
+                } else {
+                    config_forward(arg(0))
+                })
+            }
+            _ => {}
+        }
+        if let Some((object, method)) = self.member_parts(function) {
+            if object == "axios" || self.instances.borrow().contains(&object) {
+                return axios_forward(&method, &args);
+            }
+            if matches!(object.as_str(), "$" | "jQuery") {
+                return jquery_forward(&method, &args);
+            }
+        }
+        Some(self.callee_forward(function, depth)?.subst(&args))
+    }
+
+    /// What a called function or client method forwards, in terms of its own arguments.
+    fn callee_forward(&self, function: Node<'a>, depth: usize) -> Option<Forward> {
+        match function.kind() {
+            "identifier" => {
+                let name = self.text(function);
+                match self.resolve(name, function) {
+                    Some(Bound::Function(f)) => self.forward_of(f, depth + 1),
+                    Some(_) => None,
+                    None => self
+                        .imports
+                        .wrapper(name, None)
+                        .filter(|w| !w.instance && w.action.is_none())
+                        .map(|w| w.forward),
+                }
+            }
+            "member_expression" => {
+                let object = function.child_by_field_name("object")?;
+                let method = self.text(function.child_by_field_name("property")?);
+                if object.kind() == "this" {
+                    return self.forward_of(self.sibling(function, method)?, depth + 1);
+                }
+                if let Some(client) = self.client_of(object, depth + 1) {
+                    return client.method(method);
+                }
+                if object.kind() != "identifier" {
+                    return None;
+                }
+                let wrapper = self.imports.wrapper(self.text(object), Some(method))?;
+                if wrapper.instance {
+                    let own: Vec<Slot> = (0..3).map(|i| Slot::Arg(i, Vec::new())).collect();
+                    return axios_forward(method, &own);
+                }
+                wrapper.action.is_none().then_some(wrapper.forward)
+            }
+            _ => None,
+        }
+    }
+
+    /// The method `name` of the object or class whose method contains `at` (`this.name`).
+    fn sibling(&self, at: Node<'a>, name: &str) -> Option<Node<'a>> {
+        let ancestors = self.ancestors(at);
+        // Arrow functions take `this` from outside.
+        let i = ancestors.iter().position(|n| {
+            matches!(n.kind(), "method_definition" | "function_expression" | "function" | "function_declaration")
+        })?;
+        let container = match ancestors.get(i + 1)? {
+            p if p.kind() == "pair" => *ancestors.get(i + 2)?,
+            p => *p,
+        };
+        match container.kind() {
+            "object" => self.object_method(container, name).or_else(|| self.component_method(container, name)),
+            "class_body" => self.object_method(container, name),
+            _ => None,
+        }
+    }
+
+    /// A method of a component's options reached through `this`: in a group next to the one
+    /// holding the caller (`methods: { … }` beside `mounted()`, or beside `computed`), as
+    /// Vue's options API binds them all to one instance.
+    fn component_method(&self, object: Node<'a>, name: &str) -> Option<Node<'a>> {
+        let options = object
+            .parent()
+            .filter(|p| p.kind() == "pair")
+            .and_then(|p| p.parent())
+            .filter(|o| o.kind() == "object")
+            .unwrap_or(object);
+        let groups = named(options)
+            .into_iter()
+            .filter(|m| m.kind() == "pair")
+            .filter_map(|m| m.child_by_field_name("value"))
+            .filter(|v| v.kind() == "object" && *v != object);
+        self.object_method(options, name)
+            .filter(|_| options != object)
+            .or_else(|| groups.into_iter().find_map(|g| self.object_method(g, name)))
+    }
+
+    fn object_method(&self, object: Node<'a>, name: &str) -> Option<Node<'a>> {
+        named(object).into_iter().find_map(|member| match member.kind() {
+            "method_definition" => member
+                .child_by_field_name("name")
+                .is_some_and(|n| self.text(n) == name)
+                .then_some(member),
+            "pair" => {
+                let key = member.child_by_field_name("key")?;
+                if self.key_text(key) != name {
+                    return None;
+                }
+                self.function_value(member.child_by_field_name("value")?)
+            }
+            "shorthand_property_identifier" if self.text(member) == name => self.function_value(member),
+            _ => None,
+        })
+    }
+
+    /// A function, or a name bound to one.
+    fn function_value(&self, node: Node<'a>) -> Option<Node<'a>> {
+        if is_function(node) {
+            return Some(node);
+        }
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier" => match self.resolve(self.text(node), node)? {
+                Bound::Function(f) => Some(f),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The value of an expression inside a forwarding function, in terms of its parameters.
+    fn abs(&self, node: Node<'a>, env: &[(String, Slot)], depth: usize) -> Slot {
+        if depth > 6 {
+            return Slot::Unknown;
+        }
+        let first = || named(node).into_iter().next();
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier" => {
+                let name = self.text(node);
+                if let Some((_, slot)) = env.iter().rev().find(|(n, _)| n == name) {
+                    return slot.clone();
+                }
+                match self.binding(name, node) {
+                    Some(value) => self.abs(value, env, depth + 1),
+                    None => Slot::Unknown,
+                }
+            }
+            "string" => Slot::Lit(self.string_value(node)),
+            "template_string" if named(node).iter().all(|c| c.kind() == "string_fragment") => {
+                Slot::Lit(self.text(node).trim_matches('`').to_string())
+            }
+            "member_expression" => {
+                let (Some(object), Some(property)) =
+                    (node.child_by_field_name("object"), node.child_by_field_name("property"))
+                else {
+                    return Slot::Unknown;
+                };
+                match self.abs(object, env, depth + 1) {
+                    slot @ (Slot::Arg(..) | Slot::Object(..)) => slot.get(self.text(property)),
+                    _ => Slot::Unknown,
+                }
+            }
+            "object" => {
+                let mut fields = Vec::new();
+                let mut spreads = Vec::new();
+                for member in named(node) {
+                    match member.kind() {
+                        "pair" => {
+                            if let (Some(k), Some(v)) = (member.child_by_field_name("key"), member.child_by_field_name("value")) {
+                                if k.kind() != "computed_property_name" {
+                                    fields.push((self.key_text(k), self.abs(v, env, depth + 1)));
+                                }
+                            }
+                        }
+                        "shorthand_property_identifier" => {
+                            fields.push((self.text(member).to_string(), self.abs(member, env, depth + 1)))
+                        }
+                        "spread_element" => {
+                            if let Some(inner) = named(member).into_iter().next() {
+                                spreads.push(self.abs(inner, env, depth + 1));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Slot::Object(fields, spreads)
+            }
+            "parenthesized_expression" | "await_expression" => match first() {
+                Some(inner) => self.abs(inner, env, depth + 1),
+                None => Slot::Unknown,
+            },
+            // `config || {}`, `url ?? DEFAULT`.
+            "binary_expression"
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|o| matches!(self.text(o), "||" | "??")) =>
+            {
+                let left = node
+                    .child_by_field_name("left")
+                    .map(|l| self.abs(l, env, depth + 1))
+                    .unwrap_or_default();
+                let right = node
+                    .child_by_field_name("right")
+                    .map(|r| self.abs(r, env, depth + 1))
+                    .unwrap_or_default();
+                match (left, right) {
+                    (Slot::Unknown | Slot::Absent, right) => right,
+                    (left, Slot::Unknown | Slot::Absent) => left,
+                    (left, right) => Slot::Or(Box::new(left), Box::new(right)),
+                }
+            }
+            "call_expression"
+                if node
+                    .child_by_field_name("function")
+                    .is_some_and(|f| self.text(f).replace(char::is_whitespace, "") == "JSON.stringify") =>
+            {
+                match Self::args(node).into_iter().next() {
+                    Some(inner) => self.abs(inner, env, depth + 1),
+                    None => Slot::Unknown,
+                }
+            }
+            _ => Slot::Unknown,
+        }
+    }
+
+    /// The client object an expression holds. `depth` bounds chains of names and factories.
+    fn client_of(&self, receiver: Node<'a>, depth: usize) -> Option<Client> {
+        if depth > 8 {
+            return None;
+        }
+        match receiver.kind() {
+            "identifier" => {
+                let name = self.text(receiver);
+                let value = match self.resolve(name, receiver) {
+                    Some(Bound::Value(value)) | Some(Bound::Param(Some(value))) => value,
+                    Some(_) => return None,
+                    None => return self.imports.client(name, None, false),
+                };
+                let key = value.start_byte();
+                if let Some(known) = self.receivers.borrow().get(&key) {
+                    return known.clone();
+                }
+                let found = self.shape_of(value, name, depth + 1);
+                self.receivers.borrow_mut().insert(key, found.clone());
+                found
+            }
+            // `api.http` of a namespace import.
+            "member_expression" => {
+                let object = receiver.child_by_field_name("object").filter(|o| o.kind() == "identifier")?;
+                let property = receiver.child_by_field_name("property")?;
+                let name = self.text(object);
+                if self.resolve(name, object).is_some() {
+                    return None;
+                }
+                self.imports.client(name, Some(self.text(property)), false)
+            }
+            _ => None,
+        }
+    }
+
+    /// The client object a value is: a factory's result, an object literal of forwarding
+    /// methods, the first that is one of `a || b`.
+    fn shape_of(&self, value: Node<'a>, name: &str, depth: usize) -> Option<Client> {
+        if depth > 8 {
+            return None;
+        }
+        match value.kind() {
+            "call_expression" => {
+                let function = value.child_by_field_name("function")?;
+                match function.kind() {
+                    "identifier" => {
+                        let factory = self.text(function);
+                        match self.resolve(factory, function) {
+                            Some(Bound::Function(f)) => self.factory_of(f, factory, depth + 1),
+                            Some(_) => None,
+                            None => self.imports.client(factory, None, true),
+                        }
+                    }
+                    "member_expression" => {
+                        let object = function.child_by_field_name("object").filter(|o| o.kind() == "identifier")?;
+                        let property = function.child_by_field_name("property")?;
+                        if self.resolve(self.text(object), object).is_some() {
+                            return None;
+                        }
+                        self.imports.client(self.text(object), Some(self.text(property)), true)
+                    }
+                    // `(function () { return { get(url) {…} } })()`: a module object.
+                    _ => {
+                        let mut callee = function;
+                        while callee.kind() == "parenthesized_expression" {
+                            callee = named(callee).into_iter().next()?;
+                        }
+                        is_function(callee).then(|| self.factory_of(callee, name, depth + 1)).flatten()
+                    }
+                }
+            }
+            "binary_expression"
+                if value
+                    .child_by_field_name("operator")
+                    .is_some_and(|o| matches!(self.text(o), "||" | "??")) =>
+            {
+                let left = value.child_by_field_name("left").and_then(|l| self.shape_of(l, name, depth + 1));
+                left.or_else(|| value.child_by_field_name("right").and_then(|r| self.shape_of(r, name, depth + 1)))
+            }
+            "ternary_expression" => value
+                .child_by_field_name("consequence")
+                .and_then(|c| self.shape_of(c, name, depth + 1))
+                .or_else(|| value.child_by_field_name("alternative").and_then(|a| self.shape_of(a, name, depth + 1))),
+            "parenthesized_expression" | "await_expression" | "as_expression" | "satisfies_expression" | "non_null_expression" => {
+                named(value).into_iter().next().and_then(|inner| self.shape_of(inner, name, depth + 1))
+            }
+            "identifier" => self.client_of(value, depth + 1),
+            "object" => self.object_client(value, name, depth + 1),
+            _ => None,
+        }
+    }
+
+    /// The client object a function returns.
+    fn factory_of(&self, function: Node<'a>, name: &str, depth: usize) -> Option<Client> {
+        let key = function.start_byte();
+        if let Some(known) = self.factories.borrow().get(&key) {
+            return known.clone();
+        }
+        self.factories.borrow_mut().insert(key, None);
+        let found = function.child_by_field_name("body").and_then(|body| {
+            let returned = if body.kind() == "statement_block" { returned_values(body) } else { vec![body] };
+            returned.into_iter().find_map(|r| self.shape_of(r, name, depth + 1))
+        });
+        let found = found.map(|client| Client {
+            origin: name.to_string(),
+            ..client
+        });
+        self.factories.borrow_mut().insert(key, found.clone());
+        found
+    }
+
+    /// An object literal whose methods forward their arguments to a backend call.
+    fn object_client(&self, object: Node<'a>, name: &str, depth: usize) -> Option<Client> {
+        let key = object.start_byte();
+        if let Some(known) = self.objects.borrow().get(&key) {
+            return known.clone().map(|methods| Client {
+                origin: name.to_string(),
+                methods,
+            });
+        }
+        self.objects.borrow_mut().insert(key, None);
+        let mut methods = Vec::new();
+        for member in named(object) {
+            let (key, function) = match member.kind() {
+                "method_definition" => (member.child_by_field_name("name").map(|n| self.text(n).to_string()), Some(member)),
+                "pair" => (
+                    member.child_by_field_name("key").map(|k| self.key_text(k)),
+                    member.child_by_field_name("value").and_then(|v| self.function_value(v)),
+                ),
+                "shorthand_property_identifier" => (Some(self.text(member).to_string()), self.function_value(member)),
+                _ => continue,
+            };
+            if let (Some(key), Some(function)) = (key, function) {
+                if let Some(forward) = self.forward_of(function, depth + 1) {
+                    methods.push((key, forward));
+                }
+            }
+        }
+        let found = (!methods.is_empty()).then_some(methods);
+        self.objects.borrow_mut().insert(key, found.clone());
+        found.map(|methods| Client {
+            origin: name.to_string(),
+            methods,
+        })
+    }
+
+    /// The function around the call that passes one of its parameters on as the call's address,
+    /// with where its own calls are found.
+    fn forwarder_of(&self, call: Node<'a>) -> Option<(Callers, usize)> {
+        let mut current = enclosing_function(call);
+        for _ in 0..3 {
+            let function = current?;
+            let env = self.param_slots(function);
+            if !env.is_empty() && self.call_forward(call, &env, 0).is_some_and(|f| f.forwards()) {
+                return Some((callers(function), function.start_byte()));
+            }
+            if !runs_with_caller(function) {
+                return None;
+            }
+            current = enclosing_function(function);
         }
         None
     }
@@ -1467,10 +2620,11 @@ impl<'a> Ctx<'a> {
                 let config_string = |key: &str| config.and_then(|c| self.property(c, key)).and_then(|v| self.string_of(v));
                 return Some(Wrapper {
                     name: name.to_string(),
-                    url_param: 0,
-                    data_param,
-                    method: config_string("method").map(|m| m.to_ascii_uppercase()),
-                    returns_body: returns_data(body, self.src),
+                    forward: Forward {
+                        body: data_param.map(|i| Slot::Arg(i, Vec::new())).unwrap_or_default(),
+                        returns_body: returns_data(body, self.src),
+                        ..Forward::default()
+                    },
                     instance: false,
                     action: Some(ActionWrapper {
                         client,
@@ -1491,27 +2645,43 @@ impl<'a> Ctx<'a> {
         None
     }
 
-    /// The method of a client call by shape alone (`axios.post`, `api.get`, `fetch`), if it is one.
-    fn http_call_shape(&self, call: Node<'a>, instances: &HashSet<String>) -> Option<Option<String>> {
-        let function = call.child_by_field_name("function")?;
-        let callee = self.text(function).replace(char::is_whitespace, "");
-        if callee == "fetch" {
-            return Some(None);
-        }
-        let (object, method) = self.member_parts(function)?;
-        let client = object == "axios" || instances.contains(&object) || matches!(object.as_str(), "$" | "jQuery");
-        (client && (AXIOS_METHODS.contains(&method.as_str()) || matches!(method.as_str(), "ajax" | "getJSON")))
-            .then(|| (method != "request" && method != "ajax").then(|| method.to_ascii_uppercase()))
-    }
-
     /// Wrappers reachable from other modules: exported functions, members of a default-exported
     /// object, exported instances.
+    /// `export { local as name }` without `from`: (local, exported name). The local may be an
+    /// import the module passes on, as an index does.
+    fn export_list(&self) -> Vec<(Node<'a>, String)> {
+        let mut out = Vec::new();
+        for statement in named(self.root) {
+            if statement.kind() != "export_statement" || statement.child_by_field_name("source").is_some() {
+                continue;
+            }
+            for clause in named(statement).into_iter().filter(|c| c.kind() == "export_clause") {
+                for specifier in named(clause) {
+                    if let Some(local) = specifier.child_by_field_name("name") {
+                        let alias = specifier.child_by_field_name("alias").unwrap_or(local);
+                        out.push((local, self.text(alias).to_string()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn exported_wrappers(&self, wrappers: &[Wrapper], instances: &HashSet<String>) -> Vec<Wrapper> {
         let mut out = Vec::new();
+        for (local, name) in self.export_list() {
+            let local_name = self.text(local);
+            let found = match self.resolve(local_name, local) {
+                Some(_) => wrappers.iter().find(|w| w.name == local_name).cloned(),
+                None => self.imports.wrapper(local_name, None),
+            };
+            out.extend(found.map(|w| Wrapper { name, ..w }));
+        }
         for statement in named(self.root) {
             if statement.kind() != "export_statement" {
                 continue;
             }
+            let default = self.text(statement)["export".len()..].trim_start().starts_with("default");
             if let Some(declaration) = statement.child_by_field_name("declaration") {
                 let names: Vec<String> = match declaration.kind() {
                     "function_declaration" => declaration
@@ -1527,7 +2697,9 @@ impl<'a> Ctx<'a> {
                 };
                 for name in names {
                     if let Some(w) = wrappers.iter().find(|w| w.name == name) {
-                        out.push(w.clone());
+                        // `export default function request(url)`: imported as the default.
+                        let name = if default { "default".to_string() } else { name };
+                        out.push(Wrapper { name, ..w.clone() });
                     }
                 }
             }
@@ -1535,13 +2707,19 @@ impl<'a> Ctx<'a> {
                 if value.kind() == "identifier" && instances.contains(self.text(value)) {
                     out.push(Wrapper {
                         name: "default".into(),
-                        url_param: 0,
-                        data_param: None,
-                        method: None,
-                        returns_body: false,
+                        forward: Forward::default(),
                         instance: true,
                         action: None,
                     });
+                }
+                // `export default request` of a wrapper held by a variable.
+                if value.kind() == "identifier" {
+                    if let Some(w) = wrappers.iter().find(|w| !w.instance && w.name == self.text(value)) {
+                        out.push(Wrapper {
+                            name: "default".into(),
+                            ..w.clone()
+                        });
+                    }
                 }
                 if value.kind() == "object" {
                     for member in named(value) {
@@ -1570,6 +2748,14 @@ impl<'a> Ctx<'a> {
 
     fn exported_constants(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
+        for (local, name) in self.export_list() {
+            let local_name = self.text(local);
+            match self.resolve(local_name, local) {
+                Some(Bound::Value(v)) => out.extend(self.constant_entries(&name, v)),
+                Some(_) => {}
+                None => out.extend(self.imports.constant(local_name).map(|v| (name, v))),
+            }
+        }
         for statement in named(self.root) {
             if statement.kind() != "export_statement" {
                 continue;
@@ -1582,13 +2768,316 @@ impl<'a> Ctx<'a> {
             }
             for declarator in named(declaration) {
                 if let (Some(n), Some(v)) = (declarator.child_by_field_name("name"), declarator.child_by_field_name("value")) {
-                    if let Some(s) = self.string_of(v) {
-                        out.push((self.text(n).to_string(), s));
-                    }
+                    out.extend(self.constant_entries(self.text(n), v));
                 }
             }
         }
         out
+    }
+
+    /// A string constant `name`, or `name.key` for each string value of an object constant.
+    fn constant_entries(&self, name: &str, value: Node<'a>) -> Vec<(String, String)> {
+        if let Some(s) = self.string_of(value) {
+            return vec![(name.to_string(), s)];
+        }
+        let Some(object) = self.object_literal(value) else {
+            return Vec::new();
+        };
+        named(object)
+            .into_iter()
+            .filter_map(|member| {
+                let (key, value) = (member.child_by_field_name("key")?, member.child_by_field_name("value")?);
+                Some((format!("{name}.{}", self.key_text(key)), self.string_of(value)?))
+            })
+            .collect()
+    }
+
+    /// Client objects and client factories reachable from other modules.
+    fn exported_clients(&self) -> Vec<ExportedClient> {
+        let mut out = Vec::new();
+        for statement in named(self.root) {
+            if statement.kind() != "export_statement" || statement.child_by_field_name("source").is_some() {
+                continue;
+            }
+            let default = self.text(statement)["export".len()..].trim_start().starts_with("default");
+            let exported = |name: &str| if default { "default".to_string() } else { name.to_string() };
+            if let Some(declaration) = statement.child_by_field_name("declaration") {
+                match declaration.kind() {
+                    "function_declaration" => {
+                        if let Some(name) = declaration.child_by_field_name("name").map(|n| self.text(n)) {
+                            out.extend(self.export_client(exported(name), name, declaration));
+                        }
+                    }
+                    "lexical_declaration" | "variable_declaration" => {
+                        for declarator in named(declaration) {
+                            if let (Some(n), Some(v)) = (declarator.child_by_field_name("name"), declarator.child_by_field_name("value")) {
+                                out.extend(self.export_client(self.text(n).to_string(), self.text(n), v));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(value) = statement.child_by_field_name("value").filter(|_| default) {
+                let local = if value.kind() == "identifier" { self.text(value) } else { "default" };
+                let value = match value.kind() {
+                    "identifier" => match self.resolve(local, value) {
+                        Some(Bound::Function(f)) => f,
+                        Some(Bound::Value(v)) => v,
+                        _ => continue,
+                    },
+                    _ => value,
+                };
+                out.extend(self.export_client("default".into(), local, value));
+            }
+        }
+        for (local, name) in self.export_list() {
+            let local_name = self.text(local);
+            let value = match self.resolve(local_name, local) {
+                Some(Bound::Function(f)) => f,
+                Some(Bound::Value(v)) => v,
+                Some(_) => continue,
+                None => {
+                    for factory in [true, false] {
+                        if let Some(client) = self.imports.client(local_name, None, factory) {
+                            out.push(ExportedClient {
+                                name: name.clone(),
+                                factory,
+                                client,
+                            });
+                        }
+                    }
+                    continue;
+                }
+            };
+            out.extend(self.export_client(name, local_name, value));
+        }
+        out
+    }
+
+    fn export_client(&self, exported: String, local: &str, value: Node<'a>) -> Option<ExportedClient> {
+        let factory = is_function(value) || value.kind() == "function_declaration";
+        let client = if factory {
+            self.factory_of(value, local, 0)
+        } else {
+            self.shape_of(value, local, 0)
+        }?;
+        Some(ExportedClient {
+            name: exported,
+            factory,
+            client,
+        })
+    }
+}
+
+/// Not a function, or one passed as an argument (a callback: a `Promise` executor, `.then`),
+/// which runs as part of the call of the function around it. A function it returns, or a
+/// method of an object it returns, runs later: its calls are not the outer function's.
+fn runs_with_caller(node: Node) -> bool {
+    if !(is_function(node) || matches!(node.kind(), "function_declaration" | "method_definition" | "class_declaration")) {
+        return true;
+    }
+    node.parent().is_some_and(|p| p.kind() == "arguments")
+}
+
+/// Where the calls of a forwarding function are found, so that its own call is reported there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Callers {
+    /// By its name, or through the client object it is a method of: an object bound to a
+    /// name, exported, or returned by a function that is.
+    Always,
+    /// As `this.name()`, a method of an object found nowhere else (component options, an
+    /// object a callback or a class method returns): only when the script makes such a call.
+    IfCalled,
+    /// An anonymous callback, a constructor assigned to a property: the call stays where it is.
+    Never,
+}
+
+fn callers(function: Node) -> Callers {
+    let parent = function.parent();
+    let object = match function.kind() {
+        "function_declaration" => return Callers::Always,
+        "method_definition" => parent.filter(|p| p.kind() == "object"),
+        _ => match parent {
+            Some(p) if p.kind() == "variable_declarator" => return Callers::Always,
+            Some(p) if p.kind() == "pair" => p.parent().filter(|o| o.kind() == "object"),
+            _ => None,
+        },
+    };
+    match object {
+        Some(object) if reachable_object(object) => Callers::Always,
+        Some(_) => Callers::IfCalled,
+        None => Callers::Never,
+    }
+}
+
+/// Calls through the object's methods can be found: it is bound to a name, exported, or
+/// returned by a function that is reachable itself.
+fn reachable_object(object: Node) -> bool {
+    let mut holder = object.parent();
+    while let Some(h) = holder.filter(|h| h.kind() == "parenthesized_expression") {
+        holder = h.parent();
+    }
+    let Some(holder) = holder else {
+        return false;
+    };
+    match holder.kind() {
+        "variable_declarator" | "export_statement" => true,
+        "arrow_function" => reachable_function(holder),
+        "return_statement" => enclosing_function(holder).is_some_and(reachable_function),
+        _ => false,
+    }
+}
+
+/// A function its callers can name: declared, held by a variable, exported, a method of a
+/// reachable object, or called on the spot with the result bound to a name (an IIFE module).
+fn reachable_function(function: Node) -> bool {
+    let mut parent = function.parent();
+    while let Some(p) = parent.filter(|p| p.kind() == "parenthesized_expression") {
+        parent = p.parent();
+    }
+    if function.kind() == "function_declaration" {
+        return true;
+    }
+    match parent {
+        Some(p) if matches!(p.kind(), "variable_declarator" | "export_statement") => true,
+        Some(p) if p.kind() == "pair" || function.kind() == "method_definition" => {
+            let object = if function.kind() == "method_definition" { Some(p) } else { p.parent() };
+            object.is_some_and(|o| o.kind() == "object" && reachable_object(o))
+        }
+        Some(p) if p.kind() == "call_expression" => {
+            let mut holder = p.parent();
+            while let Some(h) = holder.filter(|h| h.kind() == "parenthesized_expression") {
+                holder = h.parent();
+            }
+            holder.is_some_and(|h| h.kind() == "variable_declarator")
+        }
+        _ => false,
+    }
+}
+
+/// The values a function body returns, nested functions aside.
+fn returned_values(body: Node) -> Vec<Node> {
+    let mut out = Vec::new();
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "return_statement" {
+            out.extend(named(node).into_iter().next());
+            continue;
+        }
+        if node != body
+            && (is_function(node) || matches!(node.kind(), "function_declaration" | "method_definition" | "class_declaration"))
+        {
+            continue;
+        }
+        push_children(&mut stack, node);
+    }
+    out
+}
+
+/// The parameter of `function` named `name`, with its default value.
+fn param_binding<'t>(function: Node<'t>, name: &str, src: &str) -> Option<Option<Node<'t>>> {
+    if let Some(single) = function.child_by_field_name("parameter") {
+        return (single.utf8_text(src.as_bytes()).unwrap_or("") == name).then_some(None);
+    }
+    let params = function.child_by_field_name("parameters")?;
+    named(params).into_iter().find_map(|param| {
+        let pattern = param.child_by_field_name("pattern").unwrap_or(param);
+        pattern_binding(pattern, name, param.child_by_field_name("value"), src)
+    })
+}
+
+fn pattern_binding<'t>(pattern: Node<'t>, name: &str, default: Option<Node<'t>>, src: &str) -> Option<Option<Node<'t>>> {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            (pattern.utf8_text(src.as_bytes()).unwrap_or("") == name).then_some(default)
+        }
+        "assignment_pattern" | "object_assignment_pattern" => {
+            pattern_binding(pattern.child_by_field_name("left")?, name, pattern.child_by_field_name("right"), src)
+        }
+        "pair_pattern" => pattern_binding(pattern.child_by_field_name("value")?, name, None, src),
+        "object_pattern" | "array_pattern" | "rest_pattern" => {
+            named(pattern).into_iter().find_map(|m| pattern_binding(m, name, None, src))
+        }
+        _ => None,
+    }
+}
+
+/// The calls a client makes from its arguments, axios and its instances: `get(url, config)`,
+/// `post(url, data, config)`, `request(config)`.
+fn axios_forward(method: &str, args: &[Slot]) -> Option<Forward> {
+    let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
+    let fixed = Slot::Lit(method.to_string());
+    Some(match method {
+        "request" => config_forward(arg(0)),
+        "get" | "delete" | "head" | "options" => Forward {
+            method: fixed,
+            url: arg(0),
+            body: arg(1).get("data"),
+            query: arg(1).get("params"),
+            returns_body: false,
+            url_default: None,
+        },
+        "post" | "put" | "patch" => Forward {
+            method: fixed,
+            url: arg(0),
+            body: arg(1),
+            query: arg(2).get("params"),
+            returns_body: false,
+            url_default: None,
+        },
+        _ => return None,
+    })
+}
+
+/// An axios request config.
+fn config_forward(config: Slot) -> Forward {
+    Forward {
+        method: config.get("method"),
+        url: config.get("url"),
+        body: config.get("data"),
+        query: config.get("params"),
+        returns_body: false,
+        url_default: None,
+    }
+}
+
+fn jquery_forward(method: &str, args: &[Slot]) -> Option<Forward> {
+    let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
+    match method {
+        "ajax" => {
+            let (url, settings) = if args.len() > 1 {
+                (arg(0), arg(1))
+            } else {
+                (arg(0).get("url"), arg(0))
+            };
+            // `type` or `method`: only an object literal tells which.
+            let method = match &settings {
+                Slot::Object(..) => match settings.get("method") {
+                    Slot::Absent => settings.get("type"),
+                    m => m,
+                },
+                Slot::Absent => Slot::Absent,
+                _ => Slot::Unknown,
+            };
+            Some(Forward {
+                method,
+                url,
+                body: settings.get("data"),
+                query: Slot::Absent,
+                returns_body: false,
+                url_default: None,
+            })
+        }
+        "get" | "getJSON" | "post" => Some(Forward {
+            method: Slot::Lit(if method == "post" { "post" } else { "get" }.to_string()),
+            url: arg(0),
+            body: arg(1),
+            query: Slot::Absent,
+            returns_body: false,
+            url_default: None,
+        }),
+        _ => None,
     }
 }
 
@@ -1880,7 +3369,7 @@ post('/api/v1/share/file/upload/', { file: 1 })
         assert_eq!(call.params, vec!["file"]);
         let names: Vec<&str> = facts.wrappers.iter().map(|w| w.name.as_str()).collect();
         assert!(names.contains(&"post") && names.contains(&"default.post"), "{names:?}");
-        assert!(facts.wrappers.iter().all(|w| w.name != "default.post" || w.returns_body));
+        assert!(facts.wrappers.iter().all(|w| w.name != "default.post" || w.forward.returns_body));
     }
 
     #[test]
@@ -1979,5 +3468,223 @@ fetch('/api/v1/location/city-center/?id=' + cityId, { method: 'post', body: JSON
         let facts = analyze(script, &NoImports, &[], &globals);
         let paths: Vec<&str> = facts.global_reads.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, vec!["products", "delivery.current_city", "offers"]);
+    }
+
+    fn line_of(script: &str, needle: &str) -> usize {
+        script.lines().position(|l| l.contains(needle)).expect(needle) + 1
+    }
+
+    const FACTORY: &str = include_str!("../../tests/fixtures/js/http_client_factory.js");
+
+    #[test]
+    fn client_factory_methods_take_method_and_arguments_from_what_they_forward() {
+        let facts = analyze(FACTORY, &NoImports, &[], &HashSet::new());
+        let at = |needle: &str| -> Vec<&HttpCall> {
+            let line = line_of(FACTORY, needle);
+            facts.calls.iter().filter(|c| c.line == line).collect()
+        };
+        // The factory's own forwarding calls are reported where its methods are called.
+        assert!(facts.calls.iter().all(|c| c.line > line_of(FACTORY, "ITEMS_ENDPOINT =")), "{:#?}", facts.calls);
+
+        let list = at("list: (page)");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].client, "wrapper");
+        assert_eq!(list[0].via.as_deref(), Some("createClient.get"));
+        assert_eq!(list[0].method.as_deref(), Some("GET"));
+        assert_eq!(list[0].url.as_deref(), Some("/api/items/"), "a module constant");
+        assert_eq!(list[0].params, vec!["page"], "`params` of the config");
+
+        let add = at("add: (id)");
+        assert_eq!(add[0].method.as_deref(), Some("POST"));
+        assert_eq!(add[0].params, vec!["id", "quantity"], "the body is the second argument of `post`");
+        assert_eq!(add[0].response_keys, vec!["item"], "`request` returns the body: no envelope");
+
+        let update = at("update: (id, quantity)");
+        assert_eq!(update[0].via.as_deref(), Some("createClient.request"));
+        assert_eq!(update[0].method.as_deref(), Some("PATCH"), "from the config literal");
+        assert_eq!(update[0].url.as_deref(), Some("/api/items/{encodeURIComponent(id)}/"), "a local helper");
+        assert_eq!(update[0].params, vec!["quantity"]);
+        assert_eq!(at("remove: (id)")[0].method.as_deref(), Some("DELETE"));
+
+        let find = at("find: (query)");
+        assert_eq!(find[0].url.as_deref(), Some("/api/search/?q={query}"), "a destructured parameter's default");
+
+        // `httpClient || createClient()`, a map indexed by a variable: one call per value.
+        let load: Vec<&str> = at("return client.get(`${endpointByOperation").iter().filter_map(|c| c.url.as_deref()).collect();
+        assert_eq!(load, vec!["/api/catalog/list/{suffix}?{query}", "/api/catalog/search/{suffix}?{query}"]);
+
+        // A function the factory returns runs later: its call stays where it is, the address
+        // from the parameter's default.
+        let submit = at("return http.post(endpoint");
+        assert_eq!(submit[0].url.as_deref(), Some("/api/forms/submit/"));
+        assert_eq!(submit[0].params, vec!["name"]);
+
+        // A client parameter without a default, a `Map`, an object that does not forward to an
+        // HTTP client: no calls, their addresses stay outside recognised calls.
+        let literals: Vec<&str> = facts.literals.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(literals, vec!["/api/ping/", "/api/cached/", "/api/stored/"]);
+        assert_eq!(facts.calls.len(), 8, "{:#?}", facts.calls);
+
+        let exported: Vec<(&str, bool)> = facts.clients.iter().map(|c| (c.name.as_str(), c.factory)).collect();
+        assert_eq!(exported, vec![("createClient", true)]);
+    }
+
+    #[test]
+    fn object_methods_forwarding_through_this_and_callbacks_that_keep_their_call() {
+        let script = r#"
+const api = {
+    request(config) {
+        return axios(config).then((response) => response.data)
+    },
+    apiUrl(path) {
+        return this.host + '/api' + path
+    },
+    get(url, params) {
+        return this.request({ url, params })
+    },
+    remove(url) {
+        return this.request({ url, method: 'DELETE' })
+    },
+    load(page) {
+        return this.get(this.apiUrl('/orders/'), { page })
+    },
+}
+api.remove('/api/orders/7/')
+page.evaluate((image) => fetch(image.src))
+"#;
+        let found = calls(script);
+        let at = |needle: &str| found.iter().find(|c| c.line == line_of(script, needle)).unwrap_or_else(|| panic!("{needle}: {found:#?}"));
+        let load = at("return this.get(");
+        assert_eq!(load.via.as_deref(), Some("this.get"));
+        assert_eq!(load.method.as_deref(), Some("GET"));
+        assert_eq!(load.url.as_deref(), Some("{this.host}/api/orders/"));
+        assert_eq!(load.params, vec!["page"]);
+        let remove = at("api.remove(");
+        assert_eq!(remove.via.as_deref(), Some("api.remove"));
+        assert_eq!(remove.method.as_deref(), Some("DELETE"));
+        assert_eq!(remove.url.as_deref(), Some("/api/orders/7/"));
+        // Nothing calls the callback by name: its call is reported in place.
+        assert_eq!(at("fetch(image.src)").url_expr.as_deref(), Some("image.src"));
+        assert_eq!(found.len(), 3, "{found:#?}");
+    }
+
+    #[test]
+    fn objects_of_unreachable_functions_keep_their_calls_and_an_iife_module_is_a_client() {
+        let script = r#"
+var Api = (function () {
+    return { get: function (url) { return $.get(url) } }
+})()
+Api.get('/api/iife/')
+module.exports = function createApi() {
+    return { get(url) { return axios.get(url) } }
+}
+define(['jquery'], function ($) {
+    return { post: function (url) { return $.post(url) } }
+})
+class Factory {
+    build() { return { get(url) { return axios.get(url) } } }
+}
+"#;
+        let found = calls(script);
+        let shown: Vec<(usize, &str, Option<&str>, Option<&str>)> = found
+            .iter()
+            .map(|c| (c.line, c.via.as_deref().unwrap_or(c.client), c.url.as_deref(), c.url_expr.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (line_of(script, "Api.get('/api/iife/')"), "Api.get", Some("/api/iife/"), None),
+                (line_of(script, "return { get(url) { return axios.get(url) } }"), "axios", None, Some("url")),
+                (line_of(script, "return { post:"), "jquery", None, Some("url")),
+                (line_of(script, "build() {"), "axios", None, Some("url")),
+            ],
+            "no one can name the object of a CommonJS export, an AMD callback, a class method: its call stays"
+        );
+    }
+
+    #[test]
+    fn wrappers_in_scope_spread_configs_default_addresses_and_type_casts() {
+        let script = r#"
+const api = axios.create()
+export function get(url) { return api.get(url) }
+(function () {
+    function get() { return api.get('/api/fixed/') }
+    function send(url, data) { return api.post(url, data) }
+    send('/api/first/', { a: 1 })
+})();
+(function () {
+    function send(url, data) { return $.get(url, data) }
+    send('/api/second/', { b: 1 })
+})();
+function request(config) { return api.request(config) }
+const base = { url: '/api/spread/', method: 'post' }
+request({ ...base })
+request(build())
+function fetchAll(endpoint = '/api/all/') { return fetch(endpoint) }
+fetchAll()
+function outer(path) { return fetchAll(path || '/api/alt/') }
+outer()
+const typed = axios.create() as AxiosInstance
+typed.get('/api/typed/')
+"#;
+        let found = calls(script);
+        let at = |needle: &str| found.iter().find(|c| c.line == line_of(script, needle)).unwrap_or_else(|| panic!("{needle}: {found:#?}"));
+        assert_eq!(at("/api/fixed/").url.as_deref(), Some("/api/fixed/"), "a local `get` is not the exported wrapper");
+        assert_eq!(at("send('/api/first/'").method.as_deref(), Some("POST"));
+        assert_eq!(at("send('/api/second/'").method.as_deref(), Some("GET"), "the `send` in scope");
+        let spread = at("request({ ...base })");
+        assert_eq!((spread.method.as_deref(), spread.url.as_deref()), (Some("POST"), Some("/api/spread/")));
+        assert_eq!(at("request(build())").url_expr.as_deref(), Some("build().url"));
+        assert_eq!(at("fetchAll()").url.as_deref(), Some("/api/all/"), "the parameter's default");
+        assert_eq!(at("outer()").url.as_deref(), Some("/api/alt/"), "`path || …` before the inner default");
+        assert_eq!(at("typed.get(").client, "axios-instance");
+    }
+
+    #[test]
+    fn this_in_component_options_reaches_the_methods_group() {
+        let script = r#"
+export default {
+    methods: {
+        getData(url, params) { return $.ajax({ url: url, data: params }) },
+    },
+    mounted() { this.getData('/api/mounted/', { page: 1 }) },
+}
+"#;
+        let found = calls(script);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].via.as_deref(), Some("this.getData"));
+        assert_eq!(found[0].url.as_deref(), Some("/api/mounted/"));
+        assert_eq!(found[0].params, vec!["page"]);
+    }
+
+    #[test]
+    fn forwarding_methods_of_component_options_keep_their_call_unless_called_through_this() {
+        let script = r#"
+new Vue({
+    methods: {
+        getData(url, params) {
+            return $.ajax({ url: url, data: params })
+        },
+        send(url) {
+            return $.ajax({ url: url, type: 'POST' })
+        },
+        load() {
+            this.getData('/api/list/', { page: 1 })
+        },
+    },
+})
+"#;
+        let found = calls(script);
+        let urls: Vec<(usize, Option<&str>, Option<&str>)> =
+            found.iter().map(|c| (c.line, c.url.as_deref(), c.url_expr.as_deref())).collect();
+        assert_eq!(
+            urls,
+            vec![
+                (line_of(script, "type: 'POST'"), None, Some("url")),
+                (line_of(script, "this.getData("), Some("/api/list/"), None)
+            ],
+            "`send` is called nowhere: its own call stays"
+        );
+        assert_eq!(found[1].params, vec!["page"]);
     }
 }
